@@ -1,7 +1,8 @@
-# pnpm 11 requires an explicit `packages` field whenever a workspace file exists;
-# without it every pnpm command aborts with "packages field missing or empty".
-# This repo is a single root package (the `website/` tree has its own workspace),
-# so the root is the only member.
+# pnpm <10 requires an explicit `packages` field whenever a workspace file
+# exists, or it aborts every command with "packages field missing or empty".
+# pnpm 11 (used in CI) does not need it and accepts this as the sole member —
+# so it keeps local pnpm 9 working without affecting CI. The website/ tree has
+# its own workspace.
 packages:
   - "."
 
