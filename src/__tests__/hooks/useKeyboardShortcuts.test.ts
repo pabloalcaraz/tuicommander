@@ -26,6 +26,8 @@ function createMockHandlers(): ShortcutHandlers {
 		closeTerminal: vi.fn(),
 		reopenClosedTab: vi.fn(),
 		navigateTab: vi.fn(),
+		focusLastTerminal: vi.fn(),
+		jumpWaitingTerminal: vi.fn(),
 		clearTerminal: vi.fn(),
 		terminalIds: vi.fn().mockReturnValue([]),
 		handleTerminalSelect: vi.fn(),
@@ -41,6 +43,7 @@ function createMockHandlers(): ShortcutHandlers {
 		toggleHelpPanel: vi.fn(),
 		toggleNotesPanel: vi.fn(),
 		toggleFileBrowserPanel: vi.fn(),
+		requestFileBrowserContentSearch: vi.fn(),
 		toggleOutlinePanel: vi.fn(),
 		findInTerminal: vi.fn(),
 		toggleCommandPalette: vi.fn(),
@@ -59,6 +62,7 @@ function createMockHandlers(): ShortcutHandlers {
 		toggleZoomPane: vi.fn(),
 		toggleFocusMode: vi.fn(),
 		closeActivePane: vi.fn(),
+		closeActiveTabOrPane: vi.fn(),
 		togglePromptLibrary: vi.fn(),
 		toggleDiffScroll: vi.fn(),
 		toggleGlobalWorkspace: vi.fn(),
@@ -73,7 +77,13 @@ function createMockHandlers(): ShortcutHandlers {
 		detachActivityDashboard: vi.fn(),
 		toggleProcessManager: vi.fn(),
 		toggleGenerators: vi.fn(),
+		showRemoteQr: vi.fn(),
 		refreshTerminal: vi.fn(),
+		blockPrev: vi.fn(),
+		blockNext: vi.fn(),
+		blockFoldToggle: vi.fn(),
+		blockSearchToggle: vi.fn(),
+		runSmartPromptByCombo: vi.fn(() => false),
 	};
 }
 
@@ -131,24 +141,30 @@ describe("useKeyboardShortcuts", () => {
 		});
 	});
 
+	describe("smart prompt shortcuts", () => {
+		it("fires runSmartPromptByCombo for a combo with no built-in action", () => {
+			(handlers.runSmartPromptByCombo as ReturnType<typeof vi.fn>).mockReturnValue(true);
+			const event = fireKeydown("y", { metaKey: true, shiftKey: true });
+			expect(handlers.runSmartPromptByCombo).toHaveBeenCalledWith("cmd+shift+y");
+			expect(event.defaultPrevented).toBe(true);
+		});
+
+		it("does not run a smart prompt when a built-in action matches (precedence)", () => {
+			fireKeydown("t", { metaKey: true });
+			expect(handlers.createNewTerminal).toHaveBeenCalled();
+			expect(handlers.runSmartPromptByCombo).not.toHaveBeenCalled();
+		});
+	});
+
 	describe("terminal shortcuts", () => {
 		it("Cmd+T creates new terminal", () => {
 			fireKeydown("t", { metaKey: true });
 			expect(handlers.createNewTerminal).toHaveBeenCalled();
 		});
 
-		it("Cmd+W closes active terminal", () => {
-			const id = terminalsStore.add({
-				sessionId: null,
-				fontSize: 14,
-				name: "T1",
-				cwd: null,
-				awaitingInput: null,
-			});
-			terminalsStore.setActive(id);
-
+		it("Cmd+W delegates to the shared close-tab-or-pane handler", () => {
 			fireKeydown("w", { metaKey: true });
-			expect(handlers.closeTerminal).toHaveBeenCalledWith(id);
+			expect(handlers.closeActiveTabOrPane).toHaveBeenCalledOnce();
 		});
 
 		it("Cmd+Shift+T reopens closed tab", () => {
@@ -240,8 +256,16 @@ describe("useKeyboardShortcuts", () => {
 		});
 
 		it("Cmd+? toggles help", () => {
-			fireKeydown("?", { metaKey: true });
+			// "?" is a shifted key on every layout, so a real keypress carries
+			// shiftKey:true and e.key:"?" — eventToCombo un-shifts it to "cmd+shift+/".
+			// (Firing without shift was unrealistic and hid the dead-binding bug.)
+			fireKeydown("?", { metaKey: true, shiftKey: true });
 			expect(handlers.toggleHelpPanel).toHaveBeenCalled();
+		});
+
+		it("Cmd+U jumps to the next waiting terminal", () => {
+			fireKeydown("u", { metaKey: true });
+			expect(handlers.jumpWaitingTerminal).toHaveBeenCalled();
 		});
 
 		it("Cmd+Alt+N toggles notes panel", () => {
@@ -266,6 +290,11 @@ describe("useKeyboardShortcuts", () => {
 		it("Cmd+E toggles file browser panel", () => {
 			fireKeydown("e", { metaKey: true });
 			expect(handlers.toggleFileBrowserPanel).toHaveBeenCalled();
+		});
+
+		it("Cmd+Shift+F opens file browser in content-search mode", () => {
+			fireKeydown("F", { metaKey: true, shiftKey: true });
+			expect(handlers.requestFileBrowserContentSearch).toHaveBeenCalled();
 		});
 
 		it("Cmd+Shift+D toggles git ops panel", () => {
@@ -305,36 +334,13 @@ describe("useKeyboardShortcuts", () => {
 		});
 	});
 
-	describe("Cmd+W in split mode", () => {
-		it("calls closeActivePane when pane tree is split", () => {
-			const id1 = terminalsStore.add(makeTerminal({ name: "T1" }));
-			terminalsStore.setActive(id1);
-
-			// Set up pane tree split
-			const g1 = paneLayoutStore.createGroup();
-			paneLayoutStore.addTab(g1, { id: id1, type: "terminal" });
-			paneLayoutStore.setRoot({ type: "leaf", id: g1 });
-			paneLayoutStore.setActiveGroup(g1);
-			paneLayoutStore.split(g1, "vertical");
-
+	describe("Cmd+W delegation", () => {
+		// The keyboard case only delegates; the split-vs-terminal decision (and the
+		// empty-pane cancellation) is owned by closeActiveTabOrPane / closeActivePane
+		// and covered in useSplitPanes.test.ts.
+		it("routes through closeActiveTabOrPane regardless of split state", () => {
 			fireKeydown("w", { metaKey: true });
-
-			expect(handlers.closeActivePane).toHaveBeenCalledOnce();
-			expect(handlers.closeTerminal).not.toHaveBeenCalled();
-		});
-
-		it("closes non-split active terminal", () => {
-			const id = terminalsStore.add(makeTerminal({ name: "T1" }));
-			terminalsStore.setActive(id);
-
-			fireKeydown("w", { metaKey: true });
-
-			expect(handlers.closeTerminal).toHaveBeenCalledWith(id);
-		});
-
-		it("does nothing when no active terminal", () => {
-			fireKeydown("w", { metaKey: true });
-
+			expect(handlers.closeActiveTabOrPane).toHaveBeenCalledOnce();
 			expect(handlers.closeTerminal).not.toHaveBeenCalled();
 			expect(handlers.closeActivePane).not.toHaveBeenCalled();
 		});

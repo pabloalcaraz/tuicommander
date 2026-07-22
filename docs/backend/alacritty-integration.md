@@ -12,9 +12,11 @@ TUICommander uses `alacritty_terminal` 0.26.0 as its terminal emulation backend.
 |------|--------|-----|
 | `src/term/mod.rs` | `pub fn resize_reflow(size, reflow: bool)` | Disable reflow on resize. Ink/Claude Code uses CUU cursor positioning that breaks when reflow merges/splits lines. |
 | `src/term/mod.rs` | `pub fn mark_fully_damaged()` (was `fn`) | Lets us force full-frame damage directly instead of maintaining a parallel flag. |
+| `src/term/mod.rs` | Parse-side damage: `TermParseDamage` enum, `TermDamageState.parse_lines`/`parse_full`, `pub fn parse_damage()`/`reset_parse_damage()`, damage recorded in `write_at_cursor` | A SECOND, independent damage view for TUIC's PTY parse path (`TerminalGrid::process` → `ChangedRow`), read+reset separately from the render damage so the two consumers never steal each other's damage. Lets `process()` diff only changed rows instead of rebuilding+diffing the whole screen per PTY chunk. `write_at_cursor` now damages the written cell (upstream reconstructs input damage lazily at `damage()` time from cursor deltas, which left the parse consumer blind to typed text); this is at worst a safe over-damage for the render consumer. Correctness pinned by the `process_damage_matches_full_diff` differential test. |
 | `src/term/mod.rs` | `fn osc7770(&mut self, verb, payload)` | OSC 7770 TUIC protocol handler. Fires `Event::Tuic { verb, payload }` for in-band state/suggest/intent signalling. |
 | `src/term/color.rs` | `pub fn named_color_to_index(NamedColor) -> Option<u8>` | Maps named colors to xterm-256 indices. Eliminates 30-line match duplication in our serializer. |
 | `src/event.rs` | `Event::Tuic { verb, payload }` variant | Carries parsed OSC 7770 events from VTE to the application layer. |
+| `src/grid/mod.rs` | `lines_scrolled` field + `pub fn total_scrolled()` | Monotonic count of lines ever scrolled into history (incremented in `scroll_up`). `total_scrolled() - history_size()` gives lines evicted from the top, the base for an eviction-stable absolute row coordinate. Excluded from `PartialEq`; `serde(default)` so old ref fixtures still load. |
 
 ## VTE patch (`src-tauri/patches/vte/`)
 
@@ -36,7 +38,7 @@ In-band signalling via the PTY stream. Never written to the grid (consumed by VT
 
 | Verb | Payload | Effect |
 |------|---------|--------|
-| `state` | `idle` or `busy` | Immediate shell state transition (bypasses silence timer). |
+| `state` | `idle`, `busy`, or `awaiting` | `idle`/`busy`: immediate shell state transition (bypasses silence timer). `awaiting`: emits a confident `Question` (sets `awaiting_input`); `busy` also clears a prior `awaiting`. Driven by native agent hooks (see AI Agents → Native Hook Instrumentation). Unknown payloads are ignored. |
 | `suggest` | `A\|B\|C` (pipe-separated) | Emits `ParsedEvent::Suggest` — never hits the grid, no conceal needed. |
 | `intent` | `text` or `text (Title)` | Emits `ParsedEvent::Intent` with optional tab title. |
 
@@ -133,8 +135,10 @@ gh api repos/zed-industries/alacritty/branches --jq '.[].name'
 
 ### Periodic review cadence
 
-- **Monthly:** Check crates.io for new alacritty_terminal releases.
-- **Quarterly:** Review Zed fork branches for new patches relevant to our use case.
+Driven by the `alacritty-upstream` entry in `.claude/scheduled-checks.json` (every 20 days). Each run:
+
+- Check crates.io for new alacritty_terminal releases (`cargo search alacritty_terminal`).
+- Review Zed fork branches for new patches relevant to our embedded backend.
 - **On major issues:** If we hit terminal emulation bugs, check if upstream or Zed has a fix before writing our own.
 
 ## Planned patches (stories)

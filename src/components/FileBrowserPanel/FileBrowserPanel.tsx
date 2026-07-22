@@ -6,11 +6,16 @@ import { t } from "../../i18n";
 import { invoke, listen } from "../../invoke";
 import { getModifierSymbol, shortenHomePath } from "../../platform";
 import { appLogger } from "../../stores/appLogger";
+import { diffTabsStore } from "../../stores/diffTabs";
 import { markInternalDragEnd, markInternalDragStart, startNativeDrag } from "../../stores/dragDrop";
+import { editorTabsStore } from "../../stores/editorTabs";
 import { repositoriesStore } from "../../stores/repositories";
+import { toastsStore } from "../../stores/toasts";
 import { uiStore } from "../../stores/ui";
 import type { ContentMatch, DirEntry } from "../../types/fs";
 import { cx } from "../../utils";
+import { onClickKeyDown } from "../../utils/a11y";
+import { writeClipboard } from "../../utils/clipboard";
 import { isAbsolutePath, joinPath, replaceBasename } from "../../utils/pathUtils";
 import { fileContextSmartMenuItem } from "../../utils/promptContext";
 import { ConfirmDialog } from "../ConfirmDialog";
@@ -23,7 +28,7 @@ import { PanelResizeHandle } from "../ui/PanelResizeHandle";
 import { PanelWindowControls } from "../ui/PanelWindowControls";
 import s from "./FileBrowserPanel.module.css";
 import { FileIcon } from "./FileIcon";
-import { formatSize, getStatusClass } from "./fileUtils";
+import { fileTooltip, formatSize, getStatusClass } from "./fileUtils";
 import { TreeNode } from "./TreeNode";
 
 export interface FileBrowserPanelProps {
@@ -89,6 +94,20 @@ export const FileBrowserPanel: Component<FileBrowserPanelProps> = (props) => {
 	 * best-effort — list_directory still works because it canonicalizes repo_path.
 	 */
 	const root = () => uiStore.state.fileBrowserExternalRoot || props.fsRoot || props.repoPath;
+
+	/** Relative path of the file shown in the active editor OR diff tab, when it
+	 * lives under the root this browser shows — for highlighting it in the tree
+	 * like VS Code. Editor-first: opening a diff clears the editor's active id, so
+	 * editor-first precedence resolves the visible tab correctly. Null otherwise. */
+	const activeFilePath = createMemo(() => {
+		const tab = editorTabsStore.getActive() ?? diffTabsStore.getActive();
+		if (!tab) return null;
+		const r = root();
+		const tabFsRoot = "fsRoot" in tab ? tab.fsRoot : tab.repoPath;
+		if (tabFsRoot !== r && tab.repoPath !== r) return null;
+		return tab.filePath;
+	});
+
 	const contextMenu = createContextMenu();
 	const smartPrompts = useSmartPrompts();
 
@@ -107,8 +126,14 @@ export const FileBrowserPanel: Component<FileBrowserPanelProps> = (props) => {
 	/** Parent dir the new item is created in, relative to root(). "" = root. */
 	const [createParent, setCreateParent] = createSignal<string>("");
 
-	// File clipboard state for copy/cut/paste
-	const [clipboard, setClipboard] = createSignal<{ entry: DirEntry; mode: "copy" | "cut" } | null>(null);
+	// File clipboard state for copy/cut/paste. `sourceRoot` is the repo the entry
+	// was copied from — captured so paste works across different repos (entry.path
+	// is relative to its own repo, not the paste destination's).
+	const [clipboard, setClipboard] = createSignal<{
+		entry: DirEntry;
+		mode: "copy" | "cut";
+		sourceRoot: string;
+	} | null>(null);
 
 	// Search mode: "filename" (default) or "content" (full-text grep)
 	type SearchMode = "filename" | "content";
@@ -128,6 +153,48 @@ export const FileBrowserPanel: Component<FileBrowserPanelProps> = (props) => {
 	type SortMode = "name" | "date";
 	const [sortBy, setSortBy] = createSignal<SortMode>("name");
 	const [sortDropdownOpen, setSortDropdownOpen] = createSignal(false);
+
+	// Scroll position cache: saves scrollTop + selectedIndex per subdir path
+	const scrollCache = new Map<string, { scrollTop: number; selectedIndex: number }>();
+	// Per-root subdir memory: when the user switches repos and comes back, restore
+	// the directory they were browsing instead of resetting to root. The panel
+	// instance persists across repo switches (only props.repoPath changes), so a
+	// component-scoped map survives. (#72)
+	const rootToSubdir = new Map<string, string>();
+	// Per-root search filter memory: the filter is scoped to each repo, never shared
+	// across them. Saved/restored alongside the subdir on root switch. (#72)
+	const rootToSearchQuery = new Map<string, string>();
+	let contentRef: HTMLDivElement | undefined;
+	let searchInputRef: HTMLInputElement | undefined;
+	let pendingScrollRestore: string | null = null;
+
+	// Cmd+Shift+F (toggle-file-browser-content-search) bumps this nonce. Enter
+	// content-search mode and focus the input. Guard the initial 0 so a fresh
+	// mount doesn't force content mode; the panel instance persists (hidden via
+	// CSS, not unmounted) so this fires even when re-triggered while open.
+	createEffect(() => {
+		const nonce = uiStore.state.fileBrowserContentSearchNonce;
+		if (nonce === 0) return;
+		if (untrack(searchMode) !== "content") {
+			setSearchMode("content");
+			setSearchResults([]); // clear filename-mode results
+			setSelectedIndex(0);
+		}
+		requestAnimationFrame(() => searchInputRef?.focus());
+	});
+
+	const changeSubdir = (newSubdir: string) => {
+		if (contentRef) {
+			scrollCache.set(currentSubdir(), { scrollTop: contentRef.scrollTop, selectedIndex: selectedIndex() });
+		}
+		pendingScrollRestore = newSubdir;
+		setCurrentSubdir(newSubdir);
+		// Keep keyboard focus in the panel after navigating into a directory. Entry
+		// rows aren't focusable in WebKit, so a click never grants the panel focus —
+		// without this, Cmd+C/X/V (which require panel focus, line ~919) silently
+		// no-op after entering a folder.
+		document.getElementById("file-browser-panel")?.focus();
+	};
 
 	// Tree view state
 	const viewMode = () => uiStore.state.fileBrowserViewMode;
@@ -154,6 +221,45 @@ export const FileBrowserPanel: Component<FileBrowserPanelProps> = (props) => {
 		});
 	};
 
+	/**
+	 * Reveal the active editor file: in tree view, expand its ancestor dirs (loading
+	 * children as needed) so the highlighted row is mounted; then scroll it into
+	 * view. Flat view only scrolls when the file is in the current listing.
+	 * `mode`/`searching` are passed in (already tracked by the effect); tree-state
+	 * reads here are untracked to avoid re-triggering on our own expand/load.
+	 */
+	const revealActiveFile = async (rel: string, mode: string, searching: boolean) => {
+		const fsRoot = root();
+		if (fsRoot && mode === "tree" && !searching) {
+			const parts = rel.split("/");
+			let acc = "";
+			for (let i = 0; i < parts.length - 1; i++) {
+				acc = acc ? `${acc}/${parts[i]}` : parts[i];
+				if (!treeCache().has(acc)) {
+					try {
+						onChildrenLoaded(acc, await fb.listDirectory(fsRoot, acc));
+					} catch (err) {
+						appLogger.debug("app", "reveal: listDirectory failed", { path: acc, error: String(err) });
+						return;
+					}
+				}
+				setExpandedDirs((prev) => (prev.has(acc) ? prev : new Set(prev).add(acc)));
+			}
+		}
+		// Let the newly-expanded rows render, then scroll the active row into view.
+		requestAnimationFrame(() => {
+			contentRef?.querySelector(`.${s.entryActive}`)?.scrollIntoView({ block: "nearest" });
+		});
+	};
+
+	createEffect(() => {
+		const rel = activeFilePath();
+		const mode = viewMode();
+		const searching = !!searchQuery().trim();
+		if (!rel || !props.visible) return;
+		untrack(() => void revealActiveFile(rel, mode, searching));
+	});
+
 	// Directory watcher revision — bumped when dir-changed event arrives
 	const [dirRevision, setDirRevision] = createSignal(0);
 
@@ -172,10 +278,24 @@ export const FileBrowserPanel: Component<FileBrowserPanelProps> = (props) => {
 		const fsRoot = root()!;
 		const gen = ++fetchGeneration;
 
-		// Reset subdir when root changes (merged from separate effect to avoid double fetch)
+		// Restore subdir when root changes (merged from separate effect to avoid double fetch)
 		if (fsRoot !== lastRepoPath) {
+			// Remember where we were in the previous root before switching away. (#72)
+			if (lastRepoPath !== null) {
+				rootToSubdir.set(
+					lastRepoPath,
+					untrack(() => currentSubdir()),
+				);
+				rootToSearchQuery.set(
+					lastRepoPath,
+					untrack(() => searchQuery()),
+				);
+			}
 			lastRepoPath = fsRoot;
-			setCurrentSubdir(".");
+			scrollCache.clear();
+			pendingScrollRestore = null;
+			setCurrentSubdir(rootToSubdir.get(fsRoot) ?? ".");
+			setSearchQuery(rootToSearchQuery.get(fsRoot) ?? "");
 		}
 
 		const subdir = currentSubdir();
@@ -220,8 +340,14 @@ export const FileBrowserPanel: Component<FileBrowserPanelProps> = (props) => {
 					});
 				if (changed) {
 					setEntries(result);
-					// Restore selection by path after auto-refresh, reset on initial load
-					if (prevSelectedPath) {
+					const cached = pendingScrollRestore !== null ? scrollCache.get(pendingScrollRestore) : undefined;
+					pendingScrollRestore = null;
+					if (cached) {
+						setSelectedIndex(Math.min(cached.selectedIndex, result.length - 1));
+						requestAnimationFrame(() => {
+							if (contentRef) contentRef.scrollTop = cached.scrollTop;
+						});
+					} else if (prevSelectedPath) {
 						const idx = result.findIndex((e) => e.path === prevSelectedPath);
 						setSelectedIndex(idx >= 0 ? idx : 0);
 					} else {
@@ -230,6 +356,13 @@ export const FileBrowserPanel: Component<FileBrowserPanelProps> = (props) => {
 				}
 			} catch (err) {
 				if (gen !== fetchGeneration) return;
+				// A remembered subdir may have been deleted while we were away (#72) —
+				// fall back to the root instead of stranding the user on an error.
+				if (subdir !== ".") {
+					rootToSubdir.delete(fsRoot);
+					setCurrentSubdir(".");
+					return;
+				}
 				setError(String(err));
 				setEntries([]);
 			} finally {
@@ -414,7 +547,7 @@ export const FileBrowserPanel: Component<FileBrowserPanelProps> = (props) => {
 	const refresh = () => setRefreshTrigger((n) => n + 1);
 
 	const navigateInto = (entry: DirEntry) => {
-		setCurrentSubdir(entry.path);
+		changeSubdir(entry.path);
 	};
 
 	const navigateUp = () => {
@@ -422,7 +555,7 @@ export const FileBrowserPanel: Component<FileBrowserPanelProps> = (props) => {
 		if (current === "." || current === "") return;
 		const parts = current.split("/");
 		parts.pop();
-		setCurrentSubdir(parts.length === 0 ? "." : parts.join("/"));
+		changeSubdir(parts.length === 0 ? "." : parts.join("/"));
 	};
 
 	const handleEntryClick = (entry: DirEntry) => {
@@ -443,9 +576,9 @@ export const FileBrowserPanel: Component<FileBrowserPanelProps> = (props) => {
 	const handleBreadcrumbClick = (index: number) => {
 		const segments = breadcrumbs();
 		if (index < 0) {
-			setCurrentSubdir(".");
+			changeSubdir(".");
 		} else {
-			setCurrentSubdir(segments.slice(0, index + 1).join("/"));
+			changeSubdir(segments.slice(0, index + 1).join("/"));
 		}
 	};
 
@@ -546,33 +679,47 @@ export const FileBrowserPanel: Component<FileBrowserPanelProps> = (props) => {
 	};
 
 	const handleCopy = (entry: DirEntry) => {
-		setClipboard({ entry, mode: "copy" });
+		const r = root();
+		if (!r) return;
+		setClipboard({ entry, mode: "copy", sourceRoot: r });
 	};
 
 	const handleCut = (entry: DirEntry) => {
-		setClipboard({ entry, mode: "cut" });
+		const r = root();
+		if (!r) return;
+		setClipboard({ entry, mode: "cut", sourceRoot: r });
 	};
 
 	const handlePaste = async () => {
 		const clip = clipboard();
-		if (!clip || !root()) return;
+		const destRoot = root();
+		if (!clip || !destRoot) return;
 		const destDir = currentSubdir() === "." ? "" : `${currentSubdir()}/`;
-		const destPath = `${destDir}${clip.entry.name}`;
+		const destRel = `${destDir}${clip.entry.name}`;
 
-		// Avoid pasting onto itself
-		if (destPath === clip.entry.path) return;
+		// Resolve to absolute paths so paste works across different repos: the
+		// source belongs to clip.sourceRoot, the destination to the current repo.
+		const fromAbs = joinPath(clip.sourceRoot, clip.entry.path);
+		const toAbs = joinPath(destRoot, destRel);
+
+		// Avoid pasting a file onto itself
+		if (fromAbs === toAbs) return;
 
 		try {
 			if (clip.mode === "copy") {
-				await fb.copyPath(root()!, clip.entry.path, destPath);
+				await fb.copyPathAbs(fromAbs, toAbs);
 			} else {
-				// Cut = rename (move)
-				await fb.renamePath(root()!, clip.entry.path, destPath);
+				await fb.movePathAbs(fromAbs, toAbs);
 				setClipboard(null);
 			}
 			refresh();
 		} catch (err) {
 			appLogger.error("app", `Failed to ${clip.mode === "copy" ? "copy" : "move"}`, err);
+			toastsStore.add(
+				clip.mode === "copy" ? t("fileBrowser.copyFailed", "Copy failed") : t("fileBrowser.moveFailed", "Move failed"),
+				String(err),
+				"error",
+			);
 		}
 	};
 
@@ -589,13 +736,162 @@ export const FileBrowserPanel: Component<FileBrowserPanelProps> = (props) => {
 		}
 	};
 
+	// Pointer-based drag: internal moves via pointer events (HTML5 DnD and
+	// startNativeDrag both broken in WKWebView with dragDropEnabled).
+	// When the pointer leaves the file browser panel, hands off to native drag
+	// for cross-app drops (Finder, Slack, etc.).
+	let _ptrSrc: string | null = null;
+	let _ptrActive = false;
+	let _ptrSuppressClick = false;
+	let _ptrHi: HTMLElement | null = null;
+	let _ptrGhost: HTMLElement | null = null;
+	let _ptrRaf = 0;
+
+	const ptrCleanup = () => {
+		if (_ptrRaf) {
+			cancelAnimationFrame(_ptrRaf);
+			_ptrRaf = 0;
+		}
+		_ptrHi?.classList.remove("drop-target-hover");
+		_ptrHi = null;
+		_ptrGhost?.remove();
+		_ptrGhost = null;
+		document.body.style.cursor = "";
+	};
+
+	const findDropFolder = (x: number, y: number, excludeSrc?: string | null): HTMLElement | null => {
+		let cur: Element | null = document.elementFromPoint(x, y);
+		while (cur) {
+			const dt = (cur as HTMLElement).dataset;
+			if (dt?.dropTarget === "folder" && dt.absPath && dt.absPath !== excludeSrc) return cur as HTMLElement;
+			cur = cur.parentElement;
+		}
+		return null;
+	};
+
+	const ptrHighlight = (x: number, y: number) => {
+		const target = findDropFolder(x, y, _ptrSrc);
+		if (target === _ptrHi) return;
+		_ptrHi?.classList.remove("drop-target-hover");
+		_ptrHi = target;
+		_ptrHi?.classList.add("drop-target-hover");
+	};
+
+	const ptrGhost = (name: string, x: number, y: number) => {
+		if (!_ptrGhost) {
+			_ptrGhost = document.createElement("div");
+			_ptrGhost.className = "ptr-drag-ghost";
+			document.body.appendChild(_ptrGhost);
+		}
+		_ptrGhost.textContent = name;
+		_ptrGhost.style.left = `${x + 12}px`;
+		_ptrGhost.style.top = `${y - 8}px`;
+	};
+
+	const handlePointerDragStart = (absPath: string, e: PointerEvent) => {
+		if (e.button !== 0) return;
+		// Must mark before drag threshold — Tauri's onDragDropEvent fires on any pointer
+		// hold, and without this flag the OS drop handler in dragDrop.ts would treat an
+		// internal file-browser drag as an external Finder drop (wrong dispatch path).
+		markInternalDragStart();
+		_ptrSrc = absPath;
+		_ptrActive = false;
+		const startX = e.clientX,
+			startY = e.clientY;
+		const name = absPath.slice(absPath.lastIndexOf("/") + 1);
+		const panel = document.getElementById("file-browser-panel");
+
+		const detachAll = () => {
+			document.removeEventListener("pointermove", onMove);
+			document.removeEventListener("pointerup", onUp);
+			document.removeEventListener("pointercancel", onAbort);
+			window.removeEventListener("blur", onAbort);
+		};
+
+		const onMove = (me: PointerEvent) => {
+			if (!_ptrActive) {
+				if (Math.hypot(me.clientX - startX, me.clientY - startY) < 5) return;
+				_ptrActive = true;
+				document.body.style.cursor = "grabbing";
+			}
+			if (panel && !panel.contains(document.elementFromPoint(me.clientX, me.clientY))) {
+				const src = _ptrSrc;
+				detachAll();
+				ptrCleanup();
+				_ptrSrc = null;
+				_ptrActive = false;
+				markInternalDragEnd();
+				if (src) startNativeDrag([src]);
+				return;
+			}
+			if (!_ptrRaf) {
+				_ptrRaf = requestAnimationFrame(() => {
+					_ptrRaf = 0;
+					ptrHighlight(me.clientX, me.clientY);
+					ptrGhost(name, me.clientX, me.clientY);
+				});
+			}
+		};
+
+		const onUp = (ue: PointerEvent) => {
+			markInternalDragEnd();
+			detachAll();
+			ptrCleanup();
+			if (_ptrActive && _ptrSrc) {
+				const target = findDropFolder(ue.clientX, ue.clientY);
+				if (target?.dataset.absPath) performFileMove(_ptrSrc, target.dataset.absPath);
+				_ptrSuppressClick = true;
+				requestAnimationFrame(() => {
+					_ptrSuppressClick = false;
+				});
+			}
+			_ptrSrc = null;
+			_ptrActive = false;
+		};
+
+		const onAbort = () => {
+			markInternalDragEnd();
+			detachAll();
+			ptrCleanup();
+			_ptrSrc = null;
+			_ptrActive = false;
+		};
+
+		document.addEventListener("pointermove", onMove);
+		document.addEventListener("pointerup", onUp);
+		document.addEventListener("pointercancel", onAbort);
+		window.addEventListener("blur", onAbort);
+	};
+
+	const performFileMove = async (sourcePath: string, targetFolderAbsPath: string) => {
+		const fsRoot = root();
+		if (!fsRoot) return;
+
+		const sourceDir = sourcePath.slice(0, sourcePath.lastIndexOf("/"));
+		if (targetFolderAbsPath === sourceDir || targetFolderAbsPath === sourcePath) return;
+		if (targetFolderAbsPath.startsWith(`${sourcePath}/`)) return;
+
+		const prefix = fsRoot.endsWith("/") ? fsRoot : `${fsRoot}/`;
+		const relSource = sourcePath.startsWith(prefix) ? sourcePath.slice(prefix.length) : sourcePath;
+		const fileName = sourcePath.slice(sourcePath.lastIndexOf("/") + 1);
+		const relTarget = targetFolderAbsPath.startsWith(prefix)
+			? targetFolderAbsPath.slice(prefix.length)
+			: targetFolderAbsPath;
+		const relDest = `${relTarget}/${fileName}`;
+
+		try {
+			await fb.renamePath(fsRoot, relSource, relDest);
+			refresh();
+		} catch (err) {
+			appLogger.error("app", "Failed to move file via drag", err);
+		}
+	};
+
 	const handleCopyPath = (entry: DirEntry) => {
 		const fsRoot = root();
 		if (!fsRoot) return;
 		const fullPath = `${fsRoot}/${entry.path}`;
-		navigator.clipboard
-			.writeText(shortenHomePath(fullPath))
-			.catch((err) => appLogger.error("app", "Failed to copy path", err));
+		writeClipboard(shortenHomePath(fullPath)).catch((err) => appLogger.error("app", "Failed to copy path", err));
 	};
 
 	const getContextMenuItems = (entry: DirEntry): ContextMenuItem[] => {
@@ -768,11 +1064,23 @@ export const FileBrowserPanel: Component<FileBrowserPanelProps> = (props) => {
 		onCleanup(() => document.removeEventListener("keydown", handleKeydown));
 	});
 
+	// OS file drops are routed by Tauri's onDragDropEvent → dispatchTauriDrop, which
+	// hit-tests via elementFromPoint and walks up to the nearest data-drop-target.
+	// Marking the panel root as a "folder" target with the current directory means a
+	// drop on empty panel space transfers into the current dir; drops on a folder row
+	// win because that row is the inner-most match.
+	const panelDropDir = () => {
+		const dir = root();
+		return dir ? joinPath(dir, currentSubdir()) : undefined;
+	};
+
 	return (
 		<div
 			id="file-browser-panel"
 			class={cx(s.panel, mode() === "detached" && s.detached, !props.visible && s.hidden)}
 			tabIndex={-1}
+			data-drop-target={panelDropDir() ? "folder" : undefined}
+			data-abs-path={panelDropDir()}
 		>
 			<Show when={mode() === "inline"}>
 				<PanelResizeHandle panelId="file-browser-panel" />
@@ -823,6 +1131,7 @@ export const FileBrowserPanel: Component<FileBrowserPanelProps> = (props) => {
 					</Show>
 				</button>
 				<input
+					ref={searchInputRef}
 					type="text"
 					class={p.searchInput}
 					data-focus-target="file-browser-search"
@@ -975,7 +1284,7 @@ export const FileBrowserPanel: Component<FileBrowserPanelProps> = (props) => {
 				</div>
 			</Show>
 
-			<div class={p.content}>
+			<div class={p.content} ref={contentRef}>
 				<Show when={loading() || (searching() && searchMode() === "filename")}>
 					<div class={s.empty}>
 						{searching() ? t("fileBrowser.searching", "Searching\u2026") : t("fileBrowser.loading", "Loading...")}
@@ -1054,10 +1363,12 @@ export const FileBrowserPanel: Component<FileBrowserPanelProps> = (props) => {
 										depth={0}
 										repoPath={root() ?? ""}
 										fsRoot={root() ?? ""}
+										activePath={activeFilePath()}
 										expandedDirs={expandedDirs()}
 										onToggleExpand={toggleExpand}
 										onFileOpen={props.onFileOpen}
 										onContextMenu={handleContextMenu}
+										onPointerDragStart={handlePointerDragStart}
 										childrenCache={treeCache()}
 										onChildrenLoaded={onChildrenLoaded}
 									/>
@@ -1068,6 +1379,34 @@ export const FileBrowserPanel: Component<FileBrowserPanelProps> = (props) => {
 
 					{/* Flat list view (default, or when searching) */}
 					<Show when={viewMode() === "flat" || searchQuery().trim()}>
+						{/* Go up entry when in a subdirectory and not searching — shown even when the
+						    directory is empty so the user is never stranded without a way back. */}
+						<Show
+							when={
+								!loading() &&
+								!searching() &&
+								!error() &&
+								!searchQuery().trim() &&
+								currentSubdir() !== "." &&
+								currentSubdir() !== ""
+							}
+						>
+							<div
+								class={cx(s.entry, s.entryParent)}
+								role="button"
+								tabIndex={0}
+								onClick={navigateUp}
+								onKeyDown={onClickKeyDown(navigateUp)}
+							>
+								<span class={s.entryIcon}>
+									<svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor">
+										<path d="M8 2L2 8l6 6V10h6V6H8V2z" />
+									</svg>
+								</span>
+								<span class={s.entryName}>..</span>
+							</div>
+						</Show>
+
 						<Show when={!loading() && !searching() && !error() && filteredEntries().length === 0}>
 							<div class={s.empty}>
 								{!root()
@@ -1079,18 +1418,6 @@ export const FileBrowserPanel: Component<FileBrowserPanelProps> = (props) => {
 						</Show>
 
 						<Show when={!loading() && !searching() && !error() && filteredEntries().length > 0}>
-							{/* Go up entry when in a subdirectory and not searching */}
-							<Show when={!searchQuery().trim() && currentSubdir() !== "." && currentSubdir() !== ""}>
-								<div class={cx(s.entry, s.entryParent)} onClick={navigateUp}>
-									<span class={s.entryIcon}>
-										<svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor">
-											<path d="M8 2L2 8l6 6V10h6V6H8V2z" />
-										</svg>
-									</span>
-									<span class={s.entryName}>..</span>
-								</div>
-							</Show>
-
 							<For each={filteredEntries()}>
 								{(entry, index) => {
 									const isSearch = !!searchQuery().trim();
@@ -1101,29 +1428,25 @@ export const FileBrowserPanel: Component<FileBrowserPanelProps> = (props) => {
 												s.entry,
 												entry.is_dir && s.entryDir,
 												selectedIndex() === index() && s.entrySelected,
+												!entry.is_dir && entry.path === activeFilePath() && s.entryActive,
 												entry.is_ignored && s.entryIgnored,
-												clipboard()?.mode === "cut" && clipboard()?.entry.path === entry.path && s.entryCut,
+												clipboard()?.mode === "cut" &&
+													clipboard()?.sourceRoot === root() &&
+													clipboard()?.entry.path === entry.path &&
+													s.entryCut,
 											)}
 											data-drop-target={entry.is_dir ? "folder" : undefined}
 											data-abs-path={entry.is_dir ? absPath() : undefined}
-											draggable={true}
-											onDragStart={(e) => {
-												const p = absPath();
-												e.dataTransfer!.setData("application/x-tuic-path", p);
-												e.dataTransfer!.setData("text/plain", p);
-												e.dataTransfer!.effectAllowed = "copy";
-												markInternalDragStart();
-												startNativeDrag([p]);
-											}}
-											onDragEnd={() => markInternalDragEnd()}
+											onPointerDown={(e) => handlePointerDragStart(absPath(), e)}
 											onClick={() => {
+												if (_ptrSuppressClick) return;
 												setSelectedIndex(index());
 												handleEntryClick(entry);
 											}}
 											onContextMenu={(e) => handleContextMenu(e, entry)}
 										>
 											<FileIcon name={entry.name} isDir={entry.is_dir} class={s.entryIcon} />
-											<span class={s.entryName} title={entry.path}>
+											<span class={s.entryName} title={fileTooltip(entry)}>
 												{isSearch ? entry.path : entry.name}
 											</span>
 											<Show when={entry.git_status}>

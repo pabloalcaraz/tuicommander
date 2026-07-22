@@ -9,8 +9,11 @@ import { editorTabsStore } from "../../stores/editorTabs";
 import { type HtmlPreviewTab as HtmlPreviewTabData, mdTabsStore } from "../../stores/mdTabs";
 import { repositoriesStore } from "../../stores/repositories";
 import { attachIframeKeyForwarder } from "../../utils/iframeKeyForwarder";
+import { IFRAME_SCROLLBAR_STYLE, IFRAME_SEARCH_BRIDGE_SCRIPT } from "../../utils/iframeSearch";
 import { isAbsolutePath, joinPath } from "../../utils/pathUtils";
+import { buildSearchPattern, type SearchOptions } from "../shared/DomSearchEngine";
 import e from "../shared/editor-header.module.css";
+import { SearchBar } from "../shared/SearchBar";
 import s from "./HtmlPreviewTab.module.css";
 
 export interface HtmlPreviewTabProps {
@@ -50,17 +53,68 @@ export const HtmlPreviewTab: Component<HtmlPreviewTabProps> = (props) => {
 	const [content, setContent] = createSignal("");
 	const [loading, setLoading] = createSignal(false);
 	const [error, setError] = createSignal<string | null>(null);
+	const [reloadKey, setReloadKey] = createSignal(0);
+	const [searchVisible, setSearchVisible] = createSignal(false);
+	const [matchIndex, setMatchIndex] = createSignal(-1);
+	const [matchCount, setMatchCount] = createSignal(0);
 	const repo = useRepository();
 	let wrapperRef: HTMLDivElement | undefined;
+	let iframeRef: HTMLIFrameElement | undefined;
 	let cleanupKeyForwarder: (() => void) | undefined;
+	// Last search posted to the iframe, re-sent after a reload re-creates its DOM.
+	let lastSearch: { term: string; opts: SearchOptions } | null = null;
 
-	const handleIframeLoad = (e: Event) => {
+	/** Post a search command into the (same-origin) preview iframe. */
+	const postToIframe = (msg: Record<string, unknown>) => iframeRef?.contentWindow?.postMessage(msg, "*");
+
+	const sendSearch = (term: string, opts: SearchOptions) => {
+		const pattern = term ? buildSearchPattern(term, opts) : null;
+		postToIframe({ type: "tuic:search", source: pattern?.source ?? "", flags: pattern?.flags ?? "gi" });
+	};
+
+	const handleIframeLoad = (ev: Event) => {
 		cleanupKeyForwarder?.();
-		const iframe = e.target as HTMLIFrameElement;
+		const iframe = ev.target as HTMLIFrameElement;
+		iframeRef = iframe;
 		cleanupKeyForwarder = attachIframeKeyForwarder(iframe);
+		// A reload rebuilds the iframe DOM and wipes its marks — re-run any active search.
+		if (searchVisible() && lastSearch) sendSearch(lastSearch.term, lastSearch.opts);
+	};
+
+	const reloadIframe = () => {
+		if (kind() === "html") {
+			setReloadKey((k) => k + 1);
+		} else if (iframeRef) {
+			const cur = iframeRef.src;
+			iframeRef.src = cur;
+		}
+	};
+
+	const handleMessage = (event: MessageEvent) => {
+		if (!iframeRef || event.source !== iframeRef.contentWindow) return;
+		const data = event.data;
+		if (!data || typeof data !== "object") return;
+		switch (data.type) {
+			case "tuic:reload-request":
+				reloadIframe();
+				break;
+			case "tuic:search-open":
+				setSearchVisible(true);
+				break;
+			case "tuic:search-result":
+				setMatchCount(typeof data.count === "number" ? data.count : 0);
+				setMatchIndex(typeof data.index === "number" ? data.index : -1);
+				break;
+		}
 	};
 
 	onCleanup(() => cleanupKeyForwarder?.());
+
+	// Register the iframe→parent message bridge in the component owner scope
+	// (not a JSX IIFE, which the renderer may hoist as static and skip) so the
+	// listener and its teardown are reliably paired with mount/unmount.
+	window.addEventListener("message", handleMessage);
+	onCleanup(() => window.removeEventListener("message", handleMessage));
 
 	const focusWrapper = () => requestAnimationFrame(() => wrapperRef?.focus({ preventScroll: true }));
 
@@ -68,10 +122,45 @@ export const HtmlPreviewTab: Component<HtmlPreviewTabProps> = (props) => {
 		if (mdTabsStore.state.activeId === props.tab.id) focusWrapper();
 	});
 
+	// Expose openSearch (global find shortcut) and reload (Cmd+R) so the global
+	// handlers can drive this tab when the wrapper — not the iframe — holds focus.
+	// reload is what lets Cmd+R refresh a web/preview tab instead of opening the
+	// Run Command dialog (cross-origin URL iframes can't receive the in-iframe
+	// reload-request, so the parent must trigger it).
+	createEffect(() => {
+		mdTabsStore.setHandle(props.tab.id, {
+			openSearch: () => setSearchVisible(true),
+			reload: reloadIframe,
+		});
+		onCleanup(() => mdTabsStore.clearHandle(props.tab.id));
+	});
+
+	const handleSearch = (term: string, opts: SearchOptions) => {
+		lastSearch = { term, opts };
+		sendSearch(term, opts);
+		if (!term) {
+			setMatchCount(0);
+			setMatchIndex(-1);
+		}
+	};
+	const handleSearchNext = () => postToIframe({ type: "tuic:search-next" });
+	const handleSearchPrev = () => postToIframe({ type: "tuic:search-prev" });
+	const handleSearchClose = () => {
+		postToIframe({ type: "tuic:search-close" });
+		setSearchVisible(false);
+		setMatchCount(0);
+		setMatchIndex(-1);
+		lastSearch = null;
+		focusWrapper();
+	};
+
 	const kind = () => detectKind(props.tab.fileName);
 
-	/** Asset URL for binary files (PDF, images, video, audio) */
-	const assetUrl = () => convertFileSrc(absolutePath(props.tab));
+	/** Asset URL for binary files (PDF, images, video, audio), cache-busted via repo revision */
+	const assetUrl = () => {
+		const rev = props.tab.repoPath ? repositoriesStore.getRevision(props.tab.repoPath) : 0;
+		return `${convertFileSrc(absolutePath(props.tab))}?v=${rev}`;
+	};
 
 	/** Read file content — used for HTML and text previews */
 	const readFileContent = async (fsRoot: string | undefined, filePath: string): Promise<string> => {
@@ -83,13 +172,14 @@ export const HtmlPreviewTab: Component<HtmlPreviewTabProps> = (props) => {
 			: await invoke<string>("read_external_file", { path: filePath });
 	};
 
-	// Load text content for plain-text previews (HTML uses src= via asset protocol)
+	// Load content for HTML (srcdoc with search/reload injection) and plain-text previews
 	createEffect(() => {
 		const { repoPath, filePath, fsRoot } = props.tab;
 		void (repoPath ? repositoriesStore.getRevision(repoPath) : 0);
+		void reloadKey();
 		const k = kind();
 
-		if (!filePath || k !== "text") {
+		if (!filePath || (k !== "text" && k !== "html")) {
 			setContent("");
 			return;
 		}
@@ -99,7 +189,25 @@ export const HtmlPreviewTab: Component<HtmlPreviewTabProps> = (props) => {
 
 		(async () => {
 			try {
-				const fileContent = await readFileContent(fsRoot || repoPath, filePath);
+				let fileContent = await readFileContent(fsRoot || repoPath, filePath);
+				if (k === "html") {
+					const absPath = absolutePath(props.tab);
+					const dirPath = absPath.substring(0, absPath.lastIndexOf("/") + 1);
+					const baseTag = `<base href="${convertFileSrc(dirPath)}">`;
+					fileContent = fileContent.includes("<head")
+						? fileContent.replace(/<head([^>]*)>/i, `<head$1>${baseTag}`)
+						: `${baseTag}${fileContent}`;
+					const headClose = fileContent.indexOf("</head>");
+					if (headClose >= 0) {
+						fileContent =
+							fileContent.slice(0, headClose) +
+							IFRAME_SEARCH_BRIDGE_SCRIPT +
+							IFRAME_SCROLLBAR_STYLE +
+							fileContent.slice(headClose);
+					} else {
+						fileContent = IFRAME_SEARCH_BRIDGE_SCRIPT + IFRAME_SCROLLBAR_STYLE + fileContent;
+					}
+				}
 				setContent(fileContent);
 			} catch (err) {
 				const msg = err instanceof Error ? err.message : String(err);
@@ -146,6 +254,17 @@ export const HtmlPreviewTab: Component<HtmlPreviewTabProps> = (props) => {
 					</svg>
 				</button>
 			</div>
+			<Show when={kind() === "html"}>
+				<SearchBar
+					visible={searchVisible()}
+					onSearch={handleSearch}
+					onNext={handleSearchNext}
+					onPrev={handleSearchPrev}
+					onClose={handleSearchClose}
+					matchIndex={matchIndex()}
+					matchCount={matchCount()}
+				/>
+			</Show>
 			<Show when={loading()}>
 				<div style={{ padding: "24px", color: "var(--fg-muted)" }}>Loading...</div>
 			</Show>
@@ -155,13 +274,15 @@ export const HtmlPreviewTab: Component<HtmlPreviewTabProps> = (props) => {
 			<Show when={!loading() && !error()}>
 				<Switch>
 					<Match when={kind() === "html"}>
-						<iframe
-							class={s.iframe}
-							sandbox="allow-scripts allow-same-origin"
-							src={assetUrl()}
-							title={props.tab.fileName}
-							onLoad={handleIframeLoad}
-						/>
+						<Show when={content()} keyed>
+							<iframe
+								class={s.iframe}
+								sandbox="allow-scripts allow-same-origin"
+								srcdoc={content()}
+								title={props.tab.fileName}
+								onLoad={handleIframeLoad}
+							/>
+						</Show>
 					</Match>
 					<Match when={kind() === "pdf"}>
 						<iframe class={s.iframe} src={assetUrl()} title={props.tab.fileName} onLoad={handleIframeLoad} />

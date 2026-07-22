@@ -198,6 +198,24 @@ describe("appLogger", () => {
 		});
 	});
 
+	it("serializes Error objects in data with message and stack", async () => {
+		const err = new Error("boom");
+		testInScope(() => {
+			appLogger.error("terminal", "onFrame threw in channel callback", { sessionId: "s1", error: err });
+		});
+
+		await vi.waitFor(() => {
+			expect(mockRpc).toHaveBeenCalledWith("push_log", expect.objectContaining({ level: "error", source: "terminal" }));
+		});
+		const call = mockRpc.mock.calls.find((c) => c[0] === "push_log");
+		const parsed = JSON.parse((call?.[1] as { dataJson: string }).dataJson);
+		expect(parsed.sessionId).toBe("s1");
+		// Plain JSON.stringify would emit {} here — the replacer must surface the failure.
+		expect(parsed.error.message).toBe("boom");
+		expect(parsed.error.name).toBe("Error");
+		expect(typeof parsed.error.stack).toBe("string");
+	});
+
 	it("push sends null dataJson when no data provided", async () => {
 		testInScope(() => {
 			appLogger.warn("app", "plain message");
@@ -236,6 +254,41 @@ describe("appLogger", () => {
 					message: "info msg",
 				}),
 			);
+		});
+	});
+
+	// ---- Audience ----
+
+	it("user-level loggers mirror with audience 'user'", async () => {
+		testInScope(() => {
+			appLogger.warn("git", "pull failed");
+		});
+		await vi.waitFor(() => {
+			expect(mockRpc).toHaveBeenCalledWith(
+				"push_log",
+				expect.objectContaining({ source: "git", message: "pull failed", audience: "user" }),
+			);
+		});
+	});
+
+	it("diag loggers mirror with audience 'diagnostic'", async () => {
+		testInScope(() => {
+			appLogger.diag.warn("app", "UI freeze: 1000ms");
+		});
+		await vi.waitFor(() => {
+			expect(mockRpc).toHaveBeenCalledWith(
+				"push_log",
+				expect.objectContaining({ source: "app", message: "UI freeze: 1000ms", audience: "diagnostic" }),
+			);
+		});
+	});
+
+	it("diagnostic errors do NOT bump the user-facing unseen-error badge", () => {
+		testInScope(() => {
+			appLogger.diag.error("app", "internal telemetry error");
+			expect(appLogger.unseenErrorCount()).toBe(0);
+			appLogger.error("git", "real user error");
+			expect(appLogger.unseenErrorCount()).toBe(1);
 		});
 	});
 
@@ -429,6 +482,55 @@ describe("appLogger", () => {
 			appLogger.warn("github", "a");
 
 			expect(appLogger.entryCount()).toBe(1);
+		});
+	});
+
+	// ---- Audience pool isolation (#6) ----
+	//
+	// User and diagnostic entries live in separate bounded pools, so a flood of
+	// diagnostic telemetry can never evict the user-facing signal.
+
+	it("a diagnostic flood does not evict user entries", () => {
+		testInScope(() => {
+			appLogger.error("git", "user-critical");
+
+			// 1100 exceeds the historical shared 1000-entry cap. Under the old
+			// single-buffer design the user entry (oldest) would be evicted; with
+			// separate pools it must survive.
+			for (let i = 0; i < 1100; i++) {
+				appLogger.diag.info("app", `diag-${i}`);
+			}
+
+			const entries = appLogger.getEntries();
+			expect(entries.some((e) => e.message === "user-critical")).toBe(true);
+			// The diagnostic pool is bounded independently — its oldest entries are
+			// the ones evicted, not the user entry.
+			expect(entries.some((e) => e.message === "diag-0")).toBe(false);
+			expect(entries.some((e) => e.message === "diag-1099")).toBe(true);
+		});
+	});
+
+	it("getEntries merges the two pools in chronological (id) order", () => {
+		testInScope(() => {
+			appLogger.info("app", "u1");
+			appLogger.diag.info("app", "d1");
+			appLogger.info("app", "u2");
+			appLogger.diag.info("app", "d2");
+
+			const msgs = appLogger.getEntries().map((e) => e.message);
+			expect(msgs).toEqual(["u1", "d1", "u2", "d2"]);
+		});
+	});
+
+	it("dedup is per-pool: an interleaved diagnostic entry doesn't break user dedup", () => {
+		testInScope(() => {
+			appLogger.warn("git", "retry");
+			appLogger.diag.warn("app", "telemetry");
+			appLogger.warn("git", "retry");
+
+			const retries = appLogger.getEntries().filter((e) => e.message === "retry");
+			expect(retries).toHaveLength(1);
+			expect(retries[0].repeatCount).toBe(1);
 		});
 	});
 });

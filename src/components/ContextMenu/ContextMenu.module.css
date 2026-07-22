@@ -3,9 +3,10 @@
   min-width: 180px;
   background: var(--bg-secondary);
   border: 1px solid var(--border);
-  border-radius: var(--radius-xl);
+  border-radius: var(--radius-md);
   box-shadow: var(--shadow-dropdown);
   padding: 4px;
+  overflow-y: auto;
   z-index: 1000;
   animation: fadeIn 0.1s ease-out;
 }
@@ -80,7 +81,7 @@
   overflow-y: auto;
   background: var(--bg-secondary);
   border: 1px solid var(--border);
-  border-radius: var(--radius-xl);
+  border-radius: var(--radius-md);
   box-shadow: var(--shadow-dropdown);
   padding: 4px;
   z-index: 1001;

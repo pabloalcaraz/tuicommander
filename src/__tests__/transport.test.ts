@@ -1,5 +1,70 @@
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { buildHttpUrl, isTauri, mapCommandToHttp } from "../transport";
+import { buildHttpUrl, INTENTIONALLY_UNMAPPED, isTauri, mapCommandToHttp } from "../transport";
+
+function readRepoFile(relativePath: string): string {
+	return readFileSync(join(process.cwd(), relativePath), "utf8");
+}
+
+function extractBalancedObject(source: string, marker: string): string {
+	const markerIndex = source.indexOf(marker);
+	if (markerIndex < 0) {
+		throw new Error(`Marker not found: ${marker}`);
+	}
+	const start = source.indexOf("{", markerIndex);
+	if (start < 0) {
+		throw new Error(`Object start not found after marker: ${marker}`);
+	}
+
+	let depth = 0;
+	for (let index = start; index < source.length; index += 1) {
+		const char = source[index];
+		if (char === "{") depth += 1;
+		if (char === "}") {
+			depth -= 1;
+			if (depth === 0) return source.slice(start, index + 1);
+		}
+	}
+
+	throw new Error(`Object end not found after marker: ${marker}`);
+}
+
+function extractCommandTableCommands(): Set<string> {
+	const transportSource = readRepoFile("src/transport.ts");
+	const tableBody = extractBalancedObject(transportSource, "const COMMAND_TABLE");
+	return new Set(
+		Array.from(tableBody.matchAll(/^\s*([a-zA-Z_][\w]*):\s*\{/gm), (match) => match[1]).filter(
+			(command) => command !== undefined,
+		),
+	);
+}
+
+function extractRegisteredTauriCommands(): Set<string> {
+	const libSource = readRepoFile("src-tauri/src/lib.rs");
+	const handlerStart = libSource.indexOf("tauri::generate_handler![");
+	if (handlerStart < 0) {
+		throw new Error("tauri::generate_handler![ block not found");
+	}
+	const listStart = libSource.indexOf("[", handlerStart);
+	const listEnd = libSource.indexOf("\n        ])", listStart);
+	if (listStart < 0 || listEnd < 0) {
+		throw new Error("tauri::generate_handler![ command list bounds not found");
+	}
+
+	const commandList = libSource
+		.slice(listStart + 1, listEnd)
+		.replace(/\/\/.*$/gm, "")
+		.split(",")
+		.map((entry) => entry.trim())
+		.filter((entry) => entry.length > 0)
+		.map((entry) => {
+			const parts = entry.split("::");
+			return parts[parts.length - 1];
+		});
+
+	return new Set(commandList);
+}
 
 describe("transport", () => {
 	describe("isTauri()", () => {
@@ -290,6 +355,960 @@ describe("transport", () => {
 			expect(result.method).toBe("POST");
 			expect(result.path).toBe("/sessions/s1/terminal/request-frame");
 		});
+
+		it("maps get_agent_hook_state to GET and unwraps {state}", () => {
+			const result = mapCommandToHttp("get_agent_hook_state", { agentType: "claude" });
+			expect(result.method).toBe("GET");
+			expect(result.path).toBe("/config/agents/claude/hook-instrumentation");
+			expect(result.transform?.({ state: "installed" })).toBe("installed");
+		});
+
+		it("maps set_agent_hook_instrumentation to PUT with {enabled} body", () => {
+			const result = mapCommandToHttp("set_agent_hook_instrumentation", { agentType: "claude", enabled: true });
+			expect(result.method).toBe("PUT");
+			expect(result.path).toBe("/config/agents/claude/hook-instrumentation");
+			expect(result.body).toEqual({ enabled: true });
+		});
+
+		it("maps read_plugin_data to GET /api/plugins/{id}/data/{path} with notFoundAsNull", () => {
+			const result = mapCommandToHttp("read_plugin_data", {
+				pluginId: "my-plugin",
+				path: "credential-consent-anthropic",
+			});
+			expect(result.method).toBe("GET");
+			expect(result.path).toBe("/api/plugins/my-plugin/data/credential-consent-anthropic");
+			expect(result.notFoundAsNull).toBe(true);
+			// Faithful Option<String> bridge: plain strings pass through, non-strings stringify, null stays null.
+			expect(result.transform?.("allowed")).toBe("allowed");
+			expect(result.transform?.({ a: 1 })).toBe('{"a":1}');
+			expect(result.transform?.(null)).toBeNull();
+		});
+
+		it("maps write_plugin_data to POST with content body", () => {
+			const result = mapCommandToHttp("write_plugin_data", {
+				pluginId: "my-plugin",
+				path: "credential-consent-anthropic",
+				content: "allowed",
+			});
+			expect(result.method).toBe("POST");
+			expect(result.path).toBe("/api/plugins/my-plugin/data/credential-consent-anthropic");
+			expect(result.body).toEqual({ content: "allowed" });
+		});
+
+		it("maps resolve_terminal_path to GET with null-passthrough transform", () => {
+			const result = mapCommandToHttp("resolve_terminal_path", { cwd: "/repo", candidate: "src/x.ts" });
+			expect(result.method).toBe("GET");
+			expect(result.path).toBe("/fs/resolve-terminal-path?cwd=%2Frepo&candidate=src%2Fx.ts");
+			expect(result.transform?.({ absolute_path: "/repo/src/x.ts", is_directory: false })).toEqual({
+				absolute_path: "/repo/src/x.ts",
+				is_directory: false,
+			});
+			expect(result.transform?.(null)).toBeNull();
+		});
+
+		it("maps stat_path to GET /fs/stat?path=", () => {
+			const result = mapCommandToHttp("stat_path", { path: "/repo/file.md" });
+			expect(result.method).toBe("GET");
+			expect(result.path).toBe("/fs/stat?path=%2Frepo%2Ffile.md");
+		});
+
+		it("maps warm_content_index to POST /fs/warm-index", () => {
+			const result = mapCommandToHttp("warm_content_index", { repoPath: "/repo" });
+			expect(result.method).toBe("POST");
+			expect(result.path).toBe("/fs/warm-index");
+			expect(result.body).toEqual({ repoPath: "/repo" });
+		});
+
+		it("maps write_external_file to POST /fs/write-external", () => {
+			const result = mapCommandToHttp("write_external_file", { path: "/repo/a.md", content: "hi" });
+			expect(result.method).toBe("POST");
+			expect(result.path).toBe("/fs/write-external");
+			expect(result.body).toEqual({ path: "/repo/a.md", content: "hi" });
+		});
+
+		it("maps copy_path_abs to POST /fs/copy-abs", () => {
+			const result = mapCommandToHttp("copy_path_abs", { from: "/a/x", to: "/b/x" });
+			expect(result.method).toBe("POST");
+			expect(result.path).toBe("/fs/copy-abs");
+			expect(result.body).toEqual({ from: "/a/x", to: "/b/x" });
+		});
+
+		it("maps move_path_abs to POST /fs/move-abs", () => {
+			const result = mapCommandToHttp("move_path_abs", { from: "/a/x", to: "/b/x" });
+			expect(result.method).toBe("POST");
+			expect(result.path).toBe("/fs/move-abs");
+			expect(result.body).toEqual({ from: "/a/x", to: "/b/x" });
+		});
+
+		it("maps fs_transfer_paths to POST /fs/transfer", () => {
+			const result = mapCommandToHttp("fs_transfer_paths", {
+				destDir: "/repo/dst",
+				paths: ["/a/x", "/a/y"],
+				mode: "move",
+				allowRecursive: true,
+			});
+			expect(result.method).toBe("POST");
+			expect(result.path).toBe("/fs/transfer");
+			expect(result.body).toEqual({
+				destDir: "/repo/dst",
+				paths: ["/a/x", "/a/y"],
+				mode: "move",
+				allowRecursive: true,
+			});
+		});
+
+		// --- PTY/terminal read commands (story 062) ---
+		it("maps get_shell_state to GET with {state} unwrap transform", () => {
+			const result = mapCommandToHttp("get_shell_state", { sessionId: "s1" });
+			expect(result.method).toBe("GET");
+			expect(result.path).toBe("/sessions/s1/shell-state");
+			expect(result.transform?.({ state: "busy" })).toBe("busy");
+			expect(result.transform?.({ state: null })).toBeNull();
+		});
+
+		it("maps get_last_prompt to GET with {prompt} unwrap transform", () => {
+			const result = mapCommandToHttp("get_last_prompt", { sessionId: "s1" });
+			expect(result.method).toBe("GET");
+			expect(result.path).toBe("/sessions/s1/last-prompt");
+			expect(result.transform?.({ prompt: "do the thing" })).toBe("do the thing");
+			expect(result.transform?.({ prompt: null })).toBeNull();
+		});
+
+		it("maps get_input_buffer_content to GET with {content} unwrap transform", () => {
+			const result = mapCommandToHttp("get_input_buffer_content", { sessionId: "s1" });
+			expect(result.method).toBe("GET");
+			expect(result.path).toBe("/sessions/s1/input-buffer");
+			expect(result.transform?.({ content: "ls -la" })).toBe("ls -la");
+		});
+
+		it("maps get_session_leaf_pid to GET with {pid} unwrap transform", () => {
+			const result = mapCommandToHttp("get_session_leaf_pid", { sessionId: "s1" });
+			expect(result.method).toBe("GET");
+			expect(result.path).toBe("/sessions/s1/leaf-pid");
+			expect(result.transform?.({ pid: 4321 })).toBe(4321);
+			expect(result.transform?.({ pid: null })).toBeNull();
+		});
+
+		it("maps has_foreground_process to GET with {process} unwrap transform", () => {
+			const result = mapCommandToHttp("has_foreground_process", { sessionId: "s1" });
+			expect(result.method).toBe("GET");
+			expect(result.path).toBe("/sessions/s1/has-foreground");
+			expect(result.transform?.({ process: "htop" })).toBe("htop");
+			expect(result.transform?.({ process: null })).toBeNull();
+		});
+
+		it("maps set_session_visible to POST /sessions/{id}/visible", () => {
+			const result = mapCommandToHttp("set_session_visible", { sessionId: "s1", visible: false });
+			expect(result.method).toBe("POST");
+			expect(result.path).toBe("/sessions/s1/visible");
+			expect(result.body).toEqual({ visible: false });
+		});
+
+		it("maps get_process_stats to GET /process/stats", () => {
+			const result = mapCommandToHttp("get_process_stats", {});
+			expect(result.method).toBe("GET");
+			expect(result.path).toBe("/process/stats");
+		});
+
+		it("maps terminal_get_selection_text to GET with {text} unwrap transform", () => {
+			const result = mapCommandToHttp("terminal_get_selection_text", {
+				sessionId: "s1",
+				startRow: 1,
+				startCol: 2,
+				endRow: 3,
+				endCol: 4,
+			});
+			expect(result.method).toBe("GET");
+			expect(result.path).toBe("/sessions/s1/terminal/selection-text?startRow=1&startCol=2&endRow=3&endCol=4");
+			expect(result.transform?.({ text: "hello" })).toBe("hello");
+		});
+
+		it("maps terminal_get_logical_line to GET (tuple array, no transform)", () => {
+			const result = mapCommandToHttp("terminal_get_logical_line", { sessionId: "s1", row: 7 });
+			expect(result.method).toBe("GET");
+			expect(result.path).toBe("/sessions/s1/terminal/logical-line?row=7");
+			expect(result.transform).toBeUndefined();
+		});
+
+		it("maps terminal_hyperlink_span to GET with null-passthrough transform", () => {
+			const result = mapCommandToHttp("terminal_hyperlink_span", { sessionId: "s1", row: 2, col: 5 });
+			expect(result.method).toBe("GET");
+			expect(result.path).toBe("/sessions/s1/terminal/hyperlink-span?row=2&col=5");
+			expect(result.transform?.([2, 9, "https://x.dev"])).toEqual([2, 9, "https://x.dev"]);
+			expect(result.transform?.(null)).toBeNull();
+		});
+
+		// --- Claude Usage dashboard (story 063) ---
+		it("maps get_claude_usage_api to GET /claude/usage", () => {
+			const result = mapCommandToHttp("get_claude_usage_api", {});
+			expect(result.method).toBe("GET");
+			expect(result.path).toBe("/claude/usage");
+		});
+
+		it("maps get_claude_project_list to GET /claude/projects", () => {
+			const result = mapCommandToHttp("get_claude_project_list", {});
+			expect(result.method).toBe("GET");
+			expect(result.path).toBe("/claude/projects");
+		});
+
+		it("maps get_claude_usage_timeline to GET with scope + days", () => {
+			const result = mapCommandToHttp("get_claude_usage_timeline", { scope: "all", days: 7 });
+			expect(result.method).toBe("GET");
+			expect(result.path).toBe("/claude/timeline?scope=all&days=7");
+		});
+
+		it("maps get_claude_usage_timeline omitting days when absent", () => {
+			const result = mapCommandToHttp("get_claude_usage_timeline", { scope: "my-proj" });
+			expect(result.path).toBe("/claude/timeline?scope=my-proj");
+		});
+
+		it("maps get_claude_session_stats to GET with scope", () => {
+			const result = mapCommandToHttp("get_claude_session_stats", { scope: "current" });
+			expect(result.method).toBe("GET");
+			expect(result.path).toBe("/claude/session-stats?scope=current");
+		});
+
+		// --- Git panel (story 064) ---
+		it("maps get_gutter_changes to GET with optional scope", () => {
+			const a = mapCommandToHttp("get_gutter_changes", { path: "/r", file: "a.ts", scope: "head" });
+			expect(a.method).toBe("GET");
+			expect(a.path).toBe("/repo/gutter-changes?path=%2Fr&file=a.ts&scope=head");
+			const b = mapCommandToHttp("get_gutter_changes", { path: "/r", file: "a.ts" });
+			expect(b.path).toBe("/repo/gutter-changes?path=%2Fr&file=a.ts");
+		});
+
+		it("maps get_branches_detail to GET /repo/branches-detail", () => {
+			const result = mapCommandToHttp("get_branches_detail", { path: "/r" });
+			expect(result.method).toBe("GET");
+			expect(result.path).toBe("/repo/branches-detail?path=%2Fr");
+		});
+
+		it("maps get_recent_branches with optional limit", () => {
+			expect(mapCommandToHttp("get_recent_branches", { path: "/r", limit: 5 }).path).toBe(
+				"/repo/recent-branches?path=%2Fr&limit=5",
+			);
+			expect(mapCommandToHttp("get_recent_branches", { path: "/r" }).path).toBe("/repo/recent-branches?path=%2Fr");
+		});
+
+		it("maps get_branch_base to GET with null-passthrough transform", () => {
+			const result = mapCommandToHttp("get_branch_base", { path: "/r", branchName: "feat" });
+			expect(result.path).toBe("/repo/branch-base?path=%2Fr&branchName=feat");
+			expect(result.transform?.("main")).toBe("main");
+			expect(result.transform?.(null)).toBeNull();
+		});
+
+		it("maps check_worktree_dirty to GET", () => {
+			const result = mapCommandToHttp("check_worktree_dirty", { repoPath: "/r", branchName: "feat" });
+			expect(result.path).toBe("/repo/worktree-dirty?repoPath=%2Fr&branchName=feat");
+		});
+
+		it("maps list_base_ref_options to GET", () => {
+			expect(mapCommandToHttp("list_base_ref_options", { repoPath: "/r" }).path).toBe(
+				"/repo/base-ref-options?repoPath=%2Fr",
+			);
+		});
+
+		it("maps generate_clone_branch_name_cmd to POST", () => {
+			const result = mapCommandToHttp("generate_clone_branch_name_cmd", {
+				sourceBranch: "main",
+				existingNames: ["a", "b"],
+			});
+			expect(result.method).toBe("POST");
+			expect(result.path).toBe("/repo/clone-branch-name");
+			expect(result.body).toEqual({ sourceBranch: "main", existingNames: ["a", "b"] });
+		});
+
+		it("maps get_commit_graph with optional count", () => {
+			expect(mapCommandToHttp("get_commit_graph", { path: "/r", count: 200 }).path).toBe(
+				"/repo/commit-graph?path=%2Fr&count=200",
+			);
+			expect(mapCommandToHttp("get_commit_graph", { path: "/r" }).path).toBe("/repo/commit-graph?path=%2Fr");
+		});
+
+		it("maps create_branch to POST", () => {
+			const result = mapCommandToHttp("create_branch", {
+				path: "/r",
+				name: "feat",
+				startPoint: "main",
+				checkout: true,
+			});
+			expect(result.method).toBe("POST");
+			expect(result.path).toBe("/repo/create-branch");
+			expect(result.body).toEqual({ path: "/r", name: "feat", startPoint: "main", checkout: true });
+		});
+
+		it("maps delete_branch to POST", () => {
+			const result = mapCommandToHttp("delete_branch", { path: "/r", name: "feat", force: false });
+			expect(result.method).toBe("POST");
+			expect(result.path).toBe("/repo/delete-branch");
+			expect(result.body).toEqual({ path: "/r", name: "feat", force: false });
+		});
+
+		it("maps delete_local_branch to POST", () => {
+			const result = mapCommandToHttp("delete_local_branch", {
+				repoPath: "/r",
+				branchName: "feat",
+				keepWorktree: true,
+			});
+			expect(result.method).toBe("POST");
+			expect(result.path).toBe("/repo/delete-local-branch");
+			expect(result.body).toEqual({ repoPath: "/r", branchName: "feat", keepWorktree: true });
+		});
+
+		it("maps update_from_base to POST", () => {
+			const result = mapCommandToHttp("update_from_base", {
+				path: "/r",
+				branchName: "feat",
+				strategy: "rebase",
+			});
+			expect(result.method).toBe("POST");
+			expect(result.path).toBe("/repo/update-from-base");
+			expect(result.body).toEqual({ path: "/r", branchName: "feat", strategy: "rebase" });
+		});
+
+		it("maps switch_branch to POST", () => {
+			const result = mapCommandToHttp("switch_branch", {
+				repoPath: "/r",
+				branchName: "feat",
+				force: false,
+				stash: true,
+			});
+			expect(result.method).toBe("POST");
+			expect(result.path).toBe("/repo/switch-branch");
+			expect(result.body).toEqual({ repoPath: "/r", branchName: "feat", force: false, stash: true });
+		});
+
+		it("maps merge_and_archive_worktree to POST", () => {
+			const result = mapCommandToHttp("merge_and_archive_worktree", {
+				repoPath: "/r",
+				branchName: "feat",
+				targetBranch: "main",
+				afterMerge: "archive",
+			});
+			expect(result.method).toBe("POST");
+			expect(result.path).toBe("/repo/merge-archive-worktree");
+			expect(result.body).toEqual({
+				repoPath: "/r",
+				branchName: "feat",
+				targetBranch: "main",
+				afterMerge: "archive",
+			});
+		});
+
+		it("maps close_issue to POST", () => {
+			const result = mapCommandToHttp("close_issue", { repoPath: "/r", issueNumber: 42 });
+			expect(result.method).toBe("POST");
+			expect(result.path).toBe("/repo/issues/close");
+			expect(result.body).toEqual({ repoPath: "/r", issueNumber: 42 });
+		});
+
+		it("maps reopen_issue to POST", () => {
+			const result = mapCommandToHttp("reopen_issue", { repoPath: "/r", issueNumber: 42 });
+			expect(result.method).toBe("POST");
+			expect(result.path).toBe("/repo/issues/reopen");
+			expect(result.body).toEqual({ repoPath: "/r", issueNumber: 42 });
+		});
+
+		it("maps get_issue_detail to GET", () => {
+			const result = mapCommandToHttp("get_issue_detail", { repoPath: "/r", issueNumber: 42 });
+			expect(result.method).toBe("GET");
+			expect(result.path).toBe("/repo/issue-detail?repoPath=%2Fr&issueNumber=42");
+		});
+
+		it("maps GitHub write primitives to HTTP", () => {
+			const pr = mapCommandToHttp("create_pr", {
+				repoPath: "/r",
+				title: "Fix bug",
+				body: "Details",
+				base: "main",
+				head: "fix/bug",
+				draft: true,
+			});
+			expect(pr.method).toBe("POST");
+			expect(pr.path).toBe("/repo/create-pr");
+			expect(pr.body).toEqual({
+				repoPath: "/r",
+				title: "Fix bug",
+				body: "Details",
+				base: "main",
+				head: "fix/bug",
+				draft: true,
+			});
+
+			const issue = mapCommandToHttp("create_issue", { repoPath: "/r", title: "Bug", body: "Broken" });
+			expect(issue.method).toBe("POST");
+			expect(issue.path).toBe("/repo/create-issue");
+			expect(issue.body).toEqual({ repoPath: "/r", title: "Bug", body: "Broken" });
+
+			const proposal = { issue_title: "Improve tests", issue_body: "Acceptance:\n- covered" };
+			const proposalIssue = mapCommandToHttp("create_issue_from_proposal", { repoPath: "/r", proposal });
+			expect(proposalIssue.method).toBe("POST");
+			expect(proposalIssue.path).toBe("/repo/create-issue-from-proposal");
+			expect(proposalIssue.body).toEqual({ repoPath: "/r", proposal });
+
+			const review = mapCommandToHttp("post_pr_review", {
+				repoPath: "/r",
+				prNumber: 42,
+				body: "Review",
+				event: "COMMENT",
+				comments: [{ path: "src/main.rs", line: 10, side: "RIGHT", body: "Check this" }],
+			});
+			expect(review.method).toBe("POST");
+			expect(review.path).toBe("/repo/post-pr-review");
+			expect(review.body).toEqual({
+				repoPath: "/r",
+				prNumber: 42,
+				body: "Review",
+				event: "COMMENT",
+				comments: [{ path: "src/main.rs", line: 10, side: "RIGHT", body: "Check this" }],
+			});
+		});
+
+		it("maps get_merged_prs to GET with optional sinceTag", () => {
+			const noTag = mapCommandToHttp("get_merged_prs", { repoPath: "/r" });
+			expect(noTag.method).toBe("GET");
+			expect(noTag.path).toBe("/repo/merged-prs?path=%2Fr");
+
+			const withTag = mapCommandToHttp("get_merged_prs", { repoPath: "/r", sinceTag: "v1.2.0" });
+			expect(withTag.path).toBe("/repo/merged-prs?path=%2Fr&sinceTag=v1.2.0");
+		});
+
+		it("maps generate_changelog to GET with optional sinceTag", () => {
+			const noTag = mapCommandToHttp("generate_changelog", { repoPath: "/r" });
+			expect(noTag.method).toBe("GET");
+			expect(noTag.path).toBe("/repo/changelog?path=%2Fr");
+
+			const withTag = mapCommandToHttp("generate_changelog", { repoPath: "/r", sinceTag: "v1.2.0" });
+			expect(withTag.path).toBe("/repo/changelog?path=%2Fr&sinceTag=v1.2.0");
+		});
+
+		it("maps start_conflict_assist to POST", () => {
+			const result = mapCommandToHttp("start_conflict_assist", { repoPath: "/r", prNumber: 7 });
+			expect(result.method).toBe("POST");
+			expect(result.path).toBe("/repo/conflict-assist");
+			expect(result.body).toEqual({ repoPath: "/r", prNumber: 7 });
+		});
+
+		it("maps get_github_viewer_login to GET", () => {
+			const result = mapCommandToHttp("get_github_viewer_login", {});
+			expect(result.method).toBe("GET");
+			expect(result.path).toBe("/github/viewer-login");
+		});
+
+		it("maps fetch_ci_failure_logs to GET with query", () => {
+			const result = mapCommandToHttp("fetch_ci_failure_logs", { repoPath: "/r", branch: "feat" });
+			expect(result.method).toBe("GET");
+			expect(result.path).toBe("/repo/ci-failure-logs?repoPath=%2Fr&branch=feat");
+		});
+
+		it("maps github_set_pr_hide_drafts to POST", () => {
+			const result = mapCommandToHttp("github_set_pr_hide_drafts", { hide: true });
+			expect(result.method).toBe("POST");
+			expect(result.path).toBe("/github/pr-hide-drafts");
+			expect(result.body).toEqual({ hide: true });
+		});
+
+		it("maps github device-code auth flow", () => {
+			expect(mapCommandToHttp("github_start_login", {}).path).toBe("/github/auth/start");
+			expect(mapCommandToHttp("github_start_login", {}).method).toBe("POST");
+			const poll = mapCommandToHttp("github_poll_login", { deviceCode: "abc" });
+			expect(poll.method).toBe("POST");
+			expect(poll.path).toBe("/github/auth/poll");
+			expect(poll.body).toEqual({ deviceCode: "abc" });
+			const addPoll = mapCommandToHttp("github_poll_add_account", { deviceCode: "def" });
+			expect(addPoll.method).toBe("POST");
+			expect(addPoll.path).toBe("/github/auth/poll");
+			expect(addPoll.body).toEqual({ deviceCode: "def" });
+			expect(mapCommandToHttp("github_logout", {}).path).toBe("/github/auth/logout");
+			expect(mapCommandToHttp("github_disconnect", {}).path).toBe("/github/auth/disconnect");
+			expect(mapCommandToHttp("github_auth_status", {}).path).toBe("/github/auth/status");
+			expect(mapCommandToHttp("github_auth_status", {}).method).toBe("GET");
+			expect(mapCommandToHttp("github_diagnostics", {}).path).toBe("/github/diagnostics");
+		});
+
+		it("maps multi-account accounts + repo bindings", () => {
+			expect(mapCommandToHttp("github_list_accounts", {}).method).toBe("GET");
+			expect(mapCommandToHttp("github_list_accounts", {}).path).toBe("/github/accounts");
+
+			const add = mapCommandToHttp("github_add_account", { host: "ghe.acme.com", pat: "ghp_x" });
+			expect(add.method).toBe("POST");
+			expect(add.path).toBe("/github/accounts");
+			expect(add.body).toEqual({ host: "ghe.acme.com", pat: "ghp_x" });
+
+			const rm = mapCommandToHttp("github_remove_account", { id: "ghe.acme.com" });
+			expect(rm.method).toBe("POST");
+			expect(rm.path).toBe("/github/accounts/remove");
+			expect(rm.body).toEqual({ id: "ghe.acme.com" });
+
+			expect(mapCommandToHttp("github_list_bindings", {}).path).toBe("/github/bindings");
+			expect(mapCommandToHttp("github_list_bindings", {}).method).toBe("GET");
+
+			const bind = mapCommandToHttp("github_bind_repo", {
+				repoPath: "/my/repo",
+				accountId: "ghe.acme.com",
+				remoteName: "origin",
+			});
+			expect(bind.method).toBe("POST");
+			expect(bind.path).toBe("/github/bindings");
+			expect(bind.body).toEqual({ repoPath: "/my/repo", accountId: "ghe.acme.com", remoteName: "origin" });
+
+			const unbind = mapCommandToHttp("github_unbind_repo", { repoPath: "/my/repo" });
+			expect(unbind.method).toBe("POST");
+			expect(unbind.path).toBe("/github/bindings/remove");
+			expect(unbind.body).toEqual({ repoPath: "/my/repo" });
+
+			const resolve = mapCommandToHttp("github_resolve_repo", { repoPath: "/my/repo" });
+			expect(resolve.method).toBe("GET");
+			expect(resolve.path).toBe("/github/resolve-repo?repoPath=%2Fmy%2Frepo");
+
+			const resolveBatch = mapCommandToHttp("github_resolve_repos", { repoPaths: ["/a", "/b"] });
+			expect(resolveBatch.method).toBe("POST");
+			expect(resolveBatch.path).toBe("/github/resolve-repos");
+			expect(resolveBatch.body).toEqual({ repoPaths: ["/a", "/b"] });
+		});
+
+		it("maps ai-prompts load/save", () => {
+			expect(mapCommandToHttp("load_ai_prompts", {}).path).toBe("/config/ai-prompts");
+			expect(mapCommandToHttp("load_ai_prompts", {}).method).toBe("GET");
+			const save = mapCommandToHttp("save_ai_prompts", { config: { a: 1 } });
+			expect(save.method).toBe("PUT");
+			expect(save.path).toBe("/config/ai-prompts");
+			expect(save.body).toEqual({ a: 1 });
+		});
+
+		it("maps note asset commands", () => {
+			const img = mapCommandToHttp("save_note_image", {
+				noteId: "n1",
+				dataBase64: "AAA",
+				extension: "png",
+			});
+			expect(img.path).toBe("/config/note-image");
+			expect(img.body).toEqual({ noteId: "n1", dataBase64: "AAA", extension: "png" });
+			expect(mapCommandToHttp("delete_note_assets", { noteId: "n1" }).path).toBe("/config/note-assets/delete");
+			const batch = mapCommandToHttp("delete_note_assets_batch", { noteIds: ["a", "b"] });
+			expect(batch.path).toBe("/config/note-assets/delete-batch");
+			expect(batch.body).toEqual({ noteIds: ["a", "b"] });
+		});
+
+		it("maps config/themes/mcp-upstreams commands", () => {
+			expect(mapCommandToHttp("list_themes", {}).path).toBe("/config/themes");
+			const rlc = mapCommandToHttp("save_repo_local_config", { repoPath: "/r" });
+			expect(rlc.method).toBe("POST");
+			expect(rlc.body).toEqual({ repoPath: "/r" });
+			const bl = mapCommandToHttp("set_branch_label", {
+				repoPath: "/r",
+				branchName: "feat",
+				label: "x",
+			});
+			expect(bl.path).toBe("/config/branch-label");
+			expect(bl.body).toEqual({ repoPath: "/r", branchName: "feat", label: "x" });
+			const up = mapCommandToHttp("set_project_mcp_upstreams", {
+				repoPath: "/r",
+				upstreamNames: ["a"],
+			});
+			expect(up.path).toBe("/config/project-mcp-upstreams");
+			expect(up.body).toEqual({ repoPath: "/r", upstreamNames: ["a"] });
+		});
+
+		it("maps misc command parity (shell/audio/agent/generators/registry)", () => {
+			const sh = mapCommandToHttp("execute_shell_script", {
+				scriptContent: "echo hi",
+				timeoutMs: 5000,
+				repoPath: "/r",
+			});
+			expect(sh.method).toBe("POST");
+			expect(sh.path).toBe("/exec/shell-script");
+			expect(sh.body).toEqual({ scriptContent: "echo hi", timeoutMs: 5000, repoPath: "/r" });
+			expect(mapCommandToHttp("list_audio_output_devices", {}).path).toBe("/audio/output-devices");
+			const disc = mapCommandToHttp("discover_agent_session", {
+				agentType: "claude",
+				cwd: "/r",
+				claimedIds: [],
+				agentPid: 123,
+				envOverrides: {},
+			});
+			expect(disc.path).toBe("/agent/discover-session");
+			expect(disc.body).toEqual({
+				agentType: "claude",
+				cwd: "/r",
+				claimedIds: [],
+				agentPid: 123,
+				envOverrides: {},
+			});
+			expect(mapCommandToHttp("claude_project_dir", { cwd: "/r", claudeConfigDir: null }).path).toBe(
+				"/agent/claude-project-dir",
+			);
+			const oic = mapCommandToHttp("open_in_custom", {
+				executable: "code",
+				args: ["-g"],
+				ctx: { repo: "/r" },
+			});
+			expect(oic.path).toBe("/agent/open-in-custom");
+			expect(oic.body).toEqual({ executable: "code", args: ["-g"], ctx: { repo: "/r" } });
+			const gen = mapCommandToHttp("generate_value", { request: { type: "password" } });
+			expect(gen.path).toBe("/generators/generate");
+			expect(gen.body).toEqual({ request: { type: "password" } });
+			expect(mapCommandToHttp("fetch_plugin_registry", {}).path).toBe("/registry/plugins");
+		});
+
+		it("maps AI watcher CRUD (story 070)", () => {
+			expect(mapCommandToHttp("watcher_list", {}).path).toBe("/ai/watchers");
+			expect(mapCommandToHttp("watcher_list", {}).method).toBe("GET");
+			const create = mapCommandToHttp("watcher_create", {
+				name: "w1",
+				sessionId: "s1",
+				trigger: { type: "Idle" },
+				instructions: "do it",
+				promptId: null,
+				repoPath: "/r",
+				maxFires: 3,
+				cooldownSecs: 30,
+			});
+			expect(create.method).toBe("POST");
+			expect(create.path).toBe("/ai/watchers");
+			expect(create.body).toEqual({
+				name: "w1",
+				sessionId: "s1",
+				trigger: { type: "Idle" },
+				instructions: "do it",
+				promptId: null,
+				repoPath: "/r",
+				maxFires: 3,
+				cooldownSecs: 30,
+			});
+			expect(mapCommandToHttp("watcher_update", { id: "x" }).path).toBe("/ai/watchers/update");
+			expect(mapCommandToHttp("watcher_delete", { id: "x" }).body).toEqual({ id: "x" });
+			expect(mapCommandToHttp("watcher_toggle", { id: "x", enabled: true }).body).toEqual({
+				id: "x",
+				enabled: true,
+			});
+			expect(mapCommandToHttp("watcher_attach", { templateId: "t", sessionId: "s" }).body).toEqual({
+				templateId: "t",
+				sessionId: "s",
+			});
+			expect(mapCommandToHttp("watcher_detach", { id: "x" }).path).toBe("/ai/watchers/detach");
+		});
+
+		it("maps AI chat config + conversation CRUD (story 069)", () => {
+			expect(mapCommandToHttp("load_ai_chat_config", {}).path).toBe("/ai/chat/config");
+			const save = mapCommandToHttp("save_ai_chat_config", { config: { temperature: 0.5 } });
+			expect(save.method).toBe("PUT");
+			expect(save.path).toBe("/ai/chat/config");
+			expect(save.body).toEqual({ temperature: 0.5 });
+			expect(mapCommandToHttp("list_conversations", {}).path).toBe("/ai/chat/conversations");
+			expect(mapCommandToHttp("load_conversation", { id: "abc" }).path).toBe("/ai/chat/conversation?id=abc");
+			const sc = mapCommandToHttp("save_conversation", { conversation: { meta: { id: "abc" } } });
+			expect(sc.method).toBe("POST");
+			expect(sc.path).toBe("/ai/chat/conversation");
+			expect(sc.body).toEqual({ meta: { id: "abc" } });
+			const del = mapCommandToHttp("delete_conversation", { id: "abc" });
+			expect(del.path).toBe("/ai/chat/conversation/delete");
+			expect(del.body).toEqual({ id: "abc" });
+			expect(mapCommandToHttp("new_conversation_id", {}).method).toBe("POST");
+			expect(mapCommandToHttp("new_conversation_id", {}).path).toBe("/ai/chat/new-id");
+		});
+
+		it("maps agent loop control + knowledge + scheduler (story 068)", () => {
+			for (const cmd of ["cancel_conversation", "pause_conversation", "resume_conversation"]) {
+				const r = mapCommandToHttp(cmd, { sessionId: "s1" });
+				expect(r.method).toBe("POST");
+				expect(r.path).toBe(`/ai/conversation/${cmd.split("_")[0]}`);
+				expect(r.body).toEqual({ sessionId: "s1" });
+			}
+			const ap = mapCommandToHttp("approve_conversation_action", { sessionId: "s1", approved: true });
+			expect(ap.path).toBe("/ai/conversation/approve");
+			expect(ap.body).toEqual({ sessionId: "s1", approved: true });
+			expect(mapCommandToHttp("get_session_knowledge", { sessionId: "s1" }).path).toBe(
+				"/ai/session-knowledge?sessionId=s1",
+			);
+			expect(mapCommandToHttp("toggle_ai_suggestions", { sessionId: "s1" }).path).toBe("/ai/suggestions/toggle");
+			const lk = mapCommandToHttp("list_knowledge_sessions", { filter: { text: "x" }, limit: 50 });
+			expect(lk.method).toBe("POST");
+			expect(lk.path).toBe("/ai/knowledge/sessions");
+			expect(lk.body).toEqual({ filter: { text: "x" }, limit: 50 });
+			expect(mapCommandToHttp("get_knowledge_session_detail", { sessionId: "s1" }).path).toBe(
+				"/ai/knowledge/session?sessionId=s1",
+			);
+			expect(mapCommandToHttp("load_scheduler_config", {}).path).toBe("/ai/scheduler/config");
+			const ss = mapCommandToHttp("save_scheduler_config", { config: { jobs: [] } });
+			expect(ss.method).toBe("PUT");
+			expect(ss.body).toEqual({ jobs: [] });
+		});
+
+		it("maps run_diff_triage trigger (event-bridge plan Step 2)", () => {
+			const r = mapCommandToHttp("run_diff_triage", { repoPath: "/r", refresh: true });
+			expect(r.method).toBe("POST");
+			expect(r.path).toBe("/ai/triage/run");
+			expect(r.body).toEqual({ repoPath: "/r", refresh: true });
+		});
+
+		it("maps run_pr_review trigger", () => {
+			const r = mapCommandToHttp("run_pr_review", { repoPath: "/r", prNumber: 42 });
+			expect(r.method).toBe("POST");
+			expect(r.path).toBe("/ai/review/pr");
+			expect(r.body).toEqual({ repoPath: "/r", prNumber: 42 });
+		});
+
+		it("maps run_improvement_scan trigger", () => {
+			const r = mapCommandToHttp("run_improvement_scan", { repoPath: "/r", focus: "testing" });
+			expect(r.method).toBe("POST");
+			expect(r.path).toBe("/ai/improvements/scan");
+			expect(r.body).toEqual({ repoPath: "/r", focus: "testing" });
+		});
+
+		it("maps plugin RPC commands (story 071)", () => {
+			// plugin_read_file
+			const rf = mapCommandToHttp("plugin_read_file", { pluginId: "my-plugin", path: "/home/user/f.txt" });
+			expect(rf.method).toBe("GET");
+			expect(rf.path).toBe("/api/plugins/my-plugin/fs/read?path=%2Fhome%2Fuser%2Ff.txt");
+
+			// plugin_read_file_base64
+			const rfb = mapCommandToHttp("plugin_read_file_base64", { pluginId: "my-plugin", path: "/home/user/f.docx" });
+			expect(rfb.method).toBe("GET");
+			expect(rfb.path).toBe("/api/plugins/my-plugin/fs/read-base64?path=%2Fhome%2Fuser%2Ff.docx");
+
+			// plugin_read_file_tail
+			const tail = mapCommandToHttp("plugin_read_file_tail", {
+				pluginId: "my-plugin",
+				path: "/home/user/f.log",
+				maxBytes: 4096,
+			});
+			expect(tail.method).toBe("GET");
+			expect(tail.path).toBe("/api/plugins/my-plugin/fs/tail?path=%2Fhome%2Fuser%2Ff.log&maxBytes=4096");
+
+			// plugin_list_directory — with optional params
+			const listBase = mapCommandToHttp("plugin_list_directory", { pluginId: "my-plugin", path: "/home/user/dir" });
+			expect(listBase.method).toBe("GET");
+			expect(listBase.path).toBe("/api/plugins/my-plugin/fs/list?path=%2Fhome%2Fuser%2Fdir");
+			const listFull = mapCommandToHttp("plugin_list_directory", {
+				pluginId: "my-plugin",
+				path: "/home/user/dir",
+				pattern: "*.log",
+				sortBy: "mtime",
+			});
+			expect(listFull.path).toContain("pattern=*.log");
+			expect(listFull.path).toContain("sortBy=mtime");
+
+			// plugin_write_file
+			const wf = mapCommandToHttp("plugin_write_file", {
+				pluginId: "my-plugin",
+				path: "/home/user/out.txt",
+				content: "hello",
+			});
+			expect(wf.method).toBe("POST");
+			expect(wf.path).toBe("/api/plugins/my-plugin/fs/write");
+			expect(wf.body).toEqual({ path: "/home/user/out.txt", content: "hello" });
+
+			// plugin_rename_path
+			const rn = mapCommandToHttp("plugin_rename_path", {
+				pluginId: "my-plugin",
+				from: "/home/user/a.txt",
+				to: "/home/user/b.txt",
+			});
+			expect(rn.method).toBe("POST");
+			expect(rn.path).toBe("/api/plugins/my-plugin/fs/rename");
+			expect(rn.body).toEqual({ from: "/home/user/a.txt", to: "/home/user/b.txt" });
+
+			// scan_build_artifacts
+			const scan = mapCommandToHttp("scan_build_artifacts", {
+				pluginId: "build-cleaner",
+				repoPaths: ["/home/user/repoA", "/home/user/repoB"],
+			});
+			expect(scan.method).toBe("POST");
+			expect(scan.path).toBe("/api/plugins/build-cleaner/build-artifacts/scan");
+			expect(scan.body).toEqual({ repoPaths: ["/home/user/repoA", "/home/user/repoB"] });
+			const forcedScan = mapCommandToHttp("scan_build_artifacts", {
+				pluginId: "build-cleaner",
+				repoPaths: ["/home/user/repoA"],
+				forceRefresh: true,
+			});
+			expect(forcedScan.body).toEqual({ repoPaths: ["/home/user/repoA"], forceRefresh: true });
+
+			// delete_build_artifact
+			const del = mapCommandToHttp("delete_build_artifact", {
+				pluginId: "build-cleaner",
+				path: "/home/user/repoA/target",
+				repoPaths: ["/home/user/repoA"],
+			});
+			expect(del.method).toBe("POST");
+			expect(del.path).toBe("/api/plugins/build-cleaner/build-artifacts/delete");
+			expect(del.body).toEqual({ path: "/home/user/repoA/target", repoPaths: ["/home/user/repoA"] });
+
+			// plugin_exec_cli
+			const ex = mapCommandToHttp("plugin_exec_cli", {
+				pluginId: "my-plugin",
+				binary: "mdkb",
+				args: ["--version"],
+				cwd: "/home/user",
+			});
+			expect(ex.method).toBe("POST");
+			expect(ex.path).toBe("/api/plugins/my-plugin/exec");
+			expect(ex.body).toEqual({ binary: "mdkb", args: ["--version"], cwd: "/home/user" });
+
+			// plugin_http_fetch
+			const hf = mapCommandToHttp("plugin_http_fetch", {
+				pluginId: "my-plugin",
+				url: "https://api.example.com/data",
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: "{}",
+			});
+			expect(hf.method).toBe("POST");
+			expect(hf.path).toBe("/api/plugins/my-plugin/http");
+			expect(hf.body).toEqual({
+				url: "https://api.example.com/data",
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: "{}",
+			});
+
+			// plugin_read_session_output — with and without maxLines
+			const pty = mapCommandToHttp("plugin_read_session_output", {
+				pluginId: "my-plugin",
+				sessionId: "sess-1",
+			});
+			expect(pty.method).toBe("GET");
+			expect(pty.path).toBe("/api/plugins/my-plugin/pty/output?sessionId=sess-1");
+			const ptyLines = mapCommandToHttp("plugin_read_session_output", {
+				pluginId: "my-plugin",
+				sessionId: "sess-1",
+				maxLines: 100,
+			});
+			expect(ptyLines.path).toContain("maxLines=100");
+
+			// register_loaded_plugin
+			const reg = mapCommandToHttp("register_loaded_plugin", {
+				pluginId: "my-plugin",
+				capabilities: ["fs:read", "net:http"],
+			});
+			expect(reg.method).toBe("POST");
+			expect(reg.path).toBe("/api/plugins/my-plugin/register");
+			expect(reg.body).toEqual({ capabilities: ["fs:read", "net:http"] });
+
+			// unregister_loaded_plugin
+			const unreg = mapCommandToHttp("unregister_loaded_plugin", { pluginId: "my-plugin" });
+			expect(unreg.method).toBe("POST");
+			expect(unreg.path).toBe("/api/plugins/my-plugin/unregister");
+
+			// get_plugin_readme_path — null passthrough transform
+			const readme = mapCommandToHttp("get_plugin_readme_path", { id: "my-plugin" });
+			expect(readme.method).toBe("GET");
+			expect(readme.path).toBe("/api/plugins/my-plugin/readme");
+			expect(readme.transform?.("/path/to/README.md")).toBe("/path/to/README.md");
+			expect(readme.transform?.(null)).toBeNull();
+		});
+
+		it("maps provider keyring + slot/ollama checks (story 072)", () => {
+			const exists = mapCommandToHttp("get_provider_api_key_exists", { providerId: "anthropic-main" });
+			expect(exists.method).toBe("GET");
+			expect(exists.path).toBe("/config/provider-key/exists?providerId=anthropic-main");
+
+			const save = mapCommandToHttp("save_provider_api_key", { providerId: "anthropic-main", key: "sk-ant-1" });
+			expect(save.method).toBe("POST");
+			expect(save.path).toBe("/config/provider-key");
+			expect(save.body).toEqual({ providerId: "anthropic-main", key: "sk-ant-1" });
+
+			const del = mapCommandToHttp("delete_provider_api_key", { providerId: "anthropic-main" });
+			expect(del.method).toBe("DELETE");
+			expect(del.path).toBe("/config/provider-key");
+			expect(del.body).toEqual({ providerId: "anthropic-main" });
+
+			const slot = mapCommandToHttp("test_slot_connection", { slot: "main" });
+			expect(slot.method).toBe("POST");
+			expect(slot.path).toBe("/config/slot-test");
+			expect(slot.body).toEqual({ slot: "main" });
+
+			const ollama = mapCommandToHttp("check_ollama_models", { providerId: "ollama-local" });
+			expect(ollama.method).toBe("POST");
+			expect(ollama.path).toBe("/config/ollama-models");
+			expect(ollama.body).toEqual({ providerId: "ollama-local" });
+		});
+
+		it("maps agent detection and spawn aliases to HTTP", () => {
+			const detectClaude = mapCommandToHttp("detect_claude_binary", {});
+			expect(detectClaude.method).toBe("GET");
+			expect(detectClaude.path).toBe("/agents/detect?binary=claude");
+			expect(detectClaude.transform?.({ path: "/usr/local/bin/claude" })).toBe("/usr/local/bin/claude");
+
+			const spawn = mapCommandToHttp("spawn_agent", {
+				pty_config: { rows: 30, cols: 100, cwd: "/repo" },
+				agent_config: { prompt: "fix it", agent_type: "codex", model: "gpt-5" },
+			});
+			expect(spawn.method).toBe("POST");
+			expect(spawn.path).toBe("/sessions/agent");
+			expect(spawn.body).toEqual({
+				rows: 30,
+				cols: 100,
+				cwd: "/repo",
+				prompt: "fix it",
+				agent_type: "codex",
+				model: "gpt-5",
+			});
+			expect(spawn.transform?.({ session_id: "s1" })).toBe("s1");
+		});
+	});
+
+	describe("INTENTIONALLY_UNMAPPED (native/host-only commands)", () => {
+		it("classifies every registered Tauri command as HTTP-mapped or intentionally host-only", () => {
+			const mappedCommands = extractCommandTableCommands();
+			const registeredCommands = extractRegisteredTauriCommands();
+			const uncoveredCommands = Array.from(registeredCommands)
+				.filter((command) => !mappedCommands.has(command) && !INTENTIONALLY_UNMAPPED.has(command))
+				.sort();
+
+			expect(uncoveredCommands).toEqual([]);
+		});
+
+		it("raises a precise native-only error, not a generic missing-mapping error", () => {
+			for (const command of INTENTIONALLY_UNMAPPED) {
+				expect(() => mapCommandToHttp(command, {})).toThrow(/native\/host-only/);
+			}
+		});
+
+		it("covers the documented native-only command families", () => {
+			// Sentinels from each group in the story 073 spec.
+			for (const cmd of [
+				"open_panel_window",
+				"start_native_drag",
+				"block_sleep",
+				"set_global_hotkey",
+				"check_microphone_permission",
+				"get_connect_url",
+				"regenerate_session_token",
+				"get_tailscale_status",
+				"mcp_oauth_callback",
+				"install_cli",
+				"set_last_seen_version",
+				"install_mdkb",
+				"subscribe_terminal_grid",
+				"ack_terminal_frame",
+				// story 071 desktop-only plugin commands
+				"plugin_watch_path",
+				"plugin_unwatch",
+				"plugin_read_credential",
+				"install_plugin_from_zip",
+				"install_plugin_from_folder",
+				"install_plugin_from_url",
+				"uninstall_plugin",
+				"delete_plugin_data",
+			]) {
+				expect(INTENTIONALLY_UNMAPPED.has(cmd)).toBe(true);
+			}
+		});
+
+		it("does not also have a COMMAND_TABLE mapping (would be contradictory)", () => {
+			// If a command were both mapped and listed unmapped, mapCommandToHttp would
+			// succeed and the native-only error would be dead. Guard against that drift.
+			for (const command of INTENTIONALLY_UNMAPPED) {
+				let mapped = true;
+				try {
+					mapCommandToHttp(command, {});
+				} catch {
+					mapped = false;
+				}
+				expect(mapped).toBe(false);
+			}
+		});
 	});
 
 	describe("rpc()", () => {
@@ -398,6 +1417,37 @@ describe("transport", () => {
 
 			const result = await rpc<boolean>("can_spawn_session");
 			expect(result).toBe(true);
+		});
+
+		it("returns null on 404 when notFoundAsNull is set (read_plugin_data)", async () => {
+			const { rpc } = await import("../transport");
+
+			const mockResponse = {
+				ok: false,
+				status: 404,
+				statusText: "Not Found",
+				text: vi.fn().mockResolvedValue(""),
+			};
+			globalThis.fetch = vi.fn().mockResolvedValue(mockResponse);
+
+			const result = await rpc<string | null>("read_plugin_data", { pluginId: "p", path: "missing-key" });
+			expect(result).toBeNull();
+		});
+
+		it("still throws on non-404 errors even with notFoundAsNull", async () => {
+			const { rpc } = await import("../transport");
+
+			const mockResponse = {
+				ok: false,
+				status: 400,
+				statusText: "Bad Request",
+				text: vi.fn().mockResolvedValue("bad path"),
+			};
+			globalThis.fetch = vi.fn().mockResolvedValue(mockResponse);
+
+			await expect(rpc("read_plugin_data", { pluginId: "p", path: "../escape" })).rejects.toThrow(
+				"RPC read_plugin_data failed: 400",
+			);
 		});
 
 		it("handles resp.text() failure in error path", async () => {
@@ -521,6 +1571,65 @@ describe("transport", () => {
 			unsub();
 			debugSpy.mockRestore();
 			globalThis.WebSocket = origWs;
+		});
+
+		it("log mode reconnect resumes from the tracked cursor, not the mount offset", async () => {
+			const { subscribePty } = await import("../transport");
+			vi.useFakeTimers();
+
+			const instances: {
+				url: string;
+				onopen: (() => void) | null;
+				onmessage: ((e: { data: string }) => void) | null;
+				onclose: ((e: { code: number; reason?: string }) => void) | null;
+				onerror: unknown;
+				close: () => void;
+			}[] = [];
+
+			class MockWebSocket {
+				url: string;
+				onopen: (() => void) | null = null;
+				onmessage: ((e: { data: string }) => void) | null = null;
+				onclose: ((e: { code: number; reason?: string }) => void) | null = null;
+				onerror: unknown = null;
+				close = vi.fn();
+				constructor(url: string) {
+					this.url = url;
+					instances.push(this as never);
+				}
+			}
+
+			const origWs = globalThis.WebSocket;
+			globalThis.WebSocket = MockWebSocket as unknown as typeof WebSocket;
+
+			// Mount in log mode with the HTTP-fetched offset (50).
+			const subscribePromise = subscribePty("sess-1", vi.fn(), vi.fn(), { format: "log", logOffset: 50 });
+			instances[0].onopen?.();
+			const unsub = await subscribePromise;
+			expect(instances[0].url).toContain("offset=50");
+
+			// Server advances the monotonic line cursor to 80 via a log frame.
+			instances[0].onmessage?.({
+				data: JSON.stringify({ type: "log", lines: [{ spans: [{ text: "x" }] }], offset: 50, total_lines: 80 }),
+			});
+
+			// Abnormal close → reconnect after backoff.
+			instances[0].onclose?.({ code: 1006 });
+			await vi.advanceTimersByTimeAsync(1000);
+
+			// Reconnect must resume from the consumed cursor (80), NOT replay from mount (50).
+			expect(instances.length).toBe(2);
+			expect(instances[1].url).toContain("offset=80");
+			expect(instances[1].url).not.toContain("offset=50");
+
+			// Complete the reconnect handshake so the in-flight connect() promise settles.
+			// (A real browser WebSocket fires onclose on close(); the mock does not, so an
+			// unsettled connect() promise would otherwise leak past the test.)
+			instances[1].onopen?.();
+
+			unsub();
+			globalThis.WebSocket = origWs;
+			vi.useRealTimers();
 		});
 	});
 });

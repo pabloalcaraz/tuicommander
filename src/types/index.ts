@@ -35,6 +35,10 @@ export interface PtyConfig {
 	/** Pre-set agent type for sessions launched from a run config. Enables intent
 	 *  parsing from the start even when the binary name doesn't match classify_agent. */
 	agent_type?: string | null;
+	/** Client-provided PTY session id (browser mode only). Generated and locally
+	 *  registered before the create RPC so the `session-created` SSE echo is
+	 *  recognized as locally-created and does not spawn a duplicate "PTY:" tab. */
+	session_id?: string;
 }
 
 /** PTY exit event data */
@@ -86,6 +90,8 @@ export interface CheckSummary {
 export interface CheckDetail {
 	context: string;
 	state: string;
+	/** External details URL (CheckRun.detailsUrl / StatusContext.targetUrl); empty when the provider gives none. */
+	html_url: string;
 }
 
 /** Merge state: MERGEABLE, CONFLICTING, UNKNOWN */
@@ -122,12 +128,16 @@ export interface BranchPrStatus {
 	additions: number;
 	deletions: number;
 	checks: CheckSummary;
-	check_details: CheckDetail[];
+	/** CI check rows. Absent from the batch (get_all_pr_statuses) payload —
+	 *  populated on-demand by githubStore.loadCheckDetails() via get_ci_checks. */
+	check_details?: CheckDetail[];
 	author: string;
 	commits: number;
 	mergeable: MergeableState;
 	merge_state_status: MergeStateStatus;
 	review_decision: ReviewDecision;
+	/** True if the authenticated viewer's latest review on this PR is APPROVED. */
+	viewer_did_approve: boolean;
 	labels: PrLabel[];
 	is_draft: boolean;
 	base_ref_name: string;
@@ -181,6 +191,8 @@ export interface SavedTerminal {
 	agentSessionId?: string | null;
 	/** Stable tab UUID — injected as TUIC_SESSION env var, persists across restarts */
 	tuicSession?: string | null;
+	/** Run-config command used to launch (e.g. "c"), ensures resume uses the same binary */
+	agentLaunchCommand?: string | null;
 }
 
 /** GitHub Issue from GraphQL API */
@@ -196,6 +208,31 @@ export interface GitHubIssue {
 	comments_count: number;
 	created_at: string;
 	updated_at: string;
+}
+
+export interface CreatedIssue {
+	number: number;
+	url: string;
+	title: string;
+}
+
+export type ImprovementFocus = "refactor" | "testing" | "perf";
+
+export interface ImprovementProposal {
+	title: string;
+	summary: string;
+	rationale: string;
+	issue_title: string;
+	issue_body: string;
+	labels: string[];
+	impact: string;
+	effort: string;
+}
+
+export interface ImprovementScanResult {
+	repo_path: string;
+	focus: ImprovementFocus;
+	proposals: ImprovementProposal[];
 }
 
 /** Issue filter mode for the GitHub panel */

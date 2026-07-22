@@ -1,8 +1,10 @@
-import { type Component, createEffect, createMemo, createResource, createSignal, For, onCleanup, Show } from "solid-js";
+import { type Component, createEffect, createMemo, createResource, createSignal, For, Show } from "solid-js";
 import { invoke } from "../../invoke";
 import { appLogger } from "../../stores/appLogger";
+import { registerModal } from "../../stores/modalStack";
 import { uiStore } from "../../stores/ui";
 import { cx } from "../../utils";
+import { writeClipboard } from "../../utils/clipboard";
 import s from "./KnowledgeHistoryOverlay.module.css";
 
 interface SessionListEntry {
@@ -60,7 +62,7 @@ function kindBadgeClass(kind: string): string {
 
 async function copyToClipboard(text: string): Promise<void> {
 	try {
-		await navigator.clipboard.writeText(text);
+		await writeClipboard(text);
 	} catch (e) {
 		appLogger.warn("ai-agent", `clipboard write failed: ${String(e)}`);
 	}
@@ -89,16 +91,11 @@ export const KnowledgeHistoryOverlay: Component = () => {
 		uiStore.setKnowledgeHistoryOverlayVisible(false);
 	};
 
+	// Escape-to-close is handled centrally (stores/modalStack): registering routes
+	// Escape to close AND stops it reaching the terminal underneath.
 	createEffect(() => {
 		if (!visible()) return;
-		const onKey = (e: KeyboardEvent) => {
-			if (e.key === "Escape") {
-				e.preventDefault();
-				close();
-			}
-		};
-		window.addEventListener("keydown", onKey);
-		onCleanup(() => window.removeEventListener("keydown", onKey));
+		registerModal(close);
 	});
 
 	const filterKey = createMemo(() => ({

@@ -1,10 +1,10 @@
 use crate::pty::spawn_reader_thread;
 use crate::state::{OUTPUT_RING_BUFFER_CAPACITY, VT_LOG_BUFFER_CAPACITY, VtLogBuffer};
 use crate::{AppState, MAX_CONCURRENT_SESSIONS, OutputRingBuffer, PtySession};
-use axum::Json;
 use axum::extract::{ConnectInfo, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use axum::{Extension, Json};
 use parking_lot::Mutex;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::net::SocketAddr;
@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::Emitter;
 use uuid::Uuid;
 
-use super::guards::localhost_only;
+use super::guards::{Authenticated, require_local_or_auth};
 use super::types::*;
 
 pub(super) async fn detect_agents() -> impl IntoResponse {
@@ -97,9 +97,10 @@ pub(super) async fn resolve_prompt_variables_http(Json(body): Json<serde_json::V
 
 pub(super) async fn execute_headless_prompt_http(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    auth: Option<Extension<Authenticated>>,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
-    if let Err(resp) = localhost_only(&addr) {
+    if let Err(resp) = require_local_or_auth(&addr, auth.is_some()) {
         return resp.into_response();
     }
     let command = match body
@@ -154,9 +155,10 @@ pub(super) async fn execute_headless_prompt_http(
 
 pub(super) async fn execute_api_prompt_http(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    auth: Option<Extension<Authenticated>>,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
-    if let Err(resp) = localhost_only(&addr) {
+    if let Err(resp) = require_local_or_auth(&addr, auth.is_some()) {
         return resp.into_response();
     }
     let system_prompt = body
@@ -226,9 +228,10 @@ pub(super) async fn verify_agent_session_http(
 pub(super) async fn spawn_agent_session(
     State(state): State<Arc<AppState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    auth: Option<Extension<Authenticated>>,
     Json(body): Json<SpawnAgentRequest>,
 ) -> Response {
-    if let Err(resp) = localhost_only(&addr) {
+    if let Err(resp) = require_local_or_auth(&addr, auth.is_some()) {
         return resp.into_response();
     }
     if state.sessions.len() >= MAX_CONCURRENT_SESSIONS {
@@ -284,6 +287,26 @@ pub(super) async fn spawn_agent_session(
         }
     };
 
+    // Only Claude's CLI accepts a bare positional prompt. For other agents the
+    // no-args default below would produce an argument-parse error and an immediate
+    // exit (clap exit code 2), so reject up front with an actionable message rather
+    // than spawning a doomed process.
+    if body.args.is_none()
+        && body
+            .agent_type
+            .as_deref()
+            .is_some_and(|t| !crate::agent::agent_accepts_bare_prompt(t))
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!(
+                "Agent '{name}' cannot be spawned with a bare prompt (only Claude's CLI accepts a positional prompt; other agents exit with code 2). Pass explicit args, or spawn via the MCP agent tool with a configured run config.",
+                name = body.agent_type.as_deref().unwrap_or_default()
+            )})),
+        )
+            .into_response();
+    }
+
     let rows = body.rows.unwrap_or(24);
     let cols = body.cols.unwrap_or(80);
     if let Err(msg) = super::validate_terminal_size(rows, cols) {
@@ -313,6 +336,7 @@ pub(super) async fn spawn_agent_session(
     };
 
     let mut cmd = CommandBuilder::new(&binary_path);
+    crate::pty::sanitize_pty_parent_env(&mut cmd);
 
     if let Some(ref args) = body.args {
         for arg in args {
@@ -384,11 +408,27 @@ pub(super) async fn spawn_agent_session(
             shell: binary_path.clone(),
         }),
     );
+    state.assign_term_alias(&session_id);
     state.metrics.total_spawned.fetch_add(1, Ordering::Relaxed);
     state
         .metrics
         .active_sessions
         .fetch_add(1, Ordering::Relaxed);
+
+    // Pre-set the session's agent type (mirrors session.rs spawn_pty_session) so the
+    // PTY reader's agent_active gate turns on immediately and intent/suggest protocol
+    // tokens are parsed from the first line of output.
+    let mut session_state = crate::state::SessionState::default();
+    if let Some(ref agent_type) = body.agent_type {
+        session_state.hook_instrumented = crate::pty::hook_instrumented_for(
+            &crate::config::load_agents_config(),
+            Some(agent_type.as_str()),
+        );
+        session_state.agent_type = Some(agent_type.clone());
+    }
+    state
+        .session_states
+        .insert(session_id.clone(), session_state);
 
     state.output_buffers.insert(
         session_id.clone(),
@@ -401,6 +441,11 @@ pub(super) async fn spawn_agent_session(
     state
         .last_output_ms
         .insert(session_id.clone(), std::sync::atomic::AtomicU64::new(0));
+    // Register the grid_watch channel so `GET /sessions/{id}/stream?format=grid`
+    // works for agent sessions — without it handle_ws_grid_session finds no entry
+    // and silently closes the socket. Mirrors session.rs spawn_pty_session.
+    let (grid_watch_tx, _) = tokio::sync::watch::channel(Vec::new());
+    state.grid_watch.insert(session_id.clone(), grid_watch_tx);
 
     // Broadcast to SSE/WebSocket consumers (before state is moved to reader thread)
     let _ = state
@@ -409,6 +454,7 @@ pub(super) async fn spawn_agent_session(
             session_id: session_id.clone(),
             cwd: body.cwd.clone(),
             agent_type: body.agent_type.clone(),
+            display_name: None,
         });
 
     #[cfg(feature = "desktop")]
@@ -422,6 +468,7 @@ pub(super) async fn spawn_agent_session(
             serde_json::json!({
                 "session_id": session_id,
                 "cwd": body.cwd,
+                "display_name": null,
             }),
         );
     }
@@ -444,10 +491,15 @@ mod tests {
         "192.168.1.2:1".parse().unwrap()
     }
 
+    fn authed() -> Option<Extension<Authenticated>> {
+        Some(Extension(Authenticated))
+    }
+
     #[tokio::test]
-    async fn execute_headless_prompt_http_rejects_non_loopback() {
+    async fn execute_headless_prompt_http_rejects_unauthenticated_non_loopback() {
         let resp = execute_headless_prompt_http(
             ConnectInfo(lan()),
+            None,
             Json(serde_json::json!({ "command": "echo", "args": ["x"] })),
         )
         .await;
@@ -458,16 +510,30 @@ mod tests {
     async fn execute_headless_prompt_http_loopback_passes_guard() {
         // Loopback with missing 'command' field must yield 400 from the validator,
         // proving the 403 guard is NOT fired for loopback callers.
+        let resp = execute_headless_prompt_http(
+            ConnectInfo(loopback()),
+            None,
+            Json(serde_json::json!({})),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn execute_headless_prompt_http_authenticated_remote_passes_guard() {
+        // Authenticated remote (full-trust, story 059) must pass the guard:
+        // empty body yields 400 from the validator, not 403.
         let resp =
-            execute_headless_prompt_http(ConnectInfo(loopback()), Json(serde_json::json!({})))
+            execute_headless_prompt_http(ConnectInfo(lan()), authed(), Json(serde_json::json!({})))
                 .await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
-    async fn execute_api_prompt_http_rejects_non_loopback() {
+    async fn execute_api_prompt_http_rejects_unauthenticated_non_loopback() {
         let resp = execute_api_prompt_http(
             ConnectInfo(lan()),
+            None,
             Json(serde_json::json!({ "content": "hello" })),
         )
         .await;
@@ -477,7 +543,16 @@ mod tests {
     #[tokio::test]
     async fn execute_api_prompt_http_loopback_passes_guard() {
         let resp =
-            execute_api_prompt_http(ConnectInfo(loopback()), Json(serde_json::json!({}))).await;
+            execute_api_prompt_http(ConnectInfo(loopback()), None, Json(serde_json::json!({})))
+                .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn execute_api_prompt_http_authenticated_remote_passes_guard() {
+        let resp =
+            execute_api_prompt_http(ConnectInfo(lan()), authed(), Json(serde_json::json!({})))
+                .await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 }

@@ -5,6 +5,7 @@ import { useAgentDetection } from "../../../hooks/useAgentDetection";
 import { useConfirmDialog } from "../../../hooks/useConfirmDialog";
 import { agentConfigsStore } from "../../../stores/agentConfigs";
 import { promptLibraryStore, type SavedPrompt, type SmartPlacement } from "../../../stores/promptLibrary";
+import { onClickKeyDown } from "../../../utils/a11y";
 import { ConfirmDialog } from "../../ConfirmDialog";
 import { KeyComboCapture } from "../../shared/KeyComboCapture";
 import s from "../Settings.module.css";
@@ -387,6 +388,33 @@ const PromptEditor: Component<{
 
 				<Show when={(props.prompt.executionMode ?? "inject") === "inject"}>
 					<div class={sp.editorSection} style={{ flex: "1" }}>
+						<label class={sp.editorLabel}>Target</label>
+						<select
+							class={sp.editorInput}
+							value={props.prompt.injectTarget ?? "compose"}
+							onChange={(e) => {
+								const val = e.currentTarget.value;
+								if (val === "terminal" || val === "compose") {
+									promptLibraryStore.updatePrompt(props.prompt.id, { injectTarget: val });
+								}
+							}}
+						>
+							<option value="compose">Compose box (review)</option>
+							<option value="terminal">Terminal (send to agent)</option>
+						</select>
+						<p class={sp.fieldHint}>
+							Compose fills the input for review; Terminal sends to the agent and waits for idle
+						</p>
+					</div>
+				</Show>
+
+				<Show
+					when={
+						(props.prompt.executionMode ?? "inject") === "inject" &&
+						(props.prompt.injectTarget ?? "compose") === "terminal"
+					}
+				>
+					<div class={sp.editorSection} style={{ flex: "1" }}>
 						<label class={sp.editorLabel}>Auto-execute</label>
 						<label class={sp.autoExecLabel}>
 							<input type="checkbox" checked={props.prompt.autoExecute ?? false} onChange={handleAutoExecuteToggle} />
@@ -535,7 +563,13 @@ const PromptRow: Component<{ prompt: SavedPrompt; headlessAgents: AgentType[] }>
 
 	return (
 		<div class={sp.promptRow}>
-			<div class={sp.promptHeader} onClick={() => setExpanded(!expanded())}>
+			<div
+				class={sp.promptHeader}
+				role="button"
+				tabIndex={0}
+				onClick={() => setExpanded(!expanded())}
+				onKeyDown={onClickKeyDown(() => setExpanded(!expanded()))}
+			>
 				{/* Enable/disable toggle */}
 				<label class={s.toggle} onClick={(e) => e.stopPropagation()}>
 					<input type="checkbox" checked={isEnabled()} onChange={handleToggle} />
@@ -587,7 +621,13 @@ const CategoryGroup: Component<{ category: string; prompts: SavedPrompt[]; headl
 
 	return (
 		<>
-			<div class={sp.categoryHeader} onClick={() => setOpen(!open())}>
+			<div
+				class={sp.categoryHeader}
+				role="button"
+				tabIndex={0}
+				onClick={() => setOpen(!open())}
+				onKeyDown={onClickKeyDown(() => setOpen(!open()))}
+			>
 				<span class={sp.categoryChevron} classList={{ [sp.open]: open() }}>
 					&#9654;
 				</span>

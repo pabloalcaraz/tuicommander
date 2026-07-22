@@ -1,6 +1,8 @@
 import { type Component, createEffect, For, onCleanup, Show } from "solid-js";
 import type { UpstreamStatusEntry } from "../../stores/mcpPopup";
 import { mcpPopupStore } from "../../stores/mcpPopup";
+import { registerModal } from "../../stores/modalStack";
+import { onClickKeyDown } from "../../utils/a11y";
 import s from "./McpPopup.module.css";
 
 const STATUS_COLORS: Record<string, string> = {
@@ -35,18 +37,11 @@ export const McpPopup: Component<{ onOpenSettings: (tab: string) => void }> = (p
 		});
 	});
 
-	// ESC to close
+	// Escape-to-close is handled centrally (stores/modalStack): registering routes
+	// Escape to the popup close AND stops it reaching the terminal underneath.
 	createEffect(() => {
 		if (!mcpPopupStore.state.isOpen) return;
-
-		const onKey = (e: KeyboardEvent) => {
-			if (e.key === "Escape") {
-				e.preventDefault();
-				mcpPopupStore.close();
-			}
-		};
-		document.addEventListener("keydown", onKey);
-		onCleanup(() => document.removeEventListener("keydown", onKey));
+		registerModal(() => mcpPopupStore.close());
 	});
 
 	/** Get live status entry for a server by name */
@@ -106,7 +101,13 @@ export const McpPopup: Component<{ onOpenSettings: (tab: string) => void }> = (p
 								const st = () => getStatus(server.name);
 								const enabled = () => isEnabled(server.name);
 								return (
-									<div class={s.item} onClick={() => mcpPopupStore.toggleServer(server.name)}>
+									<div
+										class={s.item}
+										role="button"
+										tabIndex={0}
+										onClick={() => mcpPopupStore.toggleServer(server.name)}
+										onKeyDown={onClickKeyDown(() => mcpPopupStore.toggleServer(server.name))}
+									>
 										<span
 											class={s.statusDot}
 											style={{

@@ -9,15 +9,20 @@ import { appLogger } from "../../stores/appLogger";
 import { notificationsStore } from "../../stores/notifications";
 import { paneLayoutStore } from "../../stores/paneLayout";
 import { rateLimitStore } from "../../stores/ratelimit";
-import { FONT_FAMILIES, settingsStore } from "../../stores/settings";
+import { settingsStore } from "../../stores/settings";
 import { type AwaitingInputType, isShellState, terminalsStore } from "../../stores/terminals";
+import { toastsStore } from "../../stores/toasts";
 import { isTauri, subscribePty, type Unsubscribe } from "../../transport";
+import { onClickKeyDown } from "../../utils/a11y";
+import { writeClipboard } from "../../utils/clipboard";
 import { keyFor } from "../../utils/hotkey";
+import { isPerfDebug } from "../../utils/perfDebug";
 import { ComposePanel } from "../ComposePanel";
 import { getAwaitingInputSound } from "./awaitingInputSound";
 import CanvasTerminal, { type CanvasTerminalRef } from "./CanvasTerminal";
-import { snapLineHeight } from "./canvasTerminalUtils";
+import { gridDimsForBox, snapLineHeight } from "./canvasTerminalUtils";
 import { getSharedMetrics } from "./glyphCache";
+import { shouldApplyIntentTitle } from "./intentTitle";
 import { LastPromptBar } from "./LastPromptBar";
 import s from "./Terminal.module.css";
 import { TerminalSearch } from "./TerminalSearch";
@@ -39,7 +44,7 @@ type ParsedEvent =
 	| { type: "usage-limit"; percentage: number; limit_type: string }
 	| { type: "usage-exhausted"; reset_time: string | null }
 	| { type: "plan-file"; path: string }
-	| { type: "user-input"; content: string }
+	| { type: "user-input"; content: string; line: number }
 	| { type: "api-error"; pattern_name: string; matched_text: string; error_kind: string }
 	| { type: "tool-error"; matched_text: string }
 	| { type: "intent"; text: string; title?: string }
@@ -119,16 +124,22 @@ export function cleanOscTitle(title: string): string {
 	return cleaned;
 }
 
-/** Get initial terminal dimensions from container size + font metrics. */
-function calcGridSize(container: HTMLElement): { rows: number; cols: number } {
-	const fontSize = settingsStore.state.defaultFontSize;
-	const fontFamily = FONT_FAMILIES[settingsStore.state.font] || FONT_FAMILIES["JetBrains Mono"];
+/** Get initial terminal dimensions from container size + font metrics.
+ *
+ *  Mirrors CanvasTerminal's remeasure EXACTLY — shared `gridDimsForBox` formula
+ *  (gutter + scrollbar subtracted) and the per-terminal font-size override — so
+ *  the reconnect-path resize lands on the same dims the canvas will compute and
+ *  the backend no-ops it instead of firing a spurious SIGWINCH (each SIGWINCH
+ *  makes Ink TUIs clear+reprint their full frame into scrollback). */
+function calcGridSize(container: HTMLElement, terminalId: string): { rows: number; cols: number } {
+	const fontSize = terminalsStore.state.terminals[terminalId]?.fontSize ?? settingsStore.state.defaultFontSize;
+	const fontFamily = settingsStore.getFontFamily();
 	const fontWeight = settingsStore.state.fontWeight;
 	const dpr = window.devicePixelRatio || 1;
 	const m = getSharedMetrics(fontSize, fontFamily, dpr, snapLineHeight(fontSize), fontWeight);
-	const cols = Math.max(2, Math.floor(container.clientWidth / m.cellWidth));
-	const rows = Math.max(2, Math.floor(container.clientHeight / m.cellHeight));
-	return { rows, cols };
+	const rect = container.getBoundingClientRect();
+	const d = gridDimsForBox(rect.width, rect.height, m.cellWidth, m.cellHeight);
+	return { rows: Math.max(2, d.rows), cols: Math.max(2, d.cols) };
 }
 
 export const Terminal: Component<TerminalProps> = (props) => {
@@ -192,18 +203,18 @@ export const Terminal: Component<TerminalProps> = (props) => {
 
 		if (sound === "error") {
 			appLogger.info("terminal", `[Notify] ${props.id} error — awaitingInput transition`);
-			notificationsStore.playError();
+			notificationsStore.playError(props.id);
 		} else if (sound === "question") {
 			if (confident) {
 				appLogger.info("terminal", `[Notify] ${props.id} question — awaitingInput transition`);
-				notificationsStore.playQuestion();
+				notificationsStore.playQuestion(props.id);
 			} else {
 				// Debounce low-confidence questions: if cleared within 500ms, skip notification
 				questionDebounceTimer = setTimeout(() => {
 					questionDebounceTimer = 0;
 					if (terminalsStore.get(props.id)?.awaitingInput === "question") {
 						appLogger.info("terminal", `[Notify] ${props.id} question — awaitingInput transition (debounced)`);
-						notificationsStore.playQuestion();
+						notificationsStore.playQuestion(props.id);
 					}
 				}, 500) as unknown as number;
 			}
@@ -252,7 +263,7 @@ export const Terminal: Component<TerminalProps> = (props) => {
 				case "status-line": {
 					retryCount = 0;
 					const awState = terminalsStore.get(props.id)?.awaitingInput;
-					const clearAw = awState && awState !== "question";
+					const clearAw = awState && awState !== "question" && awState !== "error";
 					if (clearAw) {
 						appLogger.debug("terminal", `clearAwaitingInput(${props.id}) was "${awState}" → null`);
 					}
@@ -335,6 +346,9 @@ export const Terminal: Component<TerminalProps> = (props) => {
 					break;
 				case "user-input":
 					planFileNotified = false;
+					// Record the prompt row for the green scrollbar marker. line < 0 (the
+					// keystroke-reconstructed path) is ignored by the store.
+					terminalsStore.addUserPromptLine(props.id, parsed.line);
 					// Clear suggest bar, pending buffer, and mark dismissed
 					terminalsStore.update(props.id, { suggestDismissed: true, suggestedActions: null, activeSubTasks: 0 });
 					// User resumed typing — clear any stale error/question badge. See comment
@@ -379,8 +393,10 @@ export const Terminal: Component<TerminalProps> = (props) => {
 							const current = terminalsStore.get(props.id);
 							if (sessionId && current?.shellState !== "busy") {
 								appLogger.info("terminal", `[AutoRetry] ${label}: injecting "continue" (attempt ${attempt})`);
+								// Route through sendCommand (never raw text+\r): Ink-based agents in
+								// raw mode drop the Enter when bundled with text, defeating the retry.
 								pty
-									.write(sessionId, "continue\r")
+									.sendCommand(sessionId, "continue", current?.agentType)
 									.catch((err) => appLogger.error("terminal", "[AutoRetry] Failed to write", { error: String(err) }));
 							}
 						}, delay);
@@ -414,18 +430,25 @@ export const Terminal: Component<TerminalProps> = (props) => {
 					);
 					break;
 				}
-				case "intent":
+				case "intent": {
 					retryCount = 0;
 					terminalsStore.setAgentIntent(props.id, parsed.text);
-					if (parsed.title && settingsStore.state.intentTabTitle) {
-						const agentType = terminalsStore.get(props.id)?.agentType;
-						const perAgentAllowed = agentType ? (agentConfigsStore.getIntentTabTitle(agentType) ?? true) : true;
-						if (perAgentAllowed) {
-							terminalsStore.update(props.id, { name: parsed.title });
-						}
+					const term = terminalsStore.get(props.id);
+					const agentType = term?.agentType;
+					const perAgentEnabled = agentType ? (agentConfigsStore.getIntentTabTitle(agentType) ?? true) : true;
+					if (
+						shouldApplyIntentTitle({
+							title: parsed.title,
+							globalEnabled: settingsStore.state.intentTabTitle,
+							perAgentEnabled,
+							nameIsCustom: term?.nameIsCustom ?? false,
+						})
+					) {
+						terminalsStore.update(props.id, { name: parsed.title });
 					}
 					// Intent/suggest row overlays handled by installRenderObserver
 					break;
+				}
 				case "suggest":
 					// Backend guarantees `suggest` events only arrive once the shell has
 					// transitioned to IDLE (see `drain_pending_suggest` in pty.rs, gated
@@ -517,33 +540,51 @@ export const Terminal: Component<TerminalProps> = (props) => {
 				// Guard: terminal may have been removed from the store already
 				// (e.g. pane closed). Updating a removed entry would recreate it as a ghost.
 				const stillExists = terminalsStore.get(props.id);
+				const hadAgent = stillExists?.agentType != null;
 				if (stillExists) {
 					// Restore original tab name if it was overwritten by OSC title
 					if (originalName && !stillExists.nameIsCustom) {
 						terminalsStore.update(props.id, { name: originalName });
 					}
-					const hadAgent = stillExists.agentType !== null;
-					terminalsStore.update(props.id, {
-						sessionId: null,
-						currentTask: null,
-						agentType: null,
-						agentSessionId: null,
-					});
-					terminalsStore.clearAwaitingInput(props.id);
 					if (hadAgent) {
+						// Agent finished: keep the tab with a grey "exited" dot so the user
+						// can read the final output and re-launch. Without this a dead session
+						// keeps its last shellState forever — a ghost tab that looks idle.
+						terminalsStore.update(props.id, {
+							shellState: "exited",
+							sessionId: null,
+							currentTask: null,
+							agentType: null,
+							agentSessionId: null,
+						});
+						terminalsStore.clearAwaitingInput(props.id);
 						pluginRegistry.notifyStateChange({
 							type: "agent-stopped",
 							sessionId: targetSessionId,
 							terminalId: props.id,
 						});
+					} else {
+						// Plain interactive shell exited: drop the session refs and let the
+						// app close the tab (see notifyShellExit below) — a dead shell must
+						// not linger as a grey ghost dot.
+						terminalsStore.update(props.id, { sessionId: null });
+						terminalsStore.clearAwaitingInput(props.id);
 					}
 				}
 				sessionId = null;
 				setCurrentSessionId(null);
 				props.onSessionExit?.(props.id);
-				if (terminalsStore.state.activeId !== props.id) {
+				// Completion chime only for an agent finishing in a background tab.
+				// A plain shell exit closes its tab, so it stays silent.
+				if (hadAgent && terminalsStore.state.activeId !== props.id) {
 					appLogger.info("terminal", `[Notify] ${props.id} completion — session exited (background tab)`);
 					notificationsStore.playCompletion();
+				}
+				// Plain shell exit: close the tab via the app-level onShellExit handler.
+				// This is the single owner of local session-exit handling; the global
+				// session-closed listener deliberately stays remote-only.
+				if (stillExists && !hadAgent) {
+					terminalsStore.notifyShellExit(props.id);
 				}
 			},
 			{
@@ -614,9 +655,16 @@ export const Terminal: Component<TerminalProps> = (props) => {
 				}
 			});
 
-			// Listen for OSC 52 clipboard store from Rust (native renderer)
+			// Listen for OSC 52 clipboard store from Rust (native renderer).
+			// OSC 52 is honored from anywhere in the byte stream, so a displayed file/log
+			// can overwrite the clipboard. Surface a non-blocking notice on every write and
+			// let the user disable OSC 52 entirely via settings. (Gated here, off the
+			// per-byte parse hot path — this fires once per actual OSC 52 sequence.)
 			unlistenClipboardStore = await listen<string>(`pty-clipboard-store-${targetSessionId}`, (event) => {
-				navigator.clipboard.writeText(event.payload).catch(() => {});
+				if (!settingsStore.state.osc52Clipboard) return;
+				writeClipboard(event.payload).catch(() => {});
+				const name = terminalsStore.get(props.id)?.name || "terminal";
+				toastsStore.add("Clipboard updated", `by ${name}`, "info");
 			});
 			if (disposed) {
 				unlistenClipboardStore();
@@ -668,13 +716,15 @@ export const Terminal: Component<TerminalProps> = (props) => {
 	const initSession = async () => {
 		if (sessionInitialized || !containerRef) return;
 		sessionInitialized = true;
-		const spawnMs = Math.round(performance.now() - mountedAt);
-		appLogger.info(
-			"terminal",
-			`initSession(${props.id}) — existing sessionId=${sessionId ?? "null"} spawnDelay=${spawnMs}ms`,
-		);
+		if (isPerfDebug()) {
+			const spawnMs = Math.round(performance.now() - mountedAt);
+			appLogger.info(
+				"terminal",
+				`initSession(${props.id}) — existing sessionId=${sessionId ?? "null"} spawnDelay=${spawnMs}ms`,
+			);
+		}
 
-		const grid = calcGridSize(containerRef);
+		const grid = calcGridSize(containerRef, props.id);
 
 		try {
 			let reconnected = false;
@@ -685,6 +735,10 @@ export const Terminal: Component<TerminalProps> = (props) => {
 					appLogger.info("terminal", `initSession(${props.id}) — reconnected to ${sessionId}`);
 					detectAgentForTerminal(props.id, "idle").catch(() => {});
 				} catch {
+					// If we unmounted during the resize await, onCleanup already tore
+					// down listeners; setCurrentSessionId below would recompute a
+					// disposed <Show> and crash the SolidJS root (UI freeze). Bail.
+					if (disposed) return;
 					appLogger.warn(
 						"terminal",
 						`initSession(${props.id}) — resize failed for ${sessionId}, creating FRESH session`,
@@ -741,12 +795,29 @@ export const Terminal: Component<TerminalProps> = (props) => {
 					env: agentConfigsStore.getEnvFlags("claude"),
 					agent_type: termData?.pendingInitCommand ? (termData.agentType ?? null) : null,
 				});
+				// The component can unmount during the await above (tab churn while
+				// an agent like grok rapidly toggles visibility). setCurrentSessionId
+				// then recomputes the now-disposed <Show when={_currentSessionId()}>
+				// and throws "stale value from <Show>" — unhandled, it kills the
+				// SolidJS root and the whole UI freezes while the backend stays alive.
+				// Persist the new id (plain store write) so a remount reconnects
+				// instead of leaking a duplicate PTY, then bail before any reactive write.
+				if (disposed) {
+					if (sessionId && terminalsStore.get(props.id)) {
+						terminalsStore.setSessionId(props.id, sessionId);
+					}
+					return;
+				}
 				setCurrentSessionId(sessionId);
 				if (sessionId) {
 					if (!isTauri()) {
 						browserCreatedSessions.add(sessionId);
 					}
 					await attachSessionListeners(sessionId);
+					if (disposed) {
+						terminalsStore.setSessionId(props.id, sessionId);
+						return;
+					}
 				}
 			}
 
@@ -864,13 +935,21 @@ export const Terminal: Component<TerminalProps> = (props) => {
 				pty.write(sessionId, data).catch((err) => appLogger.error("terminal", "Failed to write to PTY", err));
 		},
 		writeln: (data: string) => {
-			if (sessionId) pty.write(sessionId, data + "\n").catch((err) => appLogger.error("terminal", "writeln failed", err));
+			// PTY injection rule: writeln submits a line, so route through
+			// sendCommand (agent-aware Enter; Ink raw-mode ignores a bare \n and
+			// Windows needs \r\n). `write`/`input` below stay raw on purpose — they
+			// are low-level byte escapes for plugins.
+			if (sessionId)
+				pty
+					.sendCommand(sessionId, data, terminalsStore.get(props.id)?.agentType ?? null)
+					.catch((err) => appLogger.error("terminal", "writeln failed", err));
 		},
 		input: (data: string) => {
 			if (sessionId) pty.write(sessionId, data).catch((err) => appLogger.error("terminal", "input failed", err));
 		},
 		clear: () => {
-			if (sessionId) pty.write(sessionId, "\x1b[2J\x1b[H\x1b[3J").catch((err) => appLogger.error("terminal", "clear failed", err));
+			if (sessionId)
+				pty.write(sessionId, "\x1b[2J\x1b[H\x1b[3J").catch((err) => appLogger.error("terminal", "clear failed", err));
 		},
 		refresh: () => canvasTerminalRef()?.refresh(),
 		focus: () => {
@@ -956,6 +1035,7 @@ export const Terminal: Component<TerminalProps> = (props) => {
 			if (!sessionId) return [];
 			return invoke("terminal_get_lines", { sessionId, start: startLine, end: endLine }) as Promise<string[]>;
 		},
+		paste: (text: string) => canvasTerminalRef()?.paste(text),
 	};
 
 	onMount(() => {
@@ -1061,18 +1141,34 @@ export const Terminal: Component<TerminalProps> = (props) => {
 				)}
 			</Show>
 			<Show when={terminalsStore.get(props.id)?.pendingResumeCommand}>
-				<div class={s.resumeBanner} onClick={handleResume}>
+				<div
+					class={s.resumeBanner}
+					role="button"
+					tabIndex={0}
+					onClick={handleResume}
+					onKeyDown={onClickKeyDown(handleResume)}
+				>
 					<span>Agent session was active — click to resume</span>
 					<button class={s.resumeDismiss} onClick={handleDismissResume} title="Dismiss">
 						&times;
 					</button>
 				</div>
 			</Show>
-			<div ref={containerRef} class={s.content} style={{ width: "100%", height: "100%" }}>
-				<Show when={_currentSessionId()}>
+			<div ref={containerRef} class={s.content}>
+				{/* keyed: pass sessionId as a stable string value, NOT the Show's reactive
+				    accessor. CanvasTerminal's onFrame (and ~35 other async IPC handlers) re-read
+				    props.sessionId on every backend frame. With a non-keyed Show, props.sessionId
+				    is the Show children-accessor sid(); when a PTY auto-closes, pty-exit sets
+				    _currentSessionId(null) → this Show collapses → CanvasTerminal unmounts, but a
+				    frame event already queued in the WebView loop fires onFrame post-dispose,
+				    reading sid() on the disposed <Show> → "Stale read from <Show>" → kills the
+				    SolidJS root (whole UI frozen, hover-only, backend alive). keyed makes sid a
+				    plain string captured at mount, immune to stale reads. Transitions are always
+				    null↔id so CanvasTerminal already remounts on session change — no behavior change. */}
+				<Show keyed when={_currentSessionId()}>
 					{(sid) => (
 						<CanvasTerminal
-							sessionId={sid()}
+							sessionId={sid}
 							terminalId={props.id}
 							onOpenFilePath={props.onOpenFilePath}
 							onSearchOpen={() => setSearchVisible(true)}

@@ -11,7 +11,8 @@ import { repositoriesStore } from "../../stores/repositories";
 import { toastsStore } from "../../stores/toasts";
 import type { BranchPrStatus } from "../../types";
 import { cx } from "../../utils";
-import { effectiveMergeMethod, mergeWithFallback } from "../../utils/prMerge";
+import { onClickKeyDown } from "../../utils/a11y";
+import { canApprovePr, effectiveMergeMethod, mergeWithFallback } from "../../utils/prMerge";
 import {
 	type CleanupStep,
 	PostMergeCleanupDialog,
@@ -22,14 +23,16 @@ import { PrDetailContent } from "../PrDetailPopover/PrDetailContent";
 import { PrStateBadge } from "./RepoSection";
 import s from "./Sidebar.module.css";
 
-/** Whether a PR is eligible for merge: open, approved, CI all green */
+/** Whether a PR is eligible for merge: open, approved, CI not failing.
+ *  Pending checks do NOT hide Merge — show it as soon as the PR is approved and
+ *  let GitHub gate the actual merge if branch protection requires green CI. A
+ *  definitive CI failure still hides Merge (don't offer merge on a red PR). */
 export function canMergePr(pr: BranchPrStatus): boolean {
 	return (
 		pr.state?.toUpperCase() === "OPEN" &&
 		!pr.is_draft &&
 		pr.review_decision === "APPROVED" &&
-		(pr.checks?.failed ?? 0) === 0 &&
-		(pr.checks?.pending ?? 0) === 0
+		(pr.checks?.failed ?? 0) === 0
 	);
 }
 
@@ -281,7 +284,13 @@ export const RemoteOnlyPrPopover: Component<{
 						<For each={visiblePrs()}>
 							{(pr) => (
 								<div class={cx(s.remoteOnlyItem, expandedBranch() === pr.branch && s.remoteOnlyItemExpanded)}>
-									<div class={s.remoteOnlyRow} onClick={() => handleRowClick(pr.branch)}>
+									<div
+										class={s.remoteOnlyRow}
+										role="button"
+										tabIndex={0}
+										onClick={() => handleRowClick(pr.branch)}
+										onKeyDown={onClickKeyDown(() => handleRowClick(pr.branch))}
+									>
 										<span class={s.remoteOnlyNum}>#{pr.number}</span>
 										<span class={s.remoteOnlyTitle}>{pr.title}</span>
 										<PrStateBadge
@@ -321,11 +330,7 @@ export const RemoteOnlyPrPopover: Component<{
 															{t("sidebar.worktree", "Worktree")}
 														</button>
 													</Show>
-													<Show
-														when={
-															pr.state?.toUpperCase() === "OPEN" && !pr.is_draft && pr.review_decision !== "APPROVED"
-														}
-													>
+													<Show when={canApprovePr(pr, githubStore.state.viewerLogin)}>
 														<button
 															class={s.remoteOnlyApprove}
 															onClick={() => handleApprove(pr)}

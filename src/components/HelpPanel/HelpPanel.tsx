@@ -1,5 +1,7 @@
 import { type Component, createEffect, createSignal, onCleanup, Show } from "solid-js";
 import { t } from "../../i18n";
+import { registerModal } from "../../stores/modalStack";
+import { writeClipboard } from "../../utils/clipboard";
 import { handleOpenUrl } from "../../utils/openUrl";
 import { KeyboardShortcutsTab } from "../SettingsPanel/tabs/KeyboardShortcutsTab";
 import s from "./HelpPanel.module.css";
@@ -18,26 +20,43 @@ type HelpView = "main" | "shortcuts" | "legend";
 
 export const HelpPanel: Component<HelpPanelProps> = (props) => {
 	const [view, setView] = createSignal<HelpView>("main");
+	// Copy the version string to the clipboard (issue #101) — the nightly version
+	// is tedious to transcribe into bug reports, and text selection + Ctrl+C did
+	// not work inside the modal.
+	const [copiedVersion, setCopiedVersion] = createSignal(false);
+	let copiedResetTimer: ReturnType<typeof setTimeout> | undefined;
+	const copyVersion = async () => {
+		try {
+			// Route through writeClipboard (native plugin in Tauri) — WKWebView can
+			// reject navigator.clipboard.writeText inside modals; matches the terminal
+			// copy paths.
+			await writeClipboard(__APP_VERSION__);
+			setCopiedVersion(true);
+			clearTimeout(copiedResetTimer);
+			copiedResetTimer = setTimeout(() => setCopiedVersion(false), 1500);
+		} catch {
+			// Clipboard unavailable — nothing actionable to do.
+		}
+	};
+	onCleanup(() => clearTimeout(copiedResetTimer));
 
-	// Close on Escape, reset view on close
+	// Close on Escape, reset view on close. Escape routing is centralized
+	// (stores/modalStack) so it also stops the key reaching the terminal underneath;
+	// the guarded close preserves the sub-view back-navigation (Escape steps a
+	// shortcuts/legend view back to main before closing from main).
 	createEffect(() => {
 		if (!props.visible) {
 			setView("main");
 			return;
 		}
 
-		const handleKeydown = (e: KeyboardEvent) => {
-			if (e.key === "Escape") {
-				if (view() !== "main") {
-					setView("main");
-				} else {
-					props.onClose();
-				}
+		registerModal(() => {
+			if (view() !== "main") {
+				setView("main");
+			} else {
+				props.onClose();
 			}
-		};
-
-		document.addEventListener("keydown", handleKeydown);
-		onCleanup(() => document.removeEventListener("keydown", handleKeydown));
+		});
 	});
 
 	const subViewTitle = () => {
@@ -134,9 +153,19 @@ export const HelpPanel: Component<HelpPanelProps> = (props) => {
 							<div class={s.section}>
 								<p class={s.menuNote}>MIT License &middot; Tauri 2 &middot; SolidJS &middot; Alacritty &middot; Rust</p>
 								<p class={s.menuNote}>&copy; 2026 Stefano Straus</p>
-								<p class={s.menuNote}>
-									{t("helpPanel.version", "Version")} {__APP_VERSION__}
-								</p>
+								<div class={s.versionRow}>
+									<span class={s.menuNote}>
+										{t("helpPanel.version", "Version")} {__APP_VERSION__}
+									</span>
+									<button
+										type="button"
+										class={s.copyVersionBtn}
+										onClick={copyVersion}
+										title={t("helpPanel.copyVersion", "Copy version")}
+									>
+										{copiedVersion() ? t("helpPanel.copied", "Copied") : t("helpPanel.copy", "Copy")}
+									</button>
+								</div>
 							</div>
 						</Show>
 						<Show when={view() === "shortcuts"}>

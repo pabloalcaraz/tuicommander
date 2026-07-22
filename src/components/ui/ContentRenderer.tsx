@@ -1,11 +1,24 @@
 import { convertFileSrc } from "@tauri-apps/api/core";
+import AnsiToHtml from "ansi-to-html";
+// DOMPurify's template scrubbing relies on a complete NodeIterator implementation.
+// The component tests therefore use jsdom instead of the suite-wide happy-dom
+// environment so security behavior matches real browser engines.
 import DOMPurify from "dompurify";
-import { marked } from "marked";
+import { marked, type Tokens } from "marked";
 import "./markdown-content.css";
 import { type Component, createEffect, createMemo, onCleanup, Show } from "solid-js";
 import { appLogger } from "../../stores/appLogger";
 import { stripAnsi } from "../../utils/stripAnsi";
-import { applyTweakHighlights } from "../../utils/tweakComments";
+import { injectTweakSentinels, parseTweakComments } from "../../utils/tweakComments";
+import { applyTweakDomHighlights } from "../../utils/tweakDomHighlight";
+
+/** DOMPurify's default allowed-URI schemes plus Tauri's local asset protocols
+ *  (`asset:`, `tauri:`). Without these, DOMPurify strips the rewritten image
+ *  `src` (convertFileSrc yields `asset://localhost/…` on macOS/Linux), leaving
+ *  `src=""` and a broken-image box. `http(s):` is already covered, so Windows'
+ *  `http://asset.localhost` form keeps working. */
+const ALLOWED_URI_REGEXP =
+	/^(?:(?:(?:f|ht)tps?|mailto|tel|callto|sms|cid|xmpp|asset|tauri):|[^a-z]|[a-z+.-]+(?:[^a-z+.\-:]|$))/i;
 
 /** File extensions that can be previewed inline when clicked as relative links.
  *  .md files open in a markdown tab; all others open in the file preview tab. */
@@ -37,6 +50,44 @@ marked.setOptions({
 	gfm: true, // GitHub Flavored Markdown
 	breaks: true, // Convert \n to <br>
 });
+
+const ansiConverter = new AnsiToHtml({ escapeXML: true });
+const ANSI_CSI_RE = /\x1b\[[\x30-\x3f]*[\x20-\x2f]*[\x40-\x7e]/;
+
+// Custom renderer: code blocks with ANSI sequences render with colors.
+marked.use({
+	renderer: {
+		code(token: Tokens.Code) {
+			const lang = token.lang ?? "";
+			const baseCls = lang ? `language-${lang}` : "";
+			if (ANSI_CSI_RE.test(token.text)) {
+				const cls = [baseCls, "ansi-block"].filter(Boolean).join(" ");
+				return `<pre><code class="${cls}">${ansiConverter.toHtml(token.text)}</code></pre>\n`;
+			}
+			const escaped = token.text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+			return `<pre><code${baseCls ? ` class="${baseCls}"` : ""}>${escaped}</code></pre>\n`;
+		},
+	},
+});
+
+/**
+ * Strips ANSI escape sequences from prose sections only, leaving code fence
+ * content intact so the custom marked renderer can colorize it.
+ */
+function stripAnsiOutsideCodeBlocks(source: string): string {
+	const lines = source.split("\n");
+	const out: string[] = [];
+	let inFence = false;
+	for (const line of lines) {
+		if (/^\s*(`{3,}|~{3,})/.test(line)) {
+			inFence = !inFence;
+			out.push(line);
+		} else {
+			out.push(inFence ? line : stripAnsi(line));
+		}
+	}
+	return out.join("\n");
+}
 
 const TILDE_SENTINEL = "data-checkbox-indeterminate";
 
@@ -98,7 +149,7 @@ async function renderMermaidBlocks(container: HTMLElement): Promise<void> {
 		}
 		for (const codeEl of codeEls) {
 			const pre = codeEl.parentElement;
-			if (!pre || pre.tagName !== "PRE" || pre.dataset.mermaidRendered) continue;
+			if (pre?.tagName !== "PRE" || pre.dataset.mermaidRendered) continue;
 			const source = codeEl.textContent?.trim();
 			if (!source) continue;
 			const id = `mermaid-${++mermaidIdCounter}`;
@@ -120,7 +171,7 @@ async function renderMermaidBlocks(container: HTMLElement): Promise<void> {
 export const ContentRenderer: Component<ContentRendererProps> = (props) => {
 	// Memoize processed markdown to avoid re-parsing on every render
 	const processedContent = createMemo(() => {
-		const raw = stripAnsi(props.content ?? "");
+		const raw = stripAnsiOutsideCodeBlocks(props.content ?? "");
 		try {
 			// 1. Convert [~] to [ ] so marked renders them as standard GFM task-list items.
 			//    Track which source lines had tilde for indeterminate styling later.
@@ -130,9 +181,10 @@ export const ContentRenderer: Component<ContentRendererProps> = (props) => {
 			//    This must use the tilde-cleaned source (same checkbox count as marked sees).
 			const lineMap = buildCheckboxLineMap(cleaned);
 
-			// 3. Convert tweak markers to highlight spans, then parse markdown.
-			const withHighlights = applyTweakHighlights(cleaned);
-			let html = marked.parse(withHighlights, { async: false }) as string;
+			// 3. Replace tweak markers with sentinel delimiters (highlight spans are
+			//    applied to the rendered DOM afterwards), then parse markdown.
+			const withSentinels = injectTweakSentinels(cleaned);
+			let html = marked.parse(withSentinels, { async: false }) as string;
 
 			// 4. Rewrite relative image src attributes to loadable asset:// URLs.
 			const baseDir = props.baseDir;
@@ -163,7 +215,8 @@ export const ContentRenderer: Component<ContentRendererProps> = (props) => {
 			});
 
 			return DOMPurify.sanitize(stripEventHandlers(html), {
-				ADD_ATTR: ["data-tweak-id", "data-tweak-at", "data-tweak-comment", "data-source-line", TILDE_SENTINEL],
+				ADD_ATTR: ["data-tweak-id", "data-tweak-at", "data-tweak-comment", "data-source-line", TILDE_SENTINEL, "style"],
+				ALLOWED_URI_REGEXP,
 			});
 		} catch (err) {
 			appLogger.error("app", "Markdown parsing error", err);
@@ -172,6 +225,9 @@ export const ContentRenderer: Component<ContentRendererProps> = (props) => {
 	});
 
 	const isEmpty = createMemo(() => (props.content ?? "").trim() === "");
+
+	// Tweak comments parsed from the raw source — applied to the rendered DOM below.
+	const tweakComments = createMemo(() => parseTweakComments(props.content ?? ""));
 
 	const handleClick = (e: MouseEvent) => {
 		const target = e.target as HTMLElement;
@@ -223,6 +279,9 @@ export const ContentRenderer: Component<ContentRendererProps> = (props) => {
 			containerRef.querySelectorAll<HTMLInputElement>(`input[${TILDE_SENTINEL}]`).forEach((cb) => {
 				cb.indeterminate = true;
 			});
+			// Turn highlight sentinels into <span class="tweak-highlight"> wrappers.
+			const comments = tweakComments();
+			if (comments.length > 0) applyTweakDomHighlights(containerRef, comments);
 			renderMermaidBlocks(containerRef);
 		});
 		onCleanup(() => cancelAnimationFrame(raf));

@@ -121,6 +121,63 @@ function handleShellState(
 	return {};
 }
 
+/**
+ * Simulates the "user typing" skip branch of checkWakeups(): a wake was
+ * committed (pendingWake set, counters incremented), then the input-buffer
+ * check found unsent text. Rolls back the attempt and records the unsent
+ * text as user activity so the idle guard suppresses re-attempts.
+ */
+function applyTypingSkip(session: SessionTracker, now: number): void {
+	session.pendingWake = false;
+	session.pendingWakeAt = 0;
+	session.wakeBusySeen = false;
+	session.wakeCount--;
+	session.totalWakesEver--;
+	session.lastUserInputAt = now;
+}
+
+const WAKE_MESSAGE = "Continue, or reply `done` if finished.";
+const WAKE_MESSAGE_CLEAN = WAKE_MESSAGE.replace(/`/g, "");
+const DONE_RE = /^[\s\-*>⏺●◉⬤·•]*done[.!?"'`,:;]*\s*$/i;
+const ANSI_RE = /\x1b\[[\x30-\x3f]*[\x20-\x2f]*[\x40-\x7e]/g;
+
+function isWakeMessage(text: string): boolean {
+	const clean = text.replace(ANSI_RE, "");
+	if (clean.includes(WAKE_MESSAGE) || clean.includes(WAKE_MESSAGE_CLEAN)) return true;
+	return clean.includes("Continue") && clean.includes("finished");
+}
+
+function isDoneReply(line: string): boolean {
+	if (isWakeMessage(line)) return false;
+	return DONE_RE.test(line.replace(ANSI_RE, ""));
+}
+
+/**
+ * Simulates the sleep/wake guard at the top of checkWakeups(): when the gap
+ * since the last tick exceeds the threshold, reset every session's idle clock,
+ * drop in-flight wakes, and skip the round. Returns true if a sleep gap was
+ * detected (round skipped).
+ */
+function checkSleepWake(
+	sessions: Map<string, SessionTracker>,
+	lastCheckAt: number,
+	now: number,
+	config = DEFAULTS,
+): boolean {
+	const sleepGapMs = Math.max(30_000, config.checkIntervalMs * 4);
+	if (lastCheckAt > 0 && now - lastCheckAt > sleepGapMs) {
+		for (const session of sessions.values()) {
+			session.lastIdleAt = now;
+			session.lastBusyAt = now;
+			session.pendingWake = false;
+			session.pendingWakeAt = 0;
+			session.wakeBusySeen = false;
+		}
+		return true;
+	}
+	return false;
+}
+
 // ── Tests ───────────────────────────────────────────────────────────
 
 describe("canWake", () => {
@@ -356,5 +413,136 @@ describe("re-arm after disarm", () => {
 		handleShellState(s, "idle", 25_000);
 
 		expect(s.disarmed).toBe(true);
+	});
+});
+
+describe("typing skip backs off (no 5s busy-retry on unsent input)", () => {
+	/** Build a session that canWake() would fire on, then commit the wake. */
+	function committedWake(now: number): SessionTracker {
+		const s = new SessionTracker();
+		s.shellState = "idle";
+		s.lastIdleAt = now - DEFAULTS.idleThresholdMs - 1;
+		expect(canWake(s, now)).toBe(true);
+		// checkWakeups commits the attempt before the async buffer check:
+		s.pendingWake = true;
+		s.pendingWakeAt = now;
+		s.wakeCount++;
+		s.totalWakesEver++;
+		return s;
+	}
+
+	it("rolls back the committed wake counters", () => {
+		const now = 100_000;
+		const s = committedWake(now);
+		expect(s.wakeCount).toBe(1);
+
+		applyTypingSkip(s, now);
+
+		expect(s.pendingWake).toBe(false);
+		expect(s.wakeCount).toBe(0);
+		expect(s.totalWakesEver).toBe(0);
+	});
+
+	it("suppresses re-attempt on the next 5s check tick", () => {
+		const now = 100_000;
+		const s = committedWake(now);
+
+		applyTypingSkip(s, now);
+
+		// Without recording the unsent input as activity, canWake would return
+		// true again on the very next tick → log + IPC every 5s forever.
+		expect(canWake(s, now + DEFAULTS.checkIntervalMs)).toBe(false);
+	});
+
+	it("resumes waking once typing stops (after idle backoff elapses)", () => {
+		const now = 100_000;
+		const s = committedWake(now);
+		applyTypingSkip(s, now);
+
+		// Still suppressed within 2x idle threshold...
+		expect(canWake(s, now + DEFAULTS.idleThresholdMs * 2 - 1)).toBe(false);
+		// ...but eligible again once the user has been quiet long enough.
+		s.lastIdleAt = now; // genuinely idle since the skip
+		expect(canWake(s, now + DEFAULTS.idleThresholdMs * 2 + 1)).toBe(true);
+	});
+});
+
+describe("sleep/wake gap detection (no nudge burst on resume)", () => {
+	/** A session left idle (and wake-eligible) just before the machine slept. */
+	function eligibleBeforeSleep(t: number): SessionTracker {
+		const s = new SessionTracker();
+		s.shellState = "idle";
+		s.lastIdleAt = t - DEFAULTS.idleThresholdMs - 1;
+		return s;
+	}
+
+	it("a session that was wake-eligible before sleep is NOT eligible right after resume", () => {
+		const tBeforeSleep = 100_000;
+		const s = eligibleBeforeSleep(tBeforeSleep);
+		// Sanity: it WAS eligible the instant before sleep.
+		expect(canWake(s, tBeforeSleep)).toBe(true);
+
+		const sessions = new Map([["sess", s]]);
+		const wakeNow = tBeforeSleep + 8 * 60 * 60 * 1000; // 8h sleep
+		const skipped = checkSleepWake(sessions, tBeforeSleep, wakeNow);
+
+		expect(skipped).toBe(true);
+		// Idle clock reset to wake time → the 20s countdown restarts from resume.
+		expect(s.lastIdleAt).toBe(wakeNow);
+		expect(canWake(s, wakeNow)).toBe(false);
+		// Still suppressed just under the threshold...
+		expect(canWake(s, wakeNow + DEFAULTS.idleThresholdMs - 1)).toBe(false);
+		// ...and only a GENUINE post-resume stall (idle 20s+) nudges.
+		expect(canWake(s, wakeNow + DEFAULTS.idleThresholdMs + 1)).toBe(true);
+	});
+
+	it("drops an in-flight wake that straddled the sleep", () => {
+		const s = new SessionTracker();
+		s.shellState = "idle";
+		s.pendingWake = true;
+		s.pendingWakeAt = 100_000;
+		s.wakeBusySeen = true;
+
+		const sessions = new Map([["sess", s]]);
+		checkSleepWake(sessions, 100_000, 100_000 + 60 * 60 * 1000);
+
+		expect(s.pendingWake).toBe(false);
+		expect(s.pendingWakeAt).toBe(0);
+		expect(s.wakeBusySeen).toBe(false);
+	});
+
+	it("normal 5s ticks are never read as sleep", () => {
+		const s = eligibleBeforeSleep(100_000);
+		const sessions = new Map([["sess", s]]);
+		const skipped = checkSleepWake(sessions, 100_000, 100_000 + DEFAULTS.checkIntervalMs);
+		expect(skipped).toBe(false);
+		// Untouched → still eligible (no false reset on a normal tick).
+		expect(canWake(s, 100_000 + DEFAULTS.checkIntervalMs)).toBe(true);
+	});
+
+	it("the very first tick (lastCheckAt=0) never reads as sleep", () => {
+		const sessions = new Map([["sess", new SessionTracker()]]);
+		expect(checkSleepWake(sessions, 0, 999_999_999)).toBe(false);
+	});
+});
+
+describe("done detection survives ANSI private-mode sequences", () => {
+	it("matches a 'done' line wrapped in cursor show/hide escapes", () => {
+		// Claude renders the reply with private-mode toggles like \x1b[?25h
+		// (show cursor). The old [0-9;]*[A-Za-z] strip left '?25h' garbage and
+		// isDoneReply failed → the session never disarmed → wake loop.
+		const line = "\x1b[?25l● done.\x1b[?25h";
+		expect(isDoneReply(line)).toBe(true);
+	});
+
+	it("still rejects the wake message echoed back (even with backticks stripped)", () => {
+		// Terminal rendering may strip the backticks from `done`.
+		expect(isWakeMessage("Continue, or reply done if finished.")).toBe(true);
+		expect(isWakeMessage(WAKE_MESSAGE)).toBe(true);
+		expect(isDoneReply("Continue, or reply done if finished.")).toBe(false);
+	});
+
+	it("does not match prose containing the word done", () => {
+		expect(isDoneReply("I am done with the first part, continuing now")).toBe(false);
 	});
 });

@@ -2,16 +2,32 @@ import { batch } from "solid-js";
 import { createStore, produce } from "solid-js/store";
 import { invoke } from "../invoke";
 import type { SavedTerminal } from "../types";
+import { markPerf } from "../utils/perfTrace";
 import { appLogger } from "./appLogger";
 import { makeBranchKey } from "./tabManager";
 
 const LEGACY_STORAGE_KEY = "tui-commander-repos";
+
+/** Returns paths of repos that have at least one active terminal. */
+function getHotRepoPaths(repositories: Record<string, RepositoryState>): string[] {
+	return Object.entries(repositories)
+		.filter(([, repo]) => Object.values(repo.branches).some((b) => b.terminals.length > 0))
+		.map(([path]) => path);
+}
+
+function syncHotRepos(repositories: Record<string, RepositoryState>): void {
+	invoke("set_hot_repos", { paths: getHotRepoPaths(repositories) }).catch((err: unknown) =>
+		appLogger.warn("store", "Failed to sync hot repos", err),
+	);
+}
 
 /** Branch with its terminals */
 export interface BranchState {
 	name: string;
 	isMain: boolean; // true for main/master/develop
 	isShell?: boolean; // true for non-git directory shell entries
+	isPreparing?: boolean; // true while stale worktree is being cleaned up and recreated in background
+	isRemoving?: boolean; // true while worktree removal is in progress
 	worktreePath: string | null; // Path to worktree directory (null for main branch)
 	terminals: string[]; // terminal IDs belonging to this branch
 	hadTerminals: boolean; // true once a terminal has been created — suppresses auto-spawn after close-all
@@ -24,6 +40,8 @@ export interface BranchState {
 	savedTerminals?: SavedTerminal[]; // Persisted terminal metadata for session restore
 	/** CI auto-heal: when enabled, CI failures trigger automatic agent fix cycles */
 	ciAutoHeal?: { enabled: boolean; attempts: number; lastRunId?: number; healing?: boolean };
+	/** Whether the terminal tab list is expanded under this branch row */
+	tabsExpanded?: boolean;
 }
 
 /** Repository with branches */
@@ -96,7 +114,13 @@ function saveReposImmediate(
 	for (const [path, repo] of Object.entries(repositories)) {
 		const branches: Record<string, BranchState> = {};
 		for (const [name, branch] of Object.entries(repo.branches)) {
-			branches[name] = { ...branch, terminals: [] };
+			const persisted: BranchState = { ...branch, terminals: [] };
+			// `healing` is a transient runtime flag; never persist it (a crash mid-heal
+			// would otherwise leave the toggle showing "Healing" forever after reload).
+			if (persisted.ciAutoHeal?.healing) {
+				persisted.ciAutoHeal = { ...persisted.ciAutoHeal, healing: false };
+			}
+			branches[name] = persisted;
 		}
 		serializable[path] = { ...repo, branches };
 	}
@@ -229,6 +253,7 @@ function createRepositoriesStore() {
 					}
 				}
 				hydrated = true;
+				syncHotRepos(state.repositories);
 			} catch (err) {
 				appLogger.error("store", "Failed to hydrate repositories", err);
 				// hydrated stays false — saves are blocked to prevent data loss
@@ -276,6 +301,7 @@ function createRepositoriesStore() {
 			setState(
 				produce((s) => {
 					delete s.repositories[path];
+					delete s.revisions[path];
 					s.repoOrder = s.repoOrder.filter((p) => p !== path);
 					// Clean up group membership
 					for (const group of Object.values(s.groups)) {
@@ -292,8 +318,15 @@ function createRepositoriesStore() {
 
 		/** Set active repository */
 		setActive(path: string | null): void {
+			// Freeze-investigation breadcrumb: the synchronous reactive cascade off
+			// activeRepoPath/revision is the prime repo-switch-hang suspect.
+			markPerf("repo.setActive", { path });
 			setState("activeRepoPath", path);
 			save();
+			if (path && !getHotRepoPaths(state.repositories).includes(path)) {
+				setState("revisions", path, (n) => (n ?? 0) + 1);
+				invoke("github_poll_repo", { path }).catch(() => {});
+			}
 		},
 
 		/** Update the display name of a repository */
@@ -312,6 +345,20 @@ function createRepositoriesStore() {
 		/** Toggle repository collapsed state */
 		toggleCollapsed(path: string): void {
 			setState("repositories", path, "collapsed", (c) => !c);
+			save();
+		},
+
+		/** Toggle branch terminal tab list expanded state */
+		toggleBranchTabsExpanded(repoPath: string, branchName: string): void {
+			if (!state.repositories[repoPath]?.branches[branchName]) return;
+			setState("repositories", repoPath, "branches", branchName, "tabsExpanded", (e) => !e);
+			save();
+		},
+
+		/** Set branch terminal tab list expanded state explicitly */
+		setBranchTabsExpanded(repoPath: string, branchName: string, expanded: boolean): void {
+			if (!state.repositories[repoPath]?.branches[branchName]) return;
+			setState("repositories", repoPath, "branches", branchName, "tabsExpanded", expanded);
 			save();
 		},
 
@@ -336,6 +383,7 @@ function createRepositoriesStore() {
 					worktreePath: null,
 					terminals: [],
 					hadTerminals: false,
+					tabsExpanded: false,
 					lastActiveTerminal: null,
 					additions: 0,
 					deletions: 0,
@@ -367,6 +415,7 @@ function createRepositoriesStore() {
 					}
 				});
 				save();
+				syncHotRepos(state.repositories);
 			}
 		},
 
@@ -389,6 +438,7 @@ function createRepositoriesStore() {
 				}
 			});
 			save();
+			syncHotRepos(state.repositories);
 		},
 
 		/** Set run command for a branch */
@@ -404,6 +454,7 @@ function createRepositoriesStore() {
 		setCiAutoHeal(repoPath: string, branchName: string, value: BranchState["ciAutoHeal"]): void {
 			if (!state.repositories[repoPath]?.branches[branchName]) return;
 			setState("repositories", repoPath, "branches", branchName, "ciAutoHeal", value);
+			save();
 		},
 
 		/** Update branch stats (additions/deletions) — only if branch already exists */
@@ -859,6 +910,29 @@ function createRepositoriesStore() {
 				.filter((r) => r && !r.parked);
 
 			return { groups, ungrouped };
+		},
+
+		/** Every configured repo in display order (ungrouped first, then each
+		 *  group's repos in group order). Includes parked repos. Used by the
+		 *  Settings nav, which must list every repo regardless of group/park
+		 *  state — grouped repos live in group.repoOrder, not state.repoOrder. (#64) */
+		getAllReposOrdered(): RepositoryState[] {
+			const seen = new Set<string>();
+			const result: RepositoryState[] = [];
+			const push = (path: string) => {
+				if (seen.has(path)) return;
+				const repo = state.repositories[path];
+				if (!repo) return;
+				seen.add(path);
+				result.push(repo);
+			};
+			for (const path of state.repoOrder) push(path);
+			for (const gid of state.groupOrder) {
+				const group = state.groups[gid];
+				if (!group) continue;
+				for (const path of group.repoOrder) push(path);
+			}
+			return result;
 		},
 
 		setBranchSwitching(value: boolean): void {

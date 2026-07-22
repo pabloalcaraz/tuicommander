@@ -7,10 +7,12 @@
  */
 
 import { invoke, listen } from "../invoke";
+import { isWindows } from "../platform";
 import { appLogger } from "../stores/appLogger";
 import { pluginStore } from "../stores/pluginStore";
 import { terminalsStore } from "../stores/terminals";
 import { isTauri } from "../transport";
+import { updateAppConfig } from "../utils/updateAppConfig";
 import { pluginRegistry } from "./pluginRegistry";
 import type { TuiPlugin } from "./types";
 
@@ -138,17 +140,12 @@ export function isPluginDisabled(id: string): boolean {
  */
 export async function setPluginEnabled(id: string, enabled: boolean): Promise<void> {
 	// Update Rust config
-	const config = await invoke<Record<string, unknown>>("load_config");
-	const list = new Set<string>((config.disabled_plugin_ids as string[]) ?? []);
-
-	if (enabled) {
-		list.delete(id);
-	} else {
-		list.add(id);
-	}
-
-	await invoke("save_config", {
-		config: { ...config, disabled_plugin_ids: [...list] },
+	let list = new Set<string>();
+	await updateAppConfig<Record<string, unknown>>((config) => {
+		list = new Set<string>((config.disabled_plugin_ids as string[]) ?? []);
+		if (enabled) list.delete(id);
+		else list.add(id);
+		config.disabled_plugin_ids = [...list];
 	});
 
 	disabledPluginIds = list;
@@ -182,9 +179,9 @@ export async function setPluginEnabled(id: string, enabled: boolean): Promise<vo
 			pluginRegistry.unregister(id);
 			pluginStore.updatePlugin(id, { loaded: false });
 		} else if (loadedPluginIds.has(id)) {
+			// pluginRegistry.unregister() already issues the Rust-side unregister.
 			pluginRegistry.unregister(id);
 			loadedPluginIds.delete(id);
-			invoke("unregister_loaded_plugin", { pluginId: id }).catch(() => {});
 		}
 	}
 }
@@ -195,6 +192,19 @@ export async function setPluginEnabled(id: string, enabled: boolean): Promise<vo
 
 /** Track loaded plugin IDs for hot-reload unregister/re-register */
 const loadedPluginIds = new Set<string>();
+
+/**
+ * Build the base import URL for a plugin module.
+ *
+ * Tauri/wry exposes custom URI schemes differently per platform: macOS/Linux
+ * serve them under the raw `plugin://` scheme, but WebView2 on Windows only
+ * serves them as `http://plugin.localhost/...`. `register_plugin_protocol()`
+ * in plugins.rs already parses both forms — this just emits the right one.
+ */
+export function pluginModuleBaseUrl(id: string, main: string, windows: boolean): string {
+	const relPath = `${id}/${main}`;
+	return windows ? `http://plugin.localhost/${relPath}` : `plugin://${relPath}`;
+}
 
 async function loadPlugin(manifest: PluginManifest): Promise<void> {
 	const logger = pluginStore.getLogger(manifest.id);
@@ -207,8 +217,8 @@ async function loadPlugin(manifest: PluginManifest): Promise<void> {
 		loaded: false,
 	});
 
-	// Cache-bust for hot reload
-	const url = `plugin://${manifest.id}/${manifest.main}?t=${Date.now()}`;
+	// `?t=` cache-busts for hot reload.
+	const url = `${pluginModuleBaseUrl(manifest.id, manifest.main, isWindows())}?t=${Date.now()}`;
 	let mod: unknown;
 	try {
 		mod = await import(/* @vite-ignore */ url);
@@ -229,10 +239,11 @@ async function loadPlugin(manifest: PluginManifest): Promise<void> {
 	}
 
 	const plugin = (mod as { default: TuiPlugin }).default;
-	pluginRegistry.register(plugin, manifest.capabilities, manifest.allowedUrls, manifest.agentTypes);
+	// Await register() — it performs Rust registration + onload asynchronously.
+	// Without the await we'd log success and add to loadedPluginIds before those
+	// actually complete (race).
+	await pluginRegistry.register(plugin, manifest.capabilities, manifest.agentTypes);
 	loadedPluginIds.add(manifest.id);
-
-	// Rust-side registration is already handled by pluginRegistry.register()
 
 	logger.info(`Loaded v${manifest.version}`);
 	appLogger.info("plugin", `Loaded plugin "${manifest.id}" v${manifest.version}`);
@@ -250,14 +261,22 @@ async function handlePluginChanged(event: { payload: string[] }): Promise<void> 
 	const changedIds = event.payload;
 	if (!Array.isArray(changedIds) || changedIds.length === 0) return;
 
+	let anyReloaded = false;
+
 	for (const pluginId of changedIds) {
+		// Skip disabled plugins early — no IPC, no store churn
+		if (disabledPluginIds.has(pluginId)) {
+			appLogger.debug("plugin", `Plugin "${pluginId}" changed but disabled, skipping`);
+			continue;
+		}
+
 		appLogger.info("plugin", `Plugin "${pluginId}" changed, reloading...`);
 
 		// Unregister if previously loaded
 		if (loadedPluginIds.has(pluginId)) {
+			// pluginRegistry.unregister() already issues the Rust-side unregister.
 			pluginRegistry.unregister(pluginId);
 			loadedPluginIds.delete(pluginId);
-			invoke("unregister_loaded_plugin", { pluginId }).catch(() => {});
 		}
 
 		// Re-discover this specific plugin's manifest
@@ -284,26 +303,13 @@ async function handlePluginChanged(event: { payload: string[] }): Promise<void> 
 			continue;
 		}
 
-		// Don't reload disabled plugins
-		if (disabledPluginIds.has(pluginId)) {
-			pluginStore.registerPlugin(pluginId, {
-				manifest,
-				builtIn: false,
-				enabled: false,
-				loaded: false,
-			});
-			continue;
-		}
-
 		await loadPlugin(manifest);
+		anyReloaded = true;
 	}
 
-	// After hot-reload, replay agent-started + shell-state for all
-	// terminals with running agents. The plugin lost its in-memory
-	// session map on unload; without replay it never re-discovers
-	// sessions that were already active. Called once after all changed
-	// plugins have been reloaded to avoid duplicate dispatches.
-	replayActiveAgents(terminalsStore);
+	if (anyReloaded) {
+		replayActiveAgents(terminalsStore);
+	}
 }
 
 /** Replay agent-started events for terminals that already have a running agent. */

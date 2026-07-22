@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -59,6 +60,26 @@ pub(crate) enum PrTransition {
         pr_number: i32,
         title: String,
     },
+    Pushed {
+        repo_path: String,
+        branch: String,
+        pr_number: i32,
+        title: String,
+        head_ref_oid: String,
+        /// PR author login — used by the watcher's authored_by_others filter.
+        author: String,
+    },
+    /// A brand-new PR appeared on an open branch. Detected in `process_repo_update`
+    /// (no prior state to diff), not in `detect_transitions`. Carries `author` for
+    /// the watcher's authored_by_others filter and `head_ref_oid` for worktree review.
+    Opened {
+        repo_path: String,
+        branch: String,
+        pr_number: i32,
+        title: String,
+        head_ref_oid: String,
+        author: String,
+    },
 }
 
 fn is_ready(pr: &BranchPrStatus) -> bool {
@@ -80,6 +101,13 @@ pub(crate) fn detect_transitions(
     let title = new.title.clone();
 
     let mut primary_type: Option<&str> = None;
+
+    // A push replaces the head SHA. Its failing checks are a *fresh* failure even
+    // when the previous head was also failing — so `ci_failed` must re-fire on a
+    // new commit, not only on the failed==0 → failed>0 edge. Otherwise an agent's
+    // fix-push whose CI fails again before the poller observes an intermediate
+    // all-pending (failed==0) poll never re-triggers auto-heal, stalling the loop.
+    let new_commit = old.head_ref_oid != new.head_ref_oid && !new.head_ref_oid.is_empty();
 
     // Terminal transitions
     if old_state != "MERGED" && new_state == "MERGED" {
@@ -109,7 +137,7 @@ pub(crate) fn detect_transitions(
                 pr_number,
                 title: title.clone(),
             });
-        } else if old.checks.failed == 0 && new.checks.failed > 0 {
+        } else if new.checks.failed > 0 && (old.checks.failed == 0 || new_commit) {
             primary_type = Some("ci_failed");
             out.push(PrTransition::CiFailed {
                 repo_path: rp.clone(),
@@ -136,6 +164,19 @@ pub(crate) fn detect_transitions(
                 title: title.clone(),
             });
         }
+    }
+
+    // New commit pushed to an open PR: head_ref_oid changed. Independent signal
+    // (a push can coincide with ci_failed etc.), carries the new oid for dedup.
+    if new_state == "OPEN" && new_commit {
+        out.push(PrTransition::Pushed {
+            repo_path: rp.clone(),
+            branch: branch.clone(),
+            pr_number,
+            title: title.clone(),
+            head_ref_oid: new.head_ref_oid.clone(),
+            author: new.author.clone(),
+        });
     }
 
     // CI recovery: failed → all passing, suppressed when "ready" already fired
@@ -174,6 +215,8 @@ const RATE_BUDGET_CRITICAL: u32 = 100;
 const ACTIVE_WINDOW: Duration = Duration::from_secs(15 * 60);
 /// Idle repos are included every Nth poll cycle.
 const IDLE_POLL_DIVISOR: u32 = 5;
+/// Cold repos (no active terminals) are included every Nth poll cycle (~10min at 60s base).
+const DORMANT_POLL_DIVISOR: u32 = 10;
 
 pub(crate) enum PollerCmd {
     SetVisibility(bool),
@@ -181,6 +224,11 @@ pub(crate) enum PollerCmd {
     UpdatePaths(Vec<String>),
     SetIssueFilter(String),
     SetPrHideDrafts(bool),
+    /// Re-emit current PR + issue state for all repos on the next poll, even when
+    /// unchanged. Sent when the frontend (re)subscribes (e.g. webview reload after
+    /// standby): the frontend store reset to empty, but the poller's change-detection
+    /// would otherwise suppress re-sending unchanged data, leaving the UI blank.
+    ForceResync,
     Stop,
 }
 
@@ -210,6 +258,9 @@ struct PollMutableState {
     last_pr_updated_at: HashMap<String, Option<String>>,
     /// Per-repo max issue updated_at — `None` means known-empty issue set.
     last_issue_updated_at: HashMap<String, Option<String>>,
+    /// When set, the next poll re-emits PR + issue state regardless of change
+    /// detection, then clears. Set by `PollerCmd::ForceResync`.
+    force_resync: bool,
 }
 
 #[cfg(feature = "desktop")]
@@ -224,6 +275,7 @@ async fn poll_loop(state: Arc<AppState>, handle: AppHandle, mut rx: mpsc::Receiv
         last_changed: HashMap::new(),
         last_pr_updated_at: HashMap::new(),
         last_issue_updated_at: HashMap::new(),
+        force_resync: false,
     };
     let mut startup = true;
     let mut poll_cycle: u32 = 0;
@@ -248,7 +300,7 @@ async fn poll_loop(state: Arc<AppState>, handle: AppHandle, mut rx: mpsc::Receiv
         tokio::select! {
             _ = pending_sleep => {
                 pending_poll_at = None;
-                let rate_budget = state.github_rate_limit_remaining.load(std::sync::atomic::Ordering::Relaxed);
+                let rate_budget = crate::github::min_rate_budget(&state);
                 let batch = if pending_poll_paths.is_empty() { &paths } else { &pending_poll_paths };
                 poll_batch(&state, &handle, batch, false, &issue_filter, pr_hide_drafts, &mut ps).await;
                 pending_poll_paths.clear();
@@ -257,11 +309,12 @@ async fn poll_loop(state: Arc<AppState>, handle: AppHandle, mut rx: mpsc::Receiv
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             }
             _ = interval.tick() => {
-                let rate_budget = state.github_rate_limit_remaining.load(std::sync::atomic::Ordering::Relaxed);
+                let rate_budget = crate::github::min_rate_budget(&state);
                 let batch_paths = if startup {
                     paths.clone()
                 } else {
-                    tiered_paths(&paths, &ps.last_changed, poll_cycle)
+                    let hot = state.hot_repo_paths.read();
+                    tiered_paths(&paths, &ps.last_changed, poll_cycle, &hot)
                 };
                 poll_batch(&state, &handle, &batch_paths, startup, &issue_filter, pr_hide_drafts, &mut ps).await;
                 startup = false;
@@ -306,6 +359,13 @@ async fn poll_loop(state: Arc<AppState>, handle: AppHandle, mut rx: mpsc::Receiv
                             pending_poll_at = Some(tokio::time::Instant::now());
                         }
                     }
+                    Some(PollerCmd::ForceResync) => {
+                        // Frontend re-subscribed: re-emit full state on an immediate
+                        // poll over all paths, bypassing change detection.
+                        ps.force_resync = true;
+                        pending_poll_paths.clear();
+                        pending_poll_at = Some(tokio::time::Instant::now());
+                    }
                     Some(PollerCmd::Stop) | None => break,
                 }
             }
@@ -313,25 +373,41 @@ async fn poll_loop(state: Arc<AppState>, handle: AppHandle, mut rx: mpsc::Receiv
     }
 }
 
+/// Deterministic hash of a path to a u32 — used for jitter offset.
+fn path_hash(path: &str) -> u32 {
+    let mut hasher = std::hash::DefaultHasher::new();
+    path.hash(&mut hasher);
+    hasher.finish() as u32
+}
+
 /// Select which repos to include in this poll cycle.
 /// Active repos (PR data changed within ACTIVE_WINDOW) are polled every tick.
 /// Idle repos are polled every IDLE_POLL_DIVISOR ticks.
+/// Dormant repos (cold — no active terminals) are polled every DORMANT_POLL_DIVISOR
+/// ticks with per-path jitter so they don't all fire on the same cycle.
 /// Repos never seen yet are always included (ensures first fetch).
 fn tiered_paths(
     all_paths: &[String],
     last_changed: &HashMap<String, Instant>,
     cycle: u32,
+    hot_paths: &HashSet<String>,
 ) -> Vec<String> {
     let now = Instant::now();
     all_paths
         .iter()
-        .filter(|p| match last_changed.get(p.as_str()) {
-            None => true,
-            Some(t) => {
-                if now.duration_since(*t) < ACTIVE_WINDOW {
-                    true
-                } else {
-                    cycle.is_multiple_of(IDLE_POLL_DIVISOR)
+        .filter(|p| {
+            let is_hot = hot_paths.contains(p.as_str());
+            match last_changed.get(p.as_str()) {
+                None => true,
+                Some(t) => {
+                    if now.duration_since(*t) < ACTIVE_WINDOW {
+                        true
+                    } else if is_hot {
+                        cycle.is_multiple_of(IDLE_POLL_DIVISOR)
+                    } else {
+                        let offset = path_hash(p) % DORMANT_POLL_DIVISOR;
+                        cycle % DORMANT_POLL_DIVISOR == offset
+                    }
                 }
             }
         })
@@ -360,6 +436,28 @@ fn current_interval(visible: bool, fail_count: u32, rate_budget: u32) -> Duratio
     Duration::from_millis(backoff.min(MAX_INTERVAL.as_millis() as f64) as u64)
 }
 
+/// Decide whether to (re-)emit a repo's PR or issue snapshot to the frontend.
+///
+/// Normally we only emit when the data changed since the previous poll (cheap
+/// change detection on the max `updated_at`). `force` overrides that for a full
+/// resync: when the frontend re-subscribes (e.g. webview reload after standby)
+/// its store reset to empty, so unchanged data must be re-sent or the UI stays
+/// blank until the next real change. `prev_ts == None` means this repo was never
+/// polled before, which always counts as changed.
+#[cfg(any(feature = "desktop", test))]
+fn should_emit(prev_ts: Option<&Option<String>>, cur_ts: &Option<String>, force: bool) -> bool {
+    force || prev_ts.is_none_or(|p| p != cur_ts)
+}
+
+/// Change-detection key for a PR/issue snapshot: `<count>|<max updated_at>`.
+/// The count is essential — an item that drops out of the open set (merged/closed
+/// PR, closed issue) shrinks the list without necessarily moving the max
+/// timestamp, so a max-only key would miss the removal and leave the badge stale.
+#[cfg(any(feature = "desktop", test))]
+fn snapshot_key(count: usize, max_updated_at: &str) -> String {
+    format!("{count}|{max_updated_at}")
+}
+
 #[cfg(feature = "desktop")]
 async fn poll_batch(
     state: &AppState,
@@ -373,9 +471,8 @@ async fn poll_batch(
     if paths.is_empty() {
         return;
     }
-    if state.github_circuit_breaker.check().is_err() {
-        return;
-    }
+    // Per-account circuit breakers are checked inside get_all_batch_impl so a
+    // single failing account no longer blocks polling of the others.
 
     match crate::github::get_all_batch_impl(
         paths,
@@ -389,6 +486,10 @@ async fn poll_batch(
         Ok(result) => {
             ps.fail_count = 0;
             let now = Instant::now();
+            // One-shot full re-emit requested by a frontend re-subscribe. Consumed
+            // here so a single successful poll re-hydrates the (reset) frontend store.
+            let force = ps.force_resync;
+            ps.force_resync = false;
 
             for (repo_path, statuses) in result.prs {
                 let changed =
@@ -399,17 +500,21 @@ async fn poll_batch(
                     ps.last_changed.entry(repo_path.clone()).or_insert(now);
                 }
 
-                let cur_ts = statuses
+                // Key on count + max(updated_at): a PR that drops out of the open
+                // set (merged/closed) shrinks the list without necessarily changing
+                // the max timestamp, so max alone would miss the removal and leave
+                // the badge stale. The count flips the signal in that case.
+                let max_ts = statuses
                     .iter()
                     .map(|s| s.updated_at.as_str())
                     .filter(|s| !s.is_empty())
                     .max()
-                    .map(|s| s.to_string());
-                let prev_ts = ps.last_pr_updated_at.get(&repo_path);
-                let data_changed = prev_ts.is_none_or(|p| *p != cur_ts);
+                    .unwrap_or_default();
+                let cur_ts = Some(snapshot_key(statuses.len(), max_ts));
+                let emit = should_emit(ps.last_pr_updated_at.get(&repo_path), &cur_ts, force);
                 ps.last_pr_updated_at.insert(repo_path.clone(), cur_ts);
 
-                if data_changed {
+                if emit {
                     let _ = handle.emit(
                         "github-pr-update",
                         PrUpdatePayload {
@@ -425,17 +530,22 @@ async fn poll_batch(
             }
 
             for (repo_path, issues) in result.issues {
-                let cur_ts = issues
+                // Key on count + max(updated_at): a closed issue drops out of the
+                // OPEN set, shrinking the list without changing the max timestamp
+                // when it was not the latest — max alone misses the removal and the
+                // badge stays stale (observed: stuck at 7 after closing issues via
+                // the API). The count flips the signal in that case.
+                let max_ts = issues
                     .iter()
                     .map(|i| i.updated_at.as_str())
                     .filter(|s| !s.is_empty())
                     .max()
-                    .map(|s| s.to_string());
-                let prev_ts = ps.last_issue_updated_at.get(&repo_path);
-                let data_changed = prev_ts.is_none_or(|p| *p != cur_ts);
+                    .unwrap_or_default();
+                let cur_ts = Some(snapshot_key(issues.len(), max_ts));
+                let emit = should_emit(ps.last_issue_updated_at.get(&repo_path), &cur_ts, force);
                 ps.last_issue_updated_at.insert(repo_path.clone(), cur_ts);
 
-                if data_changed {
+                if emit {
                     let _ = handle.emit(
                         "github-issues-update",
                         IssuesUpdatePayload {
@@ -468,6 +578,9 @@ fn process_repo_update(
     statuses: &[BranchPrStatus],
     prev: &mut PrevState,
 ) -> bool {
+    // First poll for this repo seeds `old_map` with pre-existing PRs; those must
+    // not fire `Opened`. Only PRs that appear on a *later* poll are genuinely new.
+    let first_poll_for_repo = !prev.contains_key(repo_path);
     let old_map = prev.entry(repo_path.to_string()).or_default();
     let mut changed = false;
     for new_pr in statuses {
@@ -486,6 +599,23 @@ fn process_repo_update(
                 || old_pr.checks != new_pr.checks
                 || old_pr.state != new_pr.state
         } else {
+            // Brand-new branch: emit Opened for open PRs (skipping the first poll's
+            // pre-existing set). The poller inserts it into old_map below, so a PR
+            // fires Opened at most once per appearance.
+            if !first_poll_for_repo && new_pr.state.to_uppercase() == "OPEN" {
+                let t = PrTransition::Opened {
+                    repo_path: repo_path.to_string(),
+                    branch: new_pr.branch.clone(),
+                    pr_number: new_pr.number,
+                    title: new_pr.title.clone(),
+                    head_ref_oid: new_pr.head_ref_oid.clone(),
+                    author: new_pr.author.clone(),
+                };
+                let _ = handle.emit("github-transition", &t);
+                let _ = state
+                    .event_bus
+                    .send(AppEvent::GitHubTransition { transition: t });
+            }
             true
         };
         if is_new {
@@ -506,6 +636,83 @@ fn process_repo_update(
 }
 
 // ---------------------------------------------------------------------------
+// Shared start/config helpers (IPC/HTTP parity)
+// ---------------------------------------------------------------------------
+
+/// Push the poll config (paths, issue filter, hide-drafts) to a running poller.
+///
+/// `resync` additionally requests a full re-emit (`ForceResync`) — sent when a
+/// client (re)subscribes to an *already-running* poller whose frontend store may
+/// have reset (e.g. webview reload after standby), so unchanged PRs/issues
+/// re-hydrate instead of staying blank until the next data change. A freshly
+/// started poller has no prior state to resync, so it passes `resync = false`.
+///
+/// Shared by the Tauri command and the HTTP route so both transports send the
+/// identical command sequence.
+pub(crate) fn send_poller_config(
+    poller: &GitHubPoller,
+    paths: Vec<String>,
+    issue_filter: String,
+    pr_hide_drafts: bool,
+    resync: bool,
+) {
+    if let Err(e) = poller.cmd_tx.try_send(PollerCmd::UpdatePaths(paths)) {
+        tracing::warn!(
+            source = "github",
+            "Failed to send UpdatePaths to poller: {e}"
+        );
+    }
+    if let Err(e) = poller
+        .cmd_tx
+        .try_send(PollerCmd::SetIssueFilter(issue_filter))
+    {
+        tracing::warn!(
+            source = "github",
+            "Failed to send SetIssueFilter to poller: {e}"
+        );
+    }
+    if let Err(e) = poller
+        .cmd_tx
+        .try_send(PollerCmd::SetPrHideDrafts(pr_hide_drafts))
+    {
+        tracing::warn!(
+            source = "github",
+            "Failed to send SetPrHideDrafts to poller: {e}"
+        );
+    }
+    if resync && let Err(e) = poller.cmd_tx.try_send(PollerCmd::ForceResync) {
+        tracing::warn!(
+            source = "github",
+            "Failed to send ForceResync to poller: {e}"
+        );
+    }
+}
+
+/// Start the GitHub poller if not already running, then push the poll config.
+///
+/// Cold start: spawns the poller and seeds it (no resync — nothing to re-emit).
+/// Already running: forwards the new config and forces a resync for the
+/// (re)subscribing client. This is the single implementation behind both the
+/// Tauri `github_start_polling` command and the HTTP `poller_start` route.
+#[cfg(feature = "desktop")]
+pub(crate) fn ensure_polling(
+    state: &Arc<AppState>,
+    app: AppHandle,
+    paths: Vec<String>,
+    issue_filter: String,
+    pr_hide_drafts: bool,
+) {
+    let mut guard = state.github_poller.lock();
+    if let Some(poller) = guard.as_ref() {
+        send_poller_config(poller, paths, issue_filter, pr_hide_drafts, true);
+        return;
+    }
+    let poller = GitHubPoller::start(Arc::clone(state), app);
+    send_poller_config(&poller, paths, issue_filter, pr_hide_drafts, false);
+    *guard = Some(poller);
+}
+
+// ---------------------------------------------------------------------------
 // Tauri commands
 // ---------------------------------------------------------------------------
 
@@ -518,60 +725,7 @@ pub(crate) async fn github_start_polling(
     issue_filter: String,
     pr_hide_drafts: bool,
 ) -> Result<(), String> {
-    let mut guard = state.github_poller.lock();
-    if guard.is_some() {
-        // Already running — just update paths and filter
-        if let Some(poller) = guard.as_ref() {
-            if let Err(e) = poller.cmd_tx.try_send(PollerCmd::UpdatePaths(paths)) {
-                tracing::warn!(
-                    source = "github",
-                    "Failed to send UpdatePaths to poller: {e}"
-                );
-            }
-            if let Err(e) = poller
-                .cmd_tx
-                .try_send(PollerCmd::SetIssueFilter(issue_filter))
-            {
-                tracing::warn!(
-                    source = "github",
-                    "Failed to send SetIssueFilter to poller: {e}"
-                );
-            }
-            if let Err(e) = poller
-                .cmd_tx
-                .try_send(PollerCmd::SetPrHideDrafts(pr_hide_drafts))
-            {
-                tracing::warn!(
-                    source = "github",
-                    "Failed to send SetPrHideDrafts to poller: {e}"
-                );
-            }
-        }
-        return Ok(());
-    }
-    let poller = GitHubPoller::start(Arc::clone(&state), app);
-    if let Err(e) = poller.cmd_tx.try_send(PollerCmd::UpdatePaths(paths)) {
-        tracing::warn!(source = "github", "Failed to send initial UpdatePaths: {e}");
-    }
-    if let Err(e) = poller
-        .cmd_tx
-        .try_send(PollerCmd::SetIssueFilter(issue_filter))
-    {
-        tracing::warn!(
-            source = "github",
-            "Failed to send initial SetIssueFilter: {e}"
-        );
-    }
-    if let Err(e) = poller
-        .cmd_tx
-        .try_send(PollerCmd::SetPrHideDrafts(pr_hide_drafts))
-    {
-        tracing::warn!(
-            source = "github",
-            "Failed to send initial SetPrHideDrafts: {e}"
-        );
-    }
-    *guard = Some(poller);
+    ensure_polling(state.inner(), app, paths, issue_filter, pr_hide_drafts);
     Ok(())
 }
 
@@ -649,6 +803,13 @@ pub(crate) async fn github_set_pr_hide_drafts(
     state: tauri::State<'_, Arc<AppState>>,
     hide: bool,
 ) -> Result<(), String> {
+    github_set_pr_hide_drafts_impl(state.inner(), hide)
+}
+
+pub(crate) fn github_set_pr_hide_drafts_impl(
+    state: &Arc<AppState>,
+    hide: bool,
+) -> Result<(), String> {
     if let Some(poller) = state.github_poller.lock().as_ref()
         && let Err(e) = poller.cmd_tx.try_send(PollerCmd::SetPrHideDrafts(hide))
     {
@@ -703,12 +864,12 @@ mod tests {
                 pending,
                 total: failed + pending,
             },
-            check_details: vec![],
             author: String::new(),
             commits: 1,
             mergeable: mergeable.to_string(),
             merge_state_status: String::new(),
             review_decision: review.to_string(),
+            viewer_did_approve: false,
             labels: vec![],
             is_draft: false,
             base_ref_name: "main".to_string(),
@@ -751,12 +912,67 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_key_detects_count_shrink_with_unchanged_max_ts() {
+        // A closed issue / merged PR drops out of the open set, shrinking the
+        // list. If it was not the most-recently-updated item, max(updated_at) is
+        // unchanged — only the count moves. The snapshot key must still differ so
+        // should_emit re-emits the smaller list (otherwise the badge stays stale,
+        // the bug that left the sidebar stuck at 7 after closing issues via API).
+        let ts = "2026-06-01T00:00:00Z";
+        let prev = Some(snapshot_key(7, ts));
+        let cur = Some(snapshot_key(4, ts));
+        assert_ne!(prev, cur, "a count change must change the snapshot key");
+        assert!(
+            should_emit(Some(&prev), &cur, false),
+            "a count shrink with unchanged max ts must trigger a re-emit"
+        );
+    }
+
+    #[test]
+    fn snapshot_key_stable_when_unchanged() {
+        // No spurious emit when neither count nor max ts moved.
+        let key = Some(snapshot_key(4, "2026-06-01T00:00:00Z"));
+        assert!(
+            !should_emit(Some(&key), &key, false),
+            "an unchanged snapshot must not re-emit"
+        );
+    }
+
+    #[test]
     fn transition_ci_failed() {
         let old = make_pr("OPEN", "MERGEABLE", "", 0, 0);
         let new = make_pr("OPEN", "MERGEABLE", "", 2, 0);
         let t = detect_transitions("/repo", &old, &new);
         assert_eq!(t.len(), 1);
         assert!(matches!(&t[0], PrTransition::CiFailed { .. }));
+    }
+
+    #[test]
+    fn transition_ci_failed_on_new_commit_while_still_failing() {
+        // Regression: an agent's fix-push whose CI fails again before the poller
+        // sees an intermediate all-pending (failed==0) poll. old and new are both
+        // failing, but the head SHA changed — ci_failed must re-fire so auto-heal
+        // continues past the first attempt instead of stalling.
+        let mut old = make_pr("OPEN", "MERGEABLE", "", 2, 0);
+        old.head_ref_oid = "aaaa".to_string();
+        let mut new = make_pr("OPEN", "MERGEABLE", "", 2, 0);
+        new.head_ref_oid = "bbbb".to_string();
+        let t = detect_transitions("/repo", &old, &new);
+        // Both ci_failed (fresh failure on the new head) and pushed (oid changed).
+        assert!(t.iter().any(|x| matches!(x, PrTransition::CiFailed { .. })));
+        assert!(t.iter().any(|x| matches!(x, PrTransition::Pushed { .. })));
+    }
+
+    #[test]
+    fn no_ci_failed_when_still_failing_same_commit() {
+        // Same head SHA, still failing: no new ci_failed (would re-heal endlessly
+        // without a real change to react to).
+        let mut old = make_pr("OPEN", "MERGEABLE", "", 2, 0);
+        old.head_ref_oid = "aaaa".to_string();
+        let mut new = make_pr("OPEN", "MERGEABLE", "", 2, 0);
+        new.head_ref_oid = "aaaa".to_string();
+        let t = detect_transitions("/repo", &old, &new);
+        assert!(!t.iter().any(|x| matches!(x, PrTransition::CiFailed { .. })));
     }
 
     #[test]
@@ -797,6 +1013,45 @@ mod tests {
     }
 
     #[test]
+    fn transition_pushed() {
+        // New commit on an open PR: head_ref_oid changed → exactly one Pushed.
+        let mut old = make_pr("OPEN", "MERGEABLE", "", 0, 0);
+        old.head_ref_oid = "aaa111".to_string();
+        let mut new = make_pr("OPEN", "MERGEABLE", "", 0, 0);
+        new.head_ref_oid = "bbb222".to_string();
+        new.author = "octocat".to_string();
+        let t = detect_transitions("/repo", &old, &new);
+        assert_eq!(t.len(), 1);
+        assert!(matches!(
+            &t[0],
+            PrTransition::Pushed { head_ref_oid, author, .. }
+                if head_ref_oid == "bbb222" && author == "octocat"
+        ));
+    }
+
+    #[test]
+    fn pushed_same_oid_none() {
+        // Unchanged head_ref_oid → no Pushed.
+        let mut old = make_pr("OPEN", "MERGEABLE", "", 0, 0);
+        old.head_ref_oid = "aaa111".to_string();
+        let mut new = make_pr("OPEN", "MERGEABLE", "", 0, 0);
+        new.head_ref_oid = "aaa111".to_string();
+        let t = detect_transitions("/repo", &old, &new);
+        assert!(!t.iter().any(|x| matches!(x, PrTransition::Pushed { .. })));
+    }
+
+    #[test]
+    fn pushed_non_open_none() {
+        // oid changed but PR is no longer OPEN → no Pushed (Closed fires instead).
+        let mut old = make_pr("OPEN", "MERGEABLE", "", 0, 0);
+        old.head_ref_oid = "aaa111".to_string();
+        let mut new = make_pr("CLOSED", "MERGEABLE", "", 0, 0);
+        new.head_ref_oid = "bbb222".to_string();
+        let t = detect_transitions("/repo", &old, &new);
+        assert!(!t.iter().any(|x| matches!(x, PrTransition::Pushed { .. })));
+    }
+
+    #[test]
     fn no_transition_on_unchanged() {
         let pr = make_pr("OPEN", "MERGEABLE", "APPROVED", 0, 0);
         let t = detect_transitions("/repo", &pr, &pr);
@@ -810,5 +1065,164 @@ mod tests {
         let new = make_pr("OPEN", "UNKNOWN", "", 0, 3);
         let t = detect_transitions("/repo", &old, &new);
         assert!(t.is_empty());
+    }
+
+    #[test]
+    fn dormant_repo_appears_every_10th_cycle() {
+        let paths = vec!["/cold/repo".to_string()];
+        let mut last_changed = HashMap::new();
+        last_changed.insert(
+            "/cold/repo".to_string(),
+            Instant::now() - Duration::from_secs(3600),
+        );
+        let hot_paths = HashSet::new();
+
+        let offset = path_hash("/cold/repo") % DORMANT_POLL_DIVISOR;
+        let mut included_cycles = Vec::new();
+        for cycle in 0..20 {
+            let batch = tiered_paths(&paths, &last_changed, cycle, &hot_paths);
+            if !batch.is_empty() {
+                included_cycles.push(cycle);
+            }
+        }
+        assert_eq!(
+            included_cycles.len(),
+            2,
+            "dormant repo should appear twice in 20 cycles"
+        );
+        assert_eq!(included_cycles[0], offset);
+        assert_eq!(included_cycles[1], offset + DORMANT_POLL_DIVISOR);
+    }
+
+    #[test]
+    fn hot_repo_uses_idle_divisor_not_dormant() {
+        let paths = vec!["/hot/repo".to_string()];
+        let mut last_changed = HashMap::new();
+        last_changed.insert(
+            "/hot/repo".to_string(),
+            Instant::now() - Duration::from_secs(3600),
+        );
+        let mut hot_paths = HashSet::new();
+        hot_paths.insert("/hot/repo".to_string());
+
+        let mut count = 0;
+        for cycle in 0..10 {
+            let batch = tiered_paths(&paths, &last_changed, cycle, &hot_paths);
+            if !batch.is_empty() {
+                count += 1;
+            }
+        }
+        assert_eq!(
+            count, 2,
+            "hot idle repo should appear every 5th cycle = 2 times in 10"
+        );
+    }
+
+    #[test]
+    fn path_hash_distributes_across_cycles() {
+        let offsets: HashSet<u32> = ["/repo/a", "/repo/b", "/repo/c", "/repo/d", "/repo/e"]
+            .iter()
+            .map(|p| path_hash(p) % DORMANT_POLL_DIVISOR)
+            .collect();
+        assert!(
+            offsets.len() >= 2,
+            "hash should produce at least 2 distinct offsets for 5 paths"
+        );
+    }
+
+    // --- should_emit: change detection vs. forced resync ------------------
+    // The bug these guard: after standby the webview reloads, resetting the
+    // frontend GitHub store to empty. The Rust poller survives and keeps its
+    // change-detection state, so unchanged PRs/issues were never re-sent and the
+    // sidebar badges (incl. issue counts) stayed blank. `force` fixes that by
+    // re-emitting current state on a frontend re-subscribe.
+
+    #[test]
+    fn emit_on_first_poll() {
+        // Never-polled repo (no prior timestamp) is always new data → emit.
+        let cur = Some("2026-06-03T00:00:00Z".to_string());
+        assert!(should_emit(None, &cur, false));
+    }
+
+    #[test]
+    fn no_emit_when_unchanged() {
+        // The optimization: identical max updated_at and no resync → skip emit.
+        let ts = Some("2026-06-03T00:00:00Z".to_string());
+        assert!(!should_emit(Some(&ts), &ts, false));
+    }
+
+    #[test]
+    fn emit_when_changed() {
+        let prev = Some("2026-06-03T00:00:00Z".to_string());
+        let cur = Some("2026-06-03T09:00:00Z".to_string());
+        assert!(should_emit(Some(&prev), &cur, false));
+    }
+
+    #[test]
+    fn resync_re_emits_unchanged_data() {
+        // THE FIX: data is identical, but the frontend re-subscribed (force=true)
+        // so we must re-send it — otherwise the reset store stays empty.
+        let ts = Some("2026-06-03T00:00:00Z".to_string());
+        assert!(should_emit(Some(&ts), &ts, true));
+    }
+
+    #[test]
+    fn resync_re_emits_known_empty_repo() {
+        // A repo with zero open issues (cur = None) that was already known-empty
+        // (prev = Some(None)): no change, but a resync must still re-confirm the
+        // empty set so the frontend doesn't show stale counts.
+        let prev: Option<String> = None;
+        let cur: Option<String> = None;
+        assert!(!should_emit(Some(&prev), &cur, false));
+        assert!(should_emit(Some(&prev), &cur, true));
+    }
+
+    // --- IPC/HTTP parity: shared poller start/config path (story 127-89ec) ----
+    // `send_poller_config` is the single command sequence behind both the Tauri
+    // `github_start_polling` command and the HTTP `poller_start` route. The HTTP
+    // route previously dropped SetPrHideDrafts + ForceResync; these guard that the
+    // shared helper carries the full config on the (re)subscribe path and omits
+    // only ForceResync on a fresh cold start.
+
+    #[test]
+    fn send_poller_config_resync_sends_full_sequence() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let poller = GitHubPoller { cmd_tx: tx };
+        send_poller_config(
+            &poller,
+            vec!["/repo".to_string()],
+            "assigned".to_string(),
+            true,
+            true,
+        );
+        assert!(
+            matches!(rx.try_recv(), Ok(PollerCmd::UpdatePaths(p)) if p == vec!["/repo".to_string()])
+        );
+        assert!(matches!(rx.try_recv(), Ok(PollerCmd::SetIssueFilter(f)) if f == "assigned"));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(PollerCmd::SetPrHideDrafts(true))
+        ));
+        assert!(matches!(rx.try_recv(), Ok(PollerCmd::ForceResync)));
+        assert!(rx.try_recv().is_err(), "no extra commands expected");
+    }
+
+    #[test]
+    fn send_poller_config_cold_start_omits_resync() {
+        // A freshly started poller has no prior state to re-emit, so cold start
+        // passes resync = false: hide-drafts is still forwarded, ForceResync is not.
+        let (tx, mut rx) = mpsc::channel(8);
+        let poller = GitHubPoller { cmd_tx: tx };
+        send_poller_config(&poller, vec![], String::new(), false, false);
+        assert!(matches!(rx.try_recv(), Ok(PollerCmd::UpdatePaths(_))));
+        assert!(matches!(rx.try_recv(), Ok(PollerCmd::SetIssueFilter(_))));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(PollerCmd::SetPrHideDrafts(false))
+        ));
+        assert!(
+            rx.try_recv().is_err(),
+            "cold start must not send ForceResync"
+        );
     }
 }

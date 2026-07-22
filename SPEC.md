@@ -1,7 +1,7 @@
 # TUICommander Specification
 
-**Version:** 1.1.0
-**Last Updated:** 2026-05-04
+**Version:** 1.6.3
+**Last Updated:** 2026-07-11
 
 ## Overview
 
@@ -154,7 +154,7 @@ See `src/hooks/` for full signatures — the above is a representative summary.
 ## Agent Types
 
 ```typescript
-type AgentType = "claude" | "gemini" | "opencode" | "aider" | "codex" | "amp" | "cursor" | "droid" | "git";
+type AgentType = "claude" | "gemini" | "opencode" | "aider" | "codex" | "amp" | "cursor" | "goose" | "droid" | "git" | "api";
 ```
 
 Full agent configuration (binary, resume command, session discovery, detection patterns) lives in `src/agents.ts`.
@@ -242,7 +242,12 @@ Features:
 
 ## Persistence
 
-All stores persist to localStorage:
+Repository state is persisted by the Rust backend in `repositories.json`.
+Release builds use the platform config directory; debug builds use a one-time
+production-seeded `~/.tuicommander-dev/repositories.json` to avoid collisions
+with an installed app. No other backend config path is changed by this rule.
+
+Some frontend-only stores persist to localStorage:
 
 | Key | Store | Content |
 |-----|-------|---------|
@@ -276,6 +281,7 @@ All stores persist to localStorage:
 - [x] Ideas panel (formerly Notes) with send-to-terminal and delete actions
 - [x] Terminal session persistence across app restarts
 - [x] GitHub GraphQL API (replaces gh CLI for PR/CI data)
+- [x] Multi-account GitHub: multiple github.com logins + GitHub Enterprise Server (PAT), per-repo account bindings with ambiguity chooser, isolated per-account polling/rate-limits/circuit-breaker (see FEATURES.md 8.14)
 - [x] Auto-update via tauri-plugin-updater with progress badge
 - [x] Prevent system sleep while agents are working (keepawake)
 - [x] Usage limit detection for Claude Code (weekly/session) with status bar badge
@@ -303,18 +309,20 @@ All stores persist to localStorage:
 - [x] Claude Usage Dashboard (native SolidJS component with API polling, session analytics, usage timeline)
 - [x] ConfirmDialog component (in-app dark-themed replacement for native OS dialogs)
 - [x] Status bar unified agent badge with priority cascade (rate limit > usage API > PTY usage > name)
+- [x] Movement-based PTY agent activity detection ("text above the input area moves = active") with explicit-hook precedence, prompt-based Ready screens, Codex presence-based Working policy, interrupt confirmation, and confirmed-idle safety gates
 - [x] PR lifecycle filtering (CLOSED hidden, MERGED hidden after 5min user activity)
 - [x] Notes/Ideas: mark as used, badge count in status bar
 - [x] Notes/Ideas: image paste support (Ctrl+V), thumbnails, send absolute paths to terminal
 - [x] Inter-Agent Messaging (`messaging` MCP tool: register, list_peers, send, inbox with channel push + polling fallback)
-- [x] Smart Prompts (24 built-in AI prompts with context variable resolution, inject/headless/API execution, toolbar dropdown, SmartButtonStrip, Command Palette integration, direct LLM API mode via genai crate)
+- [x] Smart Prompts (29 built-in AI prompts with context variable resolution, inject/headless/API execution, toolbar dropdown, SmartButtonStrip, Command Palette integration, direct LLM API mode via genai crate)
 - [x] AI Chat panel (`Cmd+Alt+A`) — streaming conversational AI with terminal context injection, multi-provider (Ollama/Anthropic/OpenAI/OpenRouter), conversation persistence, OS-keyring API keys
-- [x] AI Agent loop (ReAct) — 6 tools (read_screen/send_input/send_key/wait_for/get_state/get_context), pause/resume, destructive-command approval gate, tool-call cards
+- [x] AI Agent loop (ReAct) — terminal observe/act, filesystem, search, drive_agent, and reactive watch tools; pause/resume, destructive-command approval gate, tool-call cards
 - [x] Session knowledge store — per-session command outcomes, error→fix pairs, CWD history, TUI apps seen; fed by OSC 133 with silence-timer fallback; persisted with 2s debounce
 - [x] TUI app detection — alternate-screen tracking classifies terminal as Shell or FullscreenTui with app hint (vim/htop/lazygit/…)
 - [x] `ai_terminal_*` MCP tools — external agent surface (Claude Code, Cursor) driving TUICommander terminals with user-confirmation gates
 - [x] ChoicePrompt parser variant — numbered confirmation menu detection with destructive-label flagging, PWA overlay, `sendPtyKey()` helper
 - [x] MCP OAuth 2.1 — RFC 9728 + RFC 8414 PKCE flow for upstream MCP servers, `tuic://oauth-callback` deep link, shared `TokenManager` with thundering-herd-safe refresh
+- [x] GitHub Ops dashboard — live review/conflict/autofix/changelog state plus Headless-slot improvement proposals with explicit issue creation
 
 ### Completed (Voice Dictation)
 - [x] Local Whisper inference via whisper-rs (Metal GPU acceleration)
@@ -369,4 +377,3 @@ For web deployment without Tauri:
 - [SolidJS Documentation](https://www.solidjs.com/docs/latest)
 - [alacritty_terminal crate](https://crates.io/crates/alacritty_terminal)
 - [Tauri Documentation](https://tauri.app/v1/guides/)
-- [Feasibility Analysis](docs/FEASIBILITY-ANALYSIS.md)

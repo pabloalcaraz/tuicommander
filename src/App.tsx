@@ -22,12 +22,14 @@ import { TabBar } from "./components/TabBar";
 import { TerminalArea } from "./components/TerminalArea";
 import { Toolbar } from "./components/Toolbar";
 import { editorTabsStore } from "./stores/editorTabs";
+import { writeClipboard } from "./utils/clipboard";
 
 const SettingsPanel = lazy(() => import("./components/SettingsPanel").then((m) => ({ default: m.SettingsPanel })));
 
 import releaseNotes from "./assets/release-notes.json";
 import { ConfirmDialog } from "./components/ConfirmDialog";
 import { ContextMenu, type ContextMenuItem, createContextMenu } from "./components/ContextMenu";
+import { CreateBranchDialog } from "./components/CreateBranchDialog";
 import { CreateWorktreeDialog } from "./components/CreateWorktreeDialog";
 import { GeneratorsModal } from "./components/GeneratorsModal";
 import {
@@ -38,6 +40,7 @@ import {
 } from "./components/PostMergeCleanupDialog/PostMergeCleanupDialog";
 import { ProcessManagerModal } from "./components/ProcessManagerModal/ProcessManagerModal";
 import { PromptDialog } from "./components/PromptDialog";
+import { RemoteQrDialog } from "./components/RemoteQrDialog";
 import { RenameBranchDialog } from "./components/RenameBranchDialog";
 import { RunCommandDialog } from "./components/RunCommandDialog";
 import { TaskQueuePanel } from "./components/TaskQueuePanel";
@@ -58,6 +61,7 @@ const ActivityDashboard = lazy(() =>
 const TunnelsPanel = lazy(() => import("./components/TunnelsPanel").then((m) => ({ default: m.TunnelsPanel })));
 
 import { getVersion } from "@tauri-apps/api/app";
+import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { getActionEntries } from "./actions/actionRegistry";
@@ -70,6 +74,7 @@ import { McpPopup } from "./components/McpPopup/McpPopup";
 import { MobileViewBanner } from "./components/MobileViewBanner";
 import qd from "./components/QuitDialog/QuitDialog.module.css";
 import { ToastContainer } from "./components/ToastContainer/ToastContainer";
+import { getAgentIconSvg } from "./components/ui/AgentIcon";
 import { type WorktreeActions, WorktreeManager } from "./components/WorktreeManager";
 import { initDeepLinkHandler } from "./deep-link-handler";
 import { useAgentDetection } from "./hooks/useAgentDetection";
@@ -94,6 +99,7 @@ import { useSplitPanes } from "./hooks/useSplitPanes";
 import { useTerminalLifecycle } from "./hooks/useTerminalLifecycle";
 import { useWorktreeSwitchPrompt } from "./hooks/useWorktreeSwitchPrompt";
 import { invoke, listen } from "./invoke";
+import { normalizeCombo } from "./keybindingDefaults";
 import { setLastMenuActionTime } from "./menuDedup";
 import { activityPanelAdapter } from "./panelAdapters/activity";
 import { fileBrowserPanelAdapter } from "./panelAdapters/fileBrowser";
@@ -138,19 +144,25 @@ import { settingsStore } from "./stores/settings";
 import { tasksStore } from "./stores/tasks";
 import { terminalsStore } from "./stores/terminals";
 import { toastsStore } from "./stores/toasts";
+import { tunnelPanelStore } from "./stores/tunnelPanel";
 import { uiStore } from "./stores/ui";
 import { updaterStore } from "./stores/updater";
 import { userActivityStore } from "./stores/userActivity";
+import { handleWatcherFire, type WatcherFirePayload, watcherFireDeps } from "./stores/watcherFire";
 import { worktreeManagerStore } from "./stores/worktreeManager";
 import { applyAppTheme, applyFontFamily, themesLoaded } from "./themes";
 import { isTauri } from "./transport";
 import { buildAgentLaunchCommand } from "./utils/agentSession";
 import { openFileAction } from "./utils/filePreview";
 import { keyFor } from "./utils/hotkey";
+import { navigateToTerminal } from "./utils/navigateToTerminal";
+import { nextWaitingTerminal } from "./utils/nextWaitingTerminal";
+import { handleOpenUrl } from "./utils/openUrl";
 import { createPanelSyncProvider, type PanelAction } from "./utils/panelSync";
 import { initPaneTabAssignment } from "./utils/paneTabAssign";
 import { pathBasename, pathStartsWith, pathStripPrefix } from "./utils/pathUtils";
 import { getShellFamily, sendCommand } from "./utils/sendCommand";
+import { switchToTerminalBySession } from "./utils/switchToTerminalBySession";
 
 const getDefaultFontSize = () => settingsStore.state.defaultFontSize;
 const getMaxTabNameLength = () => settingsStore.state.maxTabNameLength;
@@ -256,6 +268,8 @@ const App: Component = () => {
 
 	// Rename branch dialog state
 	const [renameBranchDialogVisible, setRenameBranchDialogVisible] = createSignal(false);
+	// Create branch dialog state
+	const [createBranchDialogVisible, setCreateBranchDialogVisible] = createSignal(false);
 
 	// Run command dialog state
 	const [runCommandDialogVisible, setRunCommandDialogVisible] = createSignal(false);
@@ -295,6 +309,7 @@ const App: Component = () => {
 
 	const [showProcessManager, setShowProcessManager] = createSignal(false);
 	const [showGenerators, setShowGenerators] = createSignal(false);
+	const [showRemoteQr, setShowRemoteQr] = createSignal(false);
 	const [whatsNewVersion, setWhatsNewVersion] = createSignal<string | null>(null);
 	const whatsNewEntry = () => {
 		const v = whatsNewVersion();
@@ -337,7 +352,12 @@ const App: Component = () => {
 	const gitOps = useGitOperations({
 		repo,
 		pty,
-		dialogs: { ...dialogs, promptRepoPath, confirmOrphanCleanup: dialogs.confirmOrphanCleanup },
+		dialogs: {
+			...dialogs,
+			promptRepoPath,
+			confirmOrphanCleanup: dialogs.confirmOrphanCleanup,
+			confirmRemoveLockedWorktree: dialogs.confirmRemoveLockedWorktree,
+		},
 		closeTerminal: terminalLifecycle.closeTerminal,
 		createNewTerminal: terminalLifecycle.createNewTerminal,
 		setStatusInfo,
@@ -404,6 +424,19 @@ const App: Component = () => {
 
 	const splitPanes = useSplitPanes();
 
+	// Single decision for every "close terminal / close tab" entry point
+	// (keyboard, command palette, native menu). In split mode close the active
+	// pane — which cancels a freshly-split empty pane instead of destroying a
+	// terminal; otherwise close the active terminal tab.
+	const closeActiveTabOrPane = () => {
+		if (paneLayoutStore.isSplit()) {
+			splitPanes.closeActivePane();
+		} else {
+			const activeId = terminalsStore.state.activeId;
+			if (activeId) terminalLifecycle.closeTerminal(activeId);
+		}
+	};
+
 	// Register pane tab auto-assignment hook (must be after store imports)
 	initPaneTabAssignment();
 
@@ -439,6 +472,7 @@ const App: Component = () => {
 	});
 
 	// Register built-in activity sections for git and worktree notifications
+	activityStore.registerSection({ id: "terminals", label: "TERMINALS", priority: 10, canDismissAll: true });
 	activityStore.registerSection({ id: "git-ops", label: "GIT", priority: 30, canDismissAll: true });
 	activityStore.registerSection({ id: "worktrees", label: "WORKTREES", priority: 40, canDismissAll: true });
 
@@ -546,9 +580,31 @@ const App: Component = () => {
 			toastsStore.add(trigger_reason, "", "warn", false, {
 				label: "Investigate",
 				onClick: () => {
+					// Reveal the panel and point the chat context at the failed session
+					// before starting — otherwise startAgent runs on the active terminal's
+					// conversation (the wrong one) and nothing visible happens.
+					if (!settingsStore.isAiChatEnabled()) {
+						toastsStore.add("Enable AI Chat in Settings to investigate", "", "warn", false);
+						return;
+					}
+					uiStore.setAiChatPanelVisible(true);
+					switchToTerminalBySession(session_id);
 					conversationStore.startAgent(session_id, proposed_goal);
 				},
 			});
+		}).then((fn) => {
+			unlisten = fn;
+		});
+		onCleanup(() => unlisten?.());
+	}
+
+	// Backend watcher fires: resolve the referenced smart prompt (or instructions)
+	// and run it in the target session. PR fires go through the assisted gate.
+	{
+		let unlisten: (() => void) | undefined;
+		const deps = watcherFireDeps((p) => smartPrompts.executeSmartPrompt(p));
+		listen<WatcherFirePayload>("watcher-fire", (event) => {
+			void handleWatcherFire(event.payload, deps);
 		}).then((fn) => {
 			unlisten = fn;
 		});
@@ -584,6 +640,7 @@ const App: Component = () => {
 			setCurrentBranch: gitOps.setCurrentBranch,
 			handleBranchSelect: gitOps.handleBranchSelect,
 			refreshAllBranchStats: gitOps.refreshAllBranchStats,
+			handleWorktreeCreateFailed: gitOps.handleWorktreeCreateFailed,
 			getDefaultFontSize,
 			stores: {
 				hydrate: async () => {
@@ -795,12 +852,35 @@ const App: Component = () => {
 		),
 	);
 
+	// Dismiss terminal completion activity item when user views the terminal
+	createEffect(
+		on(
+			() => terminalsStore.state.activeId,
+			(id) => {
+				if (id) activityStore.dismissItem(`terminal-done-${id}`);
+			},
+			{ defer: true },
+		),
+	);
+
 	// Wire terminal close → conversationStore cleanup
 	{
 		const dispose = terminalsStore.onRemove((id) => {
 			const term = terminalsStore.get(id);
 			const key = term?.tuicSession ?? id;
 			void conversationStore.onTerminalClose(key);
+		});
+		onCleanup(dispose);
+	}
+
+	// A plain interactive shell exiting (user typed `exit`) closes its tab instead
+	// of leaving a grey "exited" ghost dot. We do NOT auto-respawn a replacement —
+	// that made `exit` feel broken (the tab vanished then instantly reappeared).
+	// The workspace may end up with zero terminals; the TabBar "+" reopens one.
+	// Agent sessions are not routed here — they keep their tab.
+	{
+		const dispose = terminalsStore.onShellExit((id) => {
+			void terminalLifecycle.closeTerminal(id, true);
 		});
 		onCleanup(dispose);
 	}
@@ -869,11 +949,37 @@ const App: Component = () => {
 	// Deferred when the agent has active sub-tasks or is an agent process (sub-agents may still be running).
 	const BUSY_COMPLETION_THRESHOLD_MS = 5000;
 	const DEFERRED_COMPLETION_MS = 10_000;
+	// Grace window after a system wake during which busy→idle transitions are
+	// treated as false-busy (sleep/wake nudges idle shells/agents busy→idle in a
+	// synchronized cascade) and never fire a completion. Covers the post-wake
+	// settling of all terminals; real long-running work transitions far outside it.
+	const WAKE_GRACE_MS = 15_000;
+	let lastWakeAt = 0;
 	const deferredCompletionTimers = new Map<string, ReturnType<typeof setTimeout>>();
+	// OSC 133 "C" timestamp captured at idle→busy, used to tell whether a real
+	// command ran during the busy window (vs prompt-redraw / sleep-wake false-busy).
+	const busyStartExecAt = new Map<string, number | null | undefined>();
+
+	{
+		let unlistenWake: (() => void) | undefined;
+		listen<number>("system-wake", () => {
+			lastWakeAt = Date.now();
+			appLogger.debug("terminal", "[Notify] system-wake — suppressing completions for grace window");
+		}).then((fn) => {
+			unlistenWake = fn;
+		});
+		onCleanup(() => unlistenWake?.());
+	}
 
 	const unsubBusyToIdle = terminalsStore.onBusyToIdle((id, durationMs) => {
 		if (durationMs < BUSY_COMPLETION_THRESHOLD_MS) return;
 		if (terminalsStore.state.activeId === id) return;
+		// Sleep/wake false-busy cascade: the busy→idle transition landed within the
+		// grace window after a system wake — not real completed work. Suppress.
+		if (Date.now() - lastWakeAt < WAKE_GRACE_MS) {
+			appLogger.debug("terminal", `[Notify] ${id} completion SUPPRESSED — within wake grace window`);
+			return;
+		}
 
 		const fireCompletion = () => {
 			deferredCompletionTimers.delete(id);
@@ -881,6 +987,7 @@ const App: Component = () => {
 			const terminal = terminalsStore.get(id);
 			if (!terminal) return;
 
+			const startExec = busyStartExecAt.get(id);
 			const reason = getCompletionSuppression({
 				isActiveTerminal: terminalsStore.state.activeId === id,
 				isDebouncedBusy: !!terminalsStore.state.debouncedBusy[id],
@@ -888,6 +995,13 @@ const App: Component = () => {
 				awaitingInput: terminal.awaitingInput,
 				durationMs,
 				thresholdMs: BUSY_COMPLETION_THRESHOLD_MS,
+				// Gate ONLY plain shells: agent TUIs (claude, …) don't run shell commands
+				// during their lifetime, so their OSC 133 "C" never advances — gating them
+				// would suppress every legitimate agent completion. Agents keep legacy behaviour.
+				usesShellIntegration: !terminal.agentType && terminal.lastCommandExecAt != null,
+				// Unknown busy-start (snapshot missing) → don't gate; otherwise a real
+				// command ran iff the OSC 133 "C" timestamp advanced during the window.
+				ranCommandDuringBusy: startExec === undefined || terminal.lastCommandExecAt !== startExec,
 			});
 			if (reason) {
 				appLogger.debug("terminal", `[Notify] ${id} completion SUPPRESSED — ${reason}`);
@@ -895,7 +1009,30 @@ const App: Component = () => {
 			}
 			appLogger.info("terminal", `[Notify] ${id} completion — busy for ${Math.round(durationMs / 1000)}s then idle`);
 			terminalsStore.update(id, { activity: true, unseen: true });
-			notificationsStore.playCompletion();
+			notificationsStore.playCompletion(id);
+			const agentLabel = terminal.agentType ? terminal.agentType[0].toUpperCase() + terminal.agentType.slice(1) : null;
+			const repoPath = repositoriesStore.getRepoPathForTerminal(id);
+			const repoName = repoPath ? pathBasename(repoPath) : null;
+			const durationStr = `ran for ${Math.round(durationMs / 1000)}s`;
+			const subtitleParts: string[] = [];
+			if (repoName) subtitleParts.push(repoName);
+			subtitleParts.push(durationStr);
+			if (terminal.agentIntent) subtitleParts.push(terminal.agentIntent);
+
+			const defaultIcon =
+				'<svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor"><path d="M0 2.75C0 1.784.784 1 1.75 1h12.5c.966 0 1.75.784 1.75 1.75v10.5A1.75 1.75 0 0 1 14.25 15H1.75A1.75 1.75 0 0 1 0 13.25Zm1.75-.25a.25.25 0 0 0-.25.25v10.5c0 .138.112.25.25.25h12.5a.25.25 0 0 0 .25-.25V2.75a.25.25 0 0 0-.25-.25ZM7.25 8a.749.749 0 0 1-.22.53l-2.25 2.25a.749.749 0 1 1-1.06-1.06L5.44 8 3.72 6.28a.749.749 0 1 1 1.06-1.06l2.25 2.25c.141.14.22.331.22.53Zm1.5 1.5h3a.75.75 0 0 1 0 1.5h-3a.75.75 0 0 1 0-1.5Z"/></svg>';
+
+			activityStore.addItem({
+				id: `terminal-done-${id}`,
+				pluginId: "core",
+				sectionId: "terminals",
+				title: `${agentLabel ?? terminal.name} finished`,
+				subtitle: subtitleParts.join(" · "),
+				icon: (terminal.agentType && getAgentIconSvg(terminal.agentType, 14)) || defaultIcon,
+				repoPath: repoPath ?? undefined,
+				dismissible: true,
+				onClick: () => navigateToTerminal(id),
+			});
 		};
 
 		const t = terminalsStore.get(id);
@@ -916,6 +1053,9 @@ const App: Component = () => {
 		}
 	});
 	const unsubIdleToBusy = terminalsStore.onIdleToBusy((id) => {
+		// Snapshot the last-command-exec timestamp at busy-start so onBusyToIdle can
+		// detect whether a real command ran during this busy window.
+		busyStartExecAt.set(id, terminalsStore.get(id)?.lastCommandExecAt ?? null);
 		const timer = deferredCompletionTimers.get(id);
 		if (timer) {
 			clearTimeout(timer);
@@ -932,9 +1072,12 @@ const App: Component = () => {
 	});
 
 	// Auto-trigger AI diff triage when an agent terminal goes idle after meaningful work.
+	// Only while the triage panel is open — otherwise it burns LLM credits in the background
+	// with no UI to surface the result.
 	const TRIAGE_BUSY_THRESHOLD_MS = 5000;
 	const unsubTriageOnIdle = terminalsStore.onBusyToIdle((id, durationMs) => {
 		if (!settingsStore.isAiTriageEnabled()) return;
+		if (!uiStore.state.aiTriagePanelVisible) return;
 		if (durationMs < TRIAGE_BUSY_THRESHOLD_MS) return;
 		const t = terminalsStore.get(id);
 		if (!t?.agentType) return;
@@ -983,6 +1126,25 @@ const App: Component = () => {
 		if (isTauri()) getCurrentWindow().destroy();
 	};
 
+	// Trap keystrokes while the quit dialog is open (issue #102). The terminal's
+	// hidden input sits underneath and would otherwise receive Enter/Escape before
+	// they reach the dialog. A capture-phase listener intercepts the key before it
+	// descends to that input, so nothing leaks through. Both Enter and Escape
+	// cancel: quitting closes all sessions, so it must be an explicit Quit click.
+	createEffect(() => {
+		if (!quitDialogVisible()) return;
+		const onKeyDownCapture = (e: KeyboardEvent) => {
+			if (e.key === "Escape" || e.key === "Enter") {
+				e.preventDefault();
+				e.stopPropagation();
+				e.stopImmediatePropagation();
+				setQuitDialogVisible(false);
+			}
+		};
+		document.addEventListener("keydown", onKeyDownCapture, true);
+		onCleanup(() => document.removeEventListener("keydown", onKeyDownCapture, true));
+	});
+
 	// Build agent submenu items for the context menu
 	/** Launch an agent in the active terminal */
 	const launchAgentInActiveTerminal = async (agentType: AgentType, cmd: string) => {
@@ -1004,6 +1166,7 @@ const App: Component = () => {
 		terminalsStore.update(active.id, {
 			name: AGENTS[agentType].name,
 			nameIsCustom: true,
+			agentLaunchCommand: cmd,
 		});
 	};
 
@@ -1066,6 +1229,7 @@ const App: Component = () => {
 						nameIsCustom: true,
 						pendingInitCommand: finalCmd,
 						agentType: agent.type,
+						agentLaunchCommand: cmd,
 					});
 				}
 			};
@@ -1138,7 +1302,12 @@ const App: Component = () => {
 			label: "Copy",
 			shortcut: `${getModifierSymbol()}C`,
 			action: terminalLifecycle.copyFromTerminal,
-			separator: agentDetection.getAvailable().length > 0,
+		},
+		{
+			label: "Paste",
+			shortcut: `${getModifierSymbol()}V`,
+			action: terminalLifecycle.pasteToTerminal,
+			separator: true,
 		},
 		{
 			label: "Copy Block Output",
@@ -1154,7 +1323,7 @@ const App: Component = () => {
 				if (!ref) return;
 				const lines = await ref.getBufferLines(lastBlock.executionLine + 1, lastBlock.endLine);
 				const text = lines.join("\n").trimEnd();
-				if (text) navigator.clipboard.writeText(text);
+				if (text) writeClipboard(text);
 			},
 			disabled: (() => {
 				const activeId = terminalsStore.state.activeId;
@@ -1163,7 +1332,6 @@ const App: Component = () => {
 				return !term?.commandBlocks?.length;
 			})(),
 		},
-		{ label: "Paste", shortcut: `${getModifierSymbol()}V`, action: terminalLifecycle.pasteToTerminal },
 		{
 			label: "Split Right",
 			shortcut: keyFor("split-vertical"),
@@ -1260,10 +1428,7 @@ const App: Component = () => {
 		{
 			label: "Close Terminal",
 			shortcut: keyFor("close-terminal"),
-			action: () => {
-				const activeId = terminalsStore.state.activeId;
-				if (activeId) terminalLifecycle.closeTerminal(activeId);
-			},
+			action: closeActiveTabOrPane,
 			separator: true,
 		},
 	];
@@ -1326,12 +1491,23 @@ const App: Component = () => {
 	];
 
 	/** Fall back to running a git command in the active terminal */
-	const fallbackToTerminal = (repoPath: string, args: string[]) => {
+	const fallbackToTerminal = async (repoPath: string, args: string[]) => {
 		const active = terminalsStore.getActive();
-		if (active?.ref) {
-			const cmd = `cd ${JSON.stringify(repoPath)} && git ${args.join(" ")}`;
-			active.ref.write(`${cmd}\r`);
+		const sessionId = active?.sessionId;
+		if (!sessionId) return;
+		const cmd = `cd ${JSON.stringify(repoPath)} && git ${args.join(" ")}`;
+		// Route through sendCommand (never raw text+\r) so the Enter registers
+		// even when the active terminal is an Ink-based agent in raw mode.
+		const agentType = terminalsStore.getAgentTypeForSession(sessionId);
+		const shellFamily = await getShellFamily(sessionId);
+		try {
+			await sendCommand((data) => invoke("write_pty", { sessionId, data }), cmd, agentType, shellFamily);
 			setStatusInfo(`git ${args[0]} requires auth — running in terminal`);
+		} catch (err) {
+			appLogger.error(
+				"network",
+				`git fallback to terminal failed: ${err instanceof Error ? err.message : String(err)}`,
+			);
 		}
 	};
 
@@ -1375,13 +1551,14 @@ const App: Component = () => {
 					title: `git ${op}`,
 					subtitle: output || "completed",
 					icon: '<svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor"><path d="M8 0a8 8 0 1 0 0 16A8 8 0 0 0 8 0zm3.78 5.97l-4.5 4.5a.75.75 0 0 1-1.06 0l-2-2a.75.75 0 1 1 1.06-1.06L6.75 8.88l3.97-3.97a.75.75 0 1 1 1.06 1.06z"/></svg>',
+					severity: "success",
 					repoPath,
 					dismissible: true,
 				});
 			} else if (NEEDS_TERMINAL_PATTERNS.some((p) => p.test(stderr))) {
 				// Auth or interactive prompt needed — cancel background task, run in terminal
 				tasksStore.cancel(taskId);
-				fallbackToTerminal(repoPath, args);
+				void fallbackToTerminal(repoPath, args);
 			} else {
 				const errMsg = stderr.trim() || `git ${op} failed`;
 				tasksStore.fail(taskId, errMsg);
@@ -1395,6 +1572,7 @@ const App: Component = () => {
 					title: `git ${op} failed`,
 					subtitle: errMsg,
 					icon: '<svg viewBox="0 0 16 16" width="14" height="14" fill="#f85149"><path d="M8 0a8 8 0 1 0 0 16A8 8 0 0 0 8 0zm3.36 10.3a.75.75 0 0 1-1.06 1.06L8 9.06l-2.3 2.3a.75.75 0 0 1-1.06-1.06L6.94 8 4.64 5.7a.75.75 0 0 1 1.06-1.06L8 6.94l2.3-2.3a.75.75 0 0 1 1.06 1.06L9.06 8l2.3 2.3z"/></svg>',
+					severity: "error",
 					repoPath,
 					dismissible: true,
 				});
@@ -1419,7 +1597,6 @@ const App: Component = () => {
 		const term = terminalsStore.get(tabId);
 		if (!term?.sessionId) return;
 
-		const { WebviewWindow } = await import("@tauri-apps/api/webviewWindow");
 		const windowLabel = `floating-${tabId}`;
 		const url = `index.html#/floating?sessionId=${encodeURIComponent(term.sessionId)}&tabId=${encodeURIComponent(tabId)}&name=${encodeURIComponent(term.name)}`;
 
@@ -1465,7 +1642,6 @@ const App: Component = () => {
 		const windowLabel = terminalsStore.state.detachedWindows[tabId];
 		if (!windowLabel) return;
 		try {
-			const { WebviewWindow } = await import("@tauri-apps/api/webviewWindow");
 			const win = await WebviewWindow.getByLabel(windowLabel);
 			if (win) {
 				await win.unminimize();
@@ -1486,7 +1662,6 @@ const App: Component = () => {
 		const windowLabel = terminalsStore.state.detachedWindows[tabId];
 		if (!windowLabel) return;
 		try {
-			const { WebviewWindow } = await import("@tauri-apps/api/webviewWindow");
 			const win = await WebviewWindow.getByLabel(windowLabel);
 			await win?.close();
 		} catch (err) {
@@ -1571,10 +1746,28 @@ const App: Component = () => {
 		zoomInAll: terminalLifecycle.zoomInAll,
 		zoomOutAll: terminalLifecycle.zoomOutAll,
 		zoomResetAll: terminalLifecycle.zoomResetAll,
-		createNewTerminal: terminalLifecycle.createNewTerminal,
+		// Route Cmd+T / command palette through handleNewTab (the + button's path) so
+		// the new terminal is registered in the active branch.terminals and the tab
+		// appears immediately — not only after a worktree switch re-syncs orphans (#81).
+		// handleNewTab falls back to createNewTerminal for the no-repo case.
+		createNewTerminal: gitOps.handleNewTab,
 		closeTerminal: terminalLifecycle.closeTerminal,
 		reopenClosedTab: terminalLifecycle.reopenClosedTab,
 		navigateTab: terminalLifecycle.navigateTab,
+		focusLastTerminal: () => {
+			const prevId = terminalsStore.getPreviousActiveId();
+			if (prevId) navigateToTerminal(prevId);
+		},
+		jumpWaitingTerminal: () => {
+			// Cycle through terminals awaiting input (agent asked a question / hit an
+			// error), across all repos/branches, in tab order. Repeat presses advance
+			// to the next one; does nothing when none are waiting.
+			const waiting = terminalsStore
+				.getIds()
+				.filter((id) => terminalsStore.get(id)?.awaitingInput != null && !terminalsStore.isDetached(id));
+			const next = nextWaitingTerminal(waiting, terminalsStore.state.activeId);
+			if (next) navigateToTerminal(next);
+		},
 		clearTerminal: terminalLifecycle.clearTerminal,
 		refreshTerminal: terminalLifecycle.refreshTerminal,
 		clearScrollback: terminalLifecycle.clearScrollback,
@@ -1585,11 +1778,25 @@ const App: Component = () => {
 		toggleZoomPane: splitPanes.toggleZoomPane,
 		toggleFocusMode: uiStore.toggleFocusMode,
 		closeActivePane: splitPanes.closeActivePane,
+		closeActiveTabOrPane,
 		terminalIds: terminalLifecycle.terminalIds,
 		handleTerminalSelect: terminalLifecycle.handleTerminalSelect,
 		handleSplit: splitPanes.handleSplit,
-		handleRunCommand: (forceDialog: boolean) =>
-			gitOps.handleRunCommand(forceDialog, () => setRunCommandDialogVisible(true)),
+		handleRunCommand: (forceDialog: boolean) => {
+			// Context-aware Cmd+R: when a web/preview tab is active, reload it instead
+			// of opening the Run Command dialog (a terminal/worktree operation). Cross-
+			// origin URL iframes can't receive the in-iframe reload-request, so the
+			// parent triggers reload via the tab's imperative handle.
+			const mdActiveId = mdTabsStore.state.activeId;
+			if (mdActiveId) {
+				const handle = mdTabsStore.getHandle<{ reload?: () => void }>(mdActiveId);
+				if (handle?.reload) {
+					handle.reload();
+					return;
+				}
+			}
+			gitOps.handleRunCommand(forceDialog, () => setRunCommandDialogVisible(true));
+		},
 		switchToBranchByIndex: quickSwitcher.switchToBranchByIndex,
 		isQuickSwitcherOpen: quickSwitcherVisible,
 		toggleMarkdownPanel: uiStore.toggleMarkdownPanel,
@@ -1601,6 +1808,7 @@ const App: Component = () => {
 		toggleHelpPanel: () => setHelpPanelVisible((v) => !v),
 		toggleNotesPanel: uiStore.toggleNotesPanel,
 		toggleFileBrowserPanel: uiStore.toggleFileBrowserPanel,
+		requestFileBrowserContentSearch: uiStore.requestFileBrowserContentSearch,
 		toggleOutlinePanel: uiStore.toggleOutlinePanel,
 		findInTerminal: () => {
 			// Context-aware: open search in whichever tab type is active
@@ -1613,6 +1821,15 @@ const App: Component = () => {
 			const mdActiveId = mdTabsStore.state.activeId;
 			if (mdActiveId) {
 				const handle = mdTabsStore.getHandle<{ openSearch: () => void }>(mdActiveId);
+				handle?.openSearch();
+				return;
+			}
+			// Editor: routes Cmd+F at the document level so it works regardless of
+			// focus (CodeMirror's Mod-f keymap only fires with focus in the content,
+			// so dragging the scrollbar away from it would otherwise swallow Cmd+F).
+			const editorActiveId = editorTabsStore.state.activeId;
+			if (editorActiveId) {
+				const handle = editorTabsStore.getHandle<{ openSearch: () => void }>(editorActiveId);
 				handle?.openSearch();
 				return;
 			}
@@ -1653,6 +1870,7 @@ const App: Component = () => {
 					if (typeof selected === "string") handleOpenFilePath(selected);
 				} catch (err) {
 					appLogger.error("app", "Open file dialog failed", err);
+					toastsStore.add("Open file failed", String(err), "error", true);
 				}
 			})();
 		},
@@ -1664,6 +1882,7 @@ const App: Component = () => {
 					if (typeof selected === "string") revealFolderInBrowser(selected);
 				} catch (err) {
 					appLogger.error("app", "Open folder dialog failed", err);
+					toastsStore.add("Open folder failed", String(err), "error", true);
 				}
 			})();
 		},
@@ -1675,12 +1894,14 @@ const App: Component = () => {
 					const stat = await invoke<{ exists: boolean; is_dir: boolean }>("stat_path", { path: typed });
 					if (!stat.exists) {
 						appLogger.warn("app", "Open Path: path does not exist", { path: typed });
+						toastsStore.add("Path does not exist", typed, "warn", true);
 						return;
 					}
 					if (stat.is_dir) revealFolderInBrowser(typed);
 					else handleOpenFilePath(typed);
 				} catch (err) {
 					appLogger.error("app", "Open path failed", err);
+					toastsStore.add("Open path failed", String(err), "error", true);
 				}
 			})();
 		},
@@ -1707,6 +1928,70 @@ const App: Component = () => {
 		},
 		toggleProcessManager: () => setShowProcessManager((v) => !v),
 		toggleGenerators: () => setShowGenerators((v) => !v),
+		showRemoteQr: () => setShowRemoteQr(true),
+		blockPrev: () => {
+			const term = terminalsStore.getActive();
+			if (!term?.ref || term.commandBlocks.length === 0) return;
+			const sessionId = term.ref.getSessionId();
+			if (!sessionId) return;
+			invoke<[number, number, number]>("terminal_scroll_info", { sessionId })
+				.then(([offset, total]) => {
+					const viewTop = total - offset;
+					const blocks = term.commandBlocks;
+					for (let i = blocks.length - 1; i >= 0; i--) {
+						if (blocks[i].promptLine < viewTop - 1) {
+							term.ref!.scrollToLine(blocks[i].promptLine);
+							return;
+						}
+					}
+				})
+				.catch(() => {});
+		},
+		blockNext: () => {
+			const term = terminalsStore.getActive();
+			if (!term?.ref || term.commandBlocks.length === 0) return;
+			const sessionId = term.ref.getSessionId();
+			if (!sessionId) return;
+			invoke<[number, number, number]>("terminal_scroll_info", { sessionId })
+				.then(([offset, total]) => {
+					const viewTop = total - offset;
+					const blocks = term.commandBlocks;
+					for (const block of blocks) {
+						if (block.promptLine > viewTop + 1) {
+							term.ref!.scrollToLine(block.promptLine);
+							return;
+						}
+					}
+					term.ref!.scrollToBottom();
+				})
+				.catch(() => {});
+		},
+		blockFoldToggle: () => {
+			const term = terminalsStore.getActive();
+			if (!term?.ref || term.commandBlocks.length === 0) return;
+			const sessionId = term.ref.getSessionId();
+			if (!sessionId) return;
+			invoke<[number, number, number]>("terminal_scroll_info", { sessionId })
+				.then(([offset, total, screenRows]) => {
+					const viewCenter = total - offset + Math.floor(screenRows / 2);
+					const blocks = term.commandBlocks;
+					let nearest = blocks[0];
+					let bestDist = Math.abs(nearest.promptLine - viewCenter);
+					for (let i = 1; i < blocks.length; i++) {
+						const dist = Math.abs(blocks[i].promptLine - viewCenter);
+						if (dist < bestDist) {
+							nearest = blocks[i];
+							bestDist = dist;
+						}
+					}
+					terminalsStore.toggleBlockFold(term.id, nearest.promptLine);
+				})
+				.catch(() => {});
+		},
+		blockSearchToggle: () => {
+			const active = terminalsStore.getActive();
+			active?.ref?.openSearch();
+		},
 		newFile: () => {
 			const defaultPath = gitOps.activeWorktreePath() || repositoriesStore.state.activeRepoPath || undefined;
 			(async () => {
@@ -1719,8 +2004,28 @@ const App: Component = () => {
 					handleOpenFilePath(target);
 				} catch (err) {
 					appLogger.error("app", "New file creation failed", err);
+					toastsStore.add("New file failed", String(err), "error", true);
 				}
 			})();
+		},
+		runSmartPromptByCombo: (combo: string): boolean => {
+			// Any enabled prompt with a configured shortcut fires — not just those
+			// surfaced in a placement (the shortcut is set per-prompt in its editor).
+			const prompt = promptLibraryStore
+				.getAllPrompts()
+				.find((p) => p.enabled !== false && p.shortcut && normalizeCombo(p.shortcut) === combo);
+			if (!prompt) return false;
+			promptLibraryStore.markAsUsed(prompt.id);
+			smartPrompts
+				.executeSmartPrompt(prompt)
+				.then((result) => {
+					if (!result.ok) toastsStore.add(prompt.name, result.reason ?? "Failed", "warn");
+				})
+				.catch((err) => {
+					appLogger.error("prompts", `Failed to run "${prompt.name}" via shortcut`, err);
+					toastsStore.add(prompt.name, String(err), "error");
+				});
+			return true;
 		},
 	};
 
@@ -1926,19 +2231,19 @@ const App: Component = () => {
 			switch (action) {
 				// File
 				case "new-tab":
-					terminalLifecycle.createNewTerminal();
+					// Same as Cmd+T / + button: register in active branch so the tab
+					// shows immediately (#81).
+					gitOps.handleNewTab();
 					break;
 				case "close-tab": {
-					if (paneLayoutStore.isSplit()) {
-						splitPanes.closeActivePane();
-					} else {
-						const activeId = terminalsStore.state.activeId;
-						if (activeId) terminalLifecycle.closeTerminal(activeId);
-					}
+					closeActiveTabOrPane();
 					break;
 				}
 				case "reopen-closed-tab":
 					terminalLifecycle.reopenClosedTab();
+					break;
+				case "new-file":
+					shortcutHandlers.newFile();
 					break;
 				case "open-file":
 					shortcutHandlers.openFile();
@@ -1965,8 +2270,23 @@ const App: Component = () => {
 				}
 
 				// Edit
+				case "copy":
+					terminalLifecycle.copyFromTerminal();
+					break;
+				// No "paste" case: the Edit > Paste menu item is the native PredefinedMenuItem,
+				// which pastes via NSPasteboard into the focused keyInputRef without a JS
+				// clipboard read (avoids the macOS Sequoia paste-permission popup).
 				case "clear-terminal":
 					terminalLifecycle.clearTerminal();
+					break;
+				case "clear-scrollback":
+					terminalLifecycle.clearScrollback();
+					break;
+				case "refresh-terminal":
+					terminalLifecycle.refreshTerminal();
+					break;
+				case "find-in-terminal":
+					shortcutHandlers.findInTerminal();
 					break;
 
 				// View
@@ -2012,6 +2332,21 @@ const App: Component = () => {
 				case "outline-panel":
 					uiStore.toggleOutlinePanel();
 					break;
+				case "ai-chat":
+					if (settingsStore.isAiChatEnabled()) shortcutHandlers.toggleAiChatPanel();
+					break;
+				case "compose-panel":
+					shortcutHandlers.toggleComposePanel();
+					break;
+				case "zoom-pane":
+					splitPanes.toggleZoomPane();
+					break;
+				case "focus-mode":
+					uiStore.toggleFocusMode();
+					break;
+				case "global-workspace":
+					shortcutHandlers.toggleGlobalWorkspace();
+					break;
 
 				// Go
 				case "next-tab":
@@ -2019,6 +2354,19 @@ const App: Component = () => {
 					break;
 				case "prev-tab":
 					terminalLifecycle.navigateTab("prev");
+					break;
+
+				case "block-prev":
+					shortcutHandlers.blockPrev();
+					break;
+				case "block-next":
+					shortcutHandlers.blockNext();
+					break;
+				case "block-fold-toggle":
+					shortcutHandlers.blockFoldToggle();
+					break;
+				case "block-search-toggle":
+					shortcutHandlers.blockSearchToggle();
 					break;
 
 				// Tools
@@ -2054,6 +2402,16 @@ const App: Component = () => {
 				case "task-queue":
 					setTaskQueueVisible((v) => !v);
 					break;
+				case "content-search":
+					commandPaletteStore.open();
+					commandPaletteStore.setQuery("?");
+					break;
+				case "tunnels":
+					tunnelPanelStore.toggle();
+					break;
+				case "process-manager":
+					setShowProcessManager((v) => !v);
+					break;
 
 				// Help
 				case "help-panel":
@@ -2073,6 +2431,12 @@ const App: Component = () => {
 					break;
 				case "check-for-updates":
 					updaterStore.checkForUpdate().catch((err) => appLogger.warn("app", "Updater manual check failed", err));
+					break;
+				case "online-guide":
+					handleOpenUrl("https://tuicommander.com/docs/");
+					break;
+				case "changelog":
+					handleOpenUrl("https://github.com/sstraus/tuicommander/blob/main/CHANGELOG.md");
 					break;
 				case "about":
 					setHelpPanelVisible(true);
@@ -2245,6 +2609,10 @@ const App: Component = () => {
 						gitOps.handleOpenRenameBranchDialog(repoPath, branchName);
 						setRenameBranchDialogVisible(true);
 					}}
+					onCreateBranch={(repoPath, fromBranch) => {
+						gitOps.handleOpenCreateBranchDialog(repoPath, fromBranch);
+						setCreateBranchDialogVisible(true);
+					}}
 					onAddWorktree={gitOps.handleAddWorktree}
 					onCreateWorktreeFromBranch={gitOps.handleCreateWorktreeFromBranch}
 					onMergeAndArchive={(repoPath, branchName) => {
@@ -2259,7 +2627,9 @@ const App: Component = () => {
 						gitOps.handleMergeAndArchive(repoPath, branchName, mainBranch, afterMerge);
 					}}
 					creatingWorktreeRepos={gitOps.creatingWorktreeRepos()}
+					removingBranches={gitOps.removingBranches()}
 					onAddRepo={gitOps.handleAddRepo}
+					onAddRemoteRepo={gitOps.handleAddRemoteRepo}
 					onRepoSettings={(repoPath) =>
 						gitOps.handleRepoSettings(repoPath, (ctx) => {
 							setSettingsContext(ctx);
@@ -2273,6 +2643,8 @@ const App: Component = () => {
 					buildAgentMenuItems={buildSidebarAgentMenuItems}
 					onRefreshBranchStats={gitOps.refreshAllBranchStats}
 					onCheckoutRemoteBranch={gitOps.handleCheckoutRemoteBranch}
+					onAutofixIssue={gitOps.handleAutofixIssue}
+					onConflictAssist={gitOps.handleConflictAssist}
 					onSwitchBranch={gitOps.handleSwitchBranch}
 					switchBranchLists={gitOps.switchBranchLists()}
 					currentBranches={gitOps.currentBranches()}
@@ -2353,7 +2725,8 @@ const App: Component = () => {
 									: undefined
 								: gitOps.currentRepoPath()
 						}
-						cwd={gitOps.activeWorktreePath()}
+						cwd={terminalsStore.getActive()?.cwd || gitOps.activeWorktreePath()}
+						repoRoot={gitOps.activeWorktreePath()}
 						onBranchRenamed={(oldName, newName) => {
 							const repoPath = gitOps.currentRepoPath();
 							if (repoPath) {
@@ -2403,8 +2776,8 @@ const App: Component = () => {
 				onCheckoutRemote={gitOps.handleCheckoutRemoteBranch}
 			/>
 
-			{/* Activity dashboard */}
-			<Show when={!uiStore.isDetached("activity")}>
+			{/* Activity dashboard — unmount when closed to release memos/subscriptions */}
+			<Show when={!uiStore.isDetached("activity") && activityDashboardStore.state.isOpen}>
 				<Suspense>
 					<ActivityDashboard onSelect={terminalLifecycle.handleTerminalSelect} />
 				</Suspense>
@@ -2457,6 +2830,17 @@ const App: Component = () => {
 					gitOps.setBranchToRename(null);
 				}}
 				onRename={gitOps.handleRenameBranch}
+			/>
+
+			{/* Create branch dialog */}
+			<CreateBranchDialog
+				visible={createBranchDialogVisible()}
+				startPoint={gitOps.branchToCreate()?.startPoint}
+				onClose={() => {
+					setCreateBranchDialogVisible(false);
+					gitOps.setBranchToCreate(null);
+				}}
+				onCreate={gitOps.handleCreateBranch}
 			/>
 
 			{/* Create worktree dialog */}
@@ -2542,9 +2926,13 @@ const App: Component = () => {
 				message={dialogs.dialogState()?.message ?? ""}
 				confirmLabel={dialogs.dialogState()?.confirmLabel}
 				cancelLabel={dialogs.dialogState()?.cancelLabel}
+				discardLabel={dialogs.dialogState()?.discardLabel}
 				kind={dialogs.dialogState()?.kind}
+				defaultButton={dialogs.dialogState()?.defaultButton}
+				autoCancelMs={dialogs.dialogState()?.autoCancelMs}
 				onClose={dialogs.handleClose}
 				onConfirm={dialogs.handleConfirm}
+				onDiscard={dialogs.handleDiscard}
 			/>
 
 			{/* Folder-drop recursive transfer confirmation */}
@@ -2578,6 +2966,11 @@ const App: Component = () => {
 			{/* Generators modal */}
 			<Show when={showGenerators()}>
 				<GeneratorsModal onClose={() => setShowGenerators(false)} />
+			</Show>
+
+			{/* QR for Remote Mobile Connection */}
+			<Show when={showRemoteQr()}>
+				<RemoteQrDialog onClose={() => setShowRemoteQr(false)} />
 			</Show>
 
 			{/* What's New dialog — shown once after stable version update */}

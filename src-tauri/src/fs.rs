@@ -33,6 +33,9 @@ pub struct ContentMatch {
     pub match_start: u32,
     /// Byte offset of match end (exclusive) within `line_text`.
     pub match_end: u32,
+    /// Absolute repo root path — set only by cross-repo search; absent for single-repo results.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_path: Option<String>,
 }
 
 /// Aggregated result of a full-text content search.
@@ -250,6 +253,25 @@ pub(crate) fn get_ignored_paths(
 pub struct PathStat {
     pub exists: bool,
     pub is_dir: bool,
+    /// Last modification time, milliseconds since UNIX epoch (0 for dirs /
+    /// missing / unavailable). Lets callers (e.g. the editor disk-change poll)
+    /// detect changes without re-reading file content.
+    pub modified_at: u64,
+    /// File size in bytes (0 for dirs / missing). Paired with `modified_at` to
+    /// catch truncate-rewrite saves that may not bump mtime granularity.
+    pub size: u64,
+}
+
+impl PathStat {
+    /// Non-existent / inaccessible path — all-zero metadata.
+    fn missing() -> Self {
+        PathStat {
+            exists: false,
+            is_dir: false,
+            modified_at: 0,
+            size: 0,
+        }
+    }
 }
 
 pub(crate) fn stat_path_impl(path: String) -> PathStat {
@@ -259,20 +281,24 @@ pub(crate) fn stat_path_impl(path: String) -> PathStat {
     // untrusted callers (plugins, frontend bugs) probe arbitrary files outside
     // any repo scope. Mirrors resolve_terminal_path's guard.
     if is_tcc_protected_path(&p) {
-        return PathStat {
-            exists: false,
-            is_dir: false,
-        };
+        return PathStat::missing();
     }
     match std::fs::metadata(&p) {
-        Ok(meta) => PathStat {
-            exists: true,
-            is_dir: meta.is_dir(),
-        },
-        Err(_) => PathStat {
-            exists: false,
-            is_dir: false,
-        },
+        Ok(meta) => {
+            let is_dir = meta.is_dir();
+            let modified_at = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_millis() as u64);
+            PathStat {
+                exists: true,
+                is_dir,
+                modified_at,
+                size: if is_dir { 0 } else { meta.len() },
+            }
+        }
+        Err(_) => PathStat::missing(),
     }
 }
 
@@ -430,6 +456,160 @@ pub async fn search_files(
 
 #[cfg(feature = "desktop")]
 #[tauri::command]
+pub fn warm_content_index(
+    app_state: tauri::State<'_, std::sync::Arc<crate::state::AppState>>,
+    repo_path: String,
+) {
+    crate::content_index::ensure_index(&app_state, &repo_path);
+}
+
+/// Emit a `ContentSearchResult` to the frontend as `content-search-batch` events
+/// in chunks of 50, honoring cancellation. Always emits a final (possibly empty)
+/// batch so the UI knows the search is done. Shared by single- and all-repo search.
+#[cfg(feature = "desktop")]
+fn emit_content_batches(
+    app: &tauri::AppHandle,
+    result: ContentSearchResult,
+    cancel: &Arc<AtomicBool>,
+) {
+    let batch_size = 50;
+    let total = result.matches.len();
+    let mut sent = 0;
+
+    for chunk in result.matches.chunks(batch_size) {
+        if cancel.load(Ordering::Relaxed) {
+            return;
+        }
+        sent += chunk.len();
+        let _ = app.emit(
+            "content-search-batch",
+            &ContentSearchBatch {
+                matches: chunk.to_vec(),
+                is_final: sent >= total,
+                files_searched: result.files_searched,
+                files_skipped: result.files_skipped,
+                truncated: result.truncated,
+            },
+        );
+    }
+
+    // No matches → still emit a final empty batch so the UI stops spinning.
+    if total == 0 {
+        let _ = app.emit(
+            "content-search-batch",
+            &ContentSearchBatch {
+                matches: Vec::new(),
+                is_final: true,
+                files_searched: result.files_searched,
+                files_skipped: result.files_skipped,
+                truncated: result.truncated,
+            },
+        );
+    }
+}
+
+/// Search every ready content index (all registered repos) and merge the results,
+/// tagging each match with its `repo_path`. The global limit is split evenly across
+/// repos (min 5 each). Repos whose index isn't built yet are skipped. Shared by the
+/// `search_content_all` Tauri command and the `/fs/search-content-all` HTTP route.
+pub(crate) fn search_content_all_impl(
+    content_indices: &dashmap::DashMap<
+        String,
+        Arc<parking_lot::RwLock<crate::content_index::ContentIndex>>,
+    >,
+    query: &str,
+    case_sensitive: bool,
+    global_limit: usize,
+) -> ContentSearchResult {
+    let repos: Vec<(
+        String,
+        Arc<parking_lot::RwLock<crate::content_index::ContentIndex>>,
+    )> = content_indices
+        .iter()
+        .map(|e| (e.key().clone(), Arc::clone(e.value())))
+        .collect();
+
+    let per_repo_limit = (global_limit / repos.len().max(1)).max(5);
+
+    let mut all_matches = Vec::new();
+    let mut files_searched: u32 = 0;
+
+    for (repo_path, index_arc) in &repos {
+        let index = index_arc.read();
+        if !index.is_ready() {
+            continue;
+        }
+        if let Ok(result) = search_via_index(&index, query, case_sensitive, Some(per_repo_limit)) {
+            files_searched += result.files_searched;
+            for mut m in result.matches {
+                m.repo_path = Some(repo_path.clone());
+                all_matches.push(m);
+                if all_matches.len() >= global_limit {
+                    break;
+                }
+            }
+        }
+        if all_matches.len() >= global_limit {
+            break;
+        }
+    }
+
+    let truncated = all_matches.len() >= global_limit;
+    ContentSearchResult {
+        matches: all_matches,
+        files_searched,
+        files_skipped: 0,
+        truncated,
+    }
+}
+
+/// Streaming cross-repo content search. Mirrors `search_content` but fans out over
+/// every ready content index instead of a single repo; results arrive via the same
+/// `content-search-batch` events (each match carries its `repo_path`).
+#[cfg(feature = "desktop")]
+#[tauri::command]
+pub async fn search_content_all(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, ContentSearchCancel>,
+    app_state: tauri::State<'_, std::sync::Arc<crate::state::AppState>>,
+    query: String,
+    case_sensitive: Option<bool>,
+    limit: Option<usize>,
+) -> Result<(), String> {
+    // Cancel any previous search (shares the slot with single-repo search).
+    let cancel_token = Arc::new(AtomicBool::new(false));
+    {
+        let mut prev = state.0.lock().map_err(|e| e.to_string())?;
+        if let Some(old) = prev.take() {
+            old.store(true, Ordering::Relaxed);
+        }
+        *prev = Some(cancel_token.clone());
+    }
+
+    let case_sensitive = case_sensitive.unwrap_or(false);
+    let global_limit = limit.unwrap_or(100);
+    let app_state = std::sync::Arc::clone(&app_state);
+    let throttle_guard = app_state.indexer_throttle.begin_search();
+
+    tokio::task::spawn_blocking(move || {
+        let _throttle_guard = throttle_guard;
+        let result = search_content_all_impl(
+            &app_state.content_indices,
+            &query,
+            case_sensitive,
+            global_limit,
+        );
+        if cancel_token.load(Ordering::Relaxed) {
+            return;
+        }
+        emit_content_batches(&app, result, &cancel_token);
+    });
+
+    Ok(())
+}
+
+#[cfg(feature = "desktop")]
+#[tauri::command]
 #[allow(clippy::too_many_arguments)]
 pub async fn search_content(
     app: tauri::AppHandle,
@@ -477,45 +657,10 @@ pub async fn search_content(
             limit,
         ) {
             Ok(result) => {
-                // Check cancellation
                 if cancel_token.load(Ordering::Relaxed) {
                     return;
                 }
-
-                // Emit results in batches of 50
-                let batch_size = 50;
-                let total_matches = result.matches.len();
-                let mut sent = 0;
-
-                for chunk in result.matches.chunks(batch_size) {
-                    if cancel_token.load(Ordering::Relaxed) {
-                        return;
-                    }
-
-                    sent += chunk.len();
-                    let is_final = sent >= total_matches;
-
-                    let batch = ContentSearchBatch {
-                        matches: chunk.to_vec(),
-                        is_final,
-                        files_searched: result.files_searched,
-                        files_skipped: result.files_skipped,
-                        truncated: result.truncated,
-                    };
-                    let _ = app.emit("content-search-batch", &batch);
-                }
-
-                // If no matches at all, still emit a final empty batch
-                if total_matches == 0 {
-                    let batch = ContentSearchBatch {
-                        matches: Vec::new(),
-                        is_final: true,
-                        files_searched: result.files_searched,
-                        files_skipped: result.files_skipped,
-                        truncated: result.truncated,
-                    };
-                    let _ = app.emit("content-search-batch", &batch);
-                }
+                emit_content_batches(&app, result, &cancel_token);
             }
             Err(e) => {
                 let _ = app.emit("content-search-error", &e);
@@ -634,6 +779,7 @@ pub(crate) fn search_via_index(
                     line_text: line_trimmed.to_string(),
                     match_start,
                     match_end,
+                    repo_path: None,
                 });
                 Ok(true)
             }),
@@ -870,6 +1016,7 @@ pub(crate) fn search_content_impl(
                     line_text: line_trimmed.to_string(),
                     match_start,
                     match_end,
+                    repo_path: None,
                 });
                 Ok(true)
             }),
@@ -958,6 +1105,45 @@ pub fn fs_read_file(repo_path: String, file: String) -> Result<String, String> {
     crate::read_file_impl(repo_path, file)
 }
 
+/// Atomically write `data` to `target` via temp-file + rename, PRESERVING the
+/// target's existing permissions when it already exists (these are arbitrary
+/// user files — never force a restrictive mode). A crash mid-write leaves the
+/// original file intact instead of truncating it (#117-a503).
+///
+/// The temp file is created in the target's own directory (same filesystem, so
+/// the rename is atomic) with a unique per-call name, so concurrent writers to
+/// the same target never collide on the temp path.
+pub(crate) fn atomic_write(target: &std::path::Path, data: &[u8]) -> Result<(), String> {
+    let dir = target
+        .parent()
+        .ok_or_else(|| "Target path has no parent directory".to_string())?;
+    let base = target
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("tuic");
+    let temp = dir.join(format!(".{base}.tmp.{}", uuid::Uuid::new_v4()));
+
+    std::fs::write(&temp, data).map_err(|e| format!("Failed to write temp file: {e}"))?;
+
+    // Preserve the original file's permissions if it already exists — do NOT
+    // impose a restrictive mode on files the user owns and edits.
+    #[cfg(unix)]
+    if let Ok(meta) = std::fs::metadata(target)
+        && let Err(e) = std::fs::set_permissions(&temp, meta.permissions())
+    {
+        tracing::warn!(
+            path = %target.display(),
+            error = %e,
+            "atomic_write: failed to preserve file permissions"
+        );
+    }
+
+    std::fs::rename(&temp, target).map_err(|e| {
+        let _ = std::fs::remove_file(&temp);
+        format!("Failed to commit file: {e}")
+    })
+}
+
 /// Write content to a file within a repository.
 #[cfg_attr(feature = "desktop", tauri::command)]
 pub fn write_file(repo_path: String, file: String, content: String) -> Result<(), String> {
@@ -967,7 +1153,8 @@ pub fn write_file(repo_path: String, file: String, content: String) -> Result<()
         validate_path_for_creation(&repo_path, &file)?
     };
 
-    std::fs::write(&canonical_target, &content).map_err(|e| format!("Failed to write file: {e}"))
+    atomic_write(&canonical_target, content.as_bytes())
+        .map_err(|e| format!("Failed to write file: {e}"))
 }
 
 /// Create a directory (and parents) within a repository.
@@ -1045,6 +1232,60 @@ pub fn copy_path(repo_path: String, from: String, to: String) -> Result<(), Stri
         .map_err(|e| format!("Failed to copy file: {e}"))?;
 
     Ok(())
+}
+
+/// Copy a file by absolute source/destination paths.
+///
+/// Unlike [`copy_path`] (repo-scoped), this supports **cross-repo paste**: the
+/// FileBrowser captures the source repo root at copy time, so a file can be
+/// pasted from one registered repo into another. TUIC is a local tool — the
+/// user is the trust boundary — so any path the user can already see is allowed
+/// (mirrors `read_external_file`).
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub fn copy_path_abs(from: String, to: String) -> Result<(), String> {
+    let from_path = PathBuf::from(&from);
+    let to_path = PathBuf::from(&to);
+    if from_path == to_path {
+        return Ok(());
+    }
+    let canonical_from = from_path
+        .canonicalize()
+        .map_err(|e| format!("Failed to resolve source: {e}"))?;
+    if canonical_from.is_dir() {
+        return Err("Cannot copy directories. Only files can be copied.".to_string());
+    }
+    std::fs::copy(&canonical_from, &to_path).map_err(|e| format!("Failed to copy file: {e}"))?;
+    Ok(())
+}
+
+/// Move/rename a file by absolute source/destination paths (cross-repo cut+paste).
+///
+/// Falls back to copy+remove when `rename` fails across filesystems (EXDEV).
+/// See [`copy_path_abs`] for the trust-boundary rationale.
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub fn move_path_abs(from: String, to: String) -> Result<(), String> {
+    let from_path = PathBuf::from(&from);
+    let to_path = PathBuf::from(&to);
+    if from_path == to_path {
+        return Ok(());
+    }
+    let canonical_from = from_path
+        .canonicalize()
+        .map_err(|e| format!("Failed to resolve source: {e}"))?;
+    if canonical_from.is_dir() {
+        return Err("Cannot move directories. Only files can be moved.".to_string());
+    }
+    match std::fs::rename(&canonical_from, &to_path) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            // Cross-filesystem move (EXDEV): rename is rejected, so copy then remove.
+            std::fs::copy(&canonical_from, &to_path)
+                .map_err(|e| format!("Failed to move file: {e}"))?;
+            std::fs::remove_file(&canonical_from)
+                .map_err(|e| format!("Failed to remove source after move: {e}"))?;
+            Ok(())
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1384,7 +1625,7 @@ pub fn add_to_gitignore(repo_path: String, pattern: String) -> Result<(), String
 /// close (any registered repo could be outside home, e.g. `/opt/proj`).
 pub(crate) fn validate_external_write_path(
     path: &std::path::Path,
-    home: &std::path::Path,
+    _home: &std::path::Path,
 ) -> Result<(), String> {
     if !path.is_absolute() {
         return Err("write_external_file requires an absolute path".to_string());
@@ -1398,15 +1639,9 @@ pub(crate) fn validate_external_write_path(
     let parent = path
         .parent()
         .ok_or_else(|| "Access denied: path has no parent directory".to_string())?;
-    let canonical_parent = parent
+    parent
         .canonicalize()
         .map_err(|e| format!("Failed to resolve parent directory: {e}"))?;
-    let canonical_home = home
-        .canonicalize()
-        .map_err(|e| format!("Failed to resolve home directory: {e}"))?;
-    if !canonical_parent.starts_with(&canonical_home) {
-        return Err("Access denied: path must be within the user's home directory".to_string());
-    }
     Ok(())
 }
 
@@ -1525,6 +1760,13 @@ mod tests {
         let stat = stat_path_impl(file.to_string_lossy().to_string());
         assert!(stat.exists);
         assert!(!stat.is_dir);
+        // mtime/size are populated for real files so the editor poll can detect
+        // on-disk changes without reading content.
+        assert!(
+            stat.modified_at > 0,
+            "expected a non-zero mtime for a real file"
+        );
+        assert!(stat.size > 0, "README.md should have non-zero size");
     }
 
     #[test]
@@ -1674,6 +1916,64 @@ mod tests {
             "../escaped.rs".to_string(),
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_copy_path_abs_cross_repo() {
+        let src = setup_test_repo();
+        let dst = setup_test_repo();
+        let from = src.path().join("main.rs").to_string_lossy().to_string();
+        let to = dst.path().join("copied.rs").to_string_lossy().to_string();
+
+        copy_path_abs(from, to).unwrap();
+
+        assert!(
+            dst.path().join("copied.rs").exists(),
+            "file copied into dst repo"
+        );
+        assert!(src.path().join("main.rs").exists(), "source preserved");
+    }
+
+    #[test]
+    fn test_copy_path_abs_rejects_directory() {
+        let src = setup_test_repo();
+        let dst = setup_test_repo();
+        let from = src.path().join("src").to_string_lossy().to_string();
+        let to = dst.path().join("src_copy").to_string_lossy().to_string();
+
+        assert!(
+            copy_path_abs(from, to).is_err(),
+            "directories cannot be copied"
+        );
+    }
+
+    #[test]
+    fn test_copy_path_abs_same_path_is_noop() {
+        let src = setup_test_repo();
+        let p = src.path().join("main.rs").to_string_lossy().to_string();
+
+        copy_path_abs(p.clone(), p).unwrap();
+
+        assert!(src.path().join("main.rs").exists());
+    }
+
+    #[test]
+    fn test_move_path_abs_cross_repo() {
+        let src = setup_test_repo();
+        let dst = setup_test_repo();
+        let from = src.path().join("main.rs").to_string_lossy().to_string();
+        let to = dst.path().join("moved.rs").to_string_lossy().to_string();
+
+        move_path_abs(from, to).unwrap();
+
+        assert!(
+            dst.path().join("moved.rs").exists(),
+            "file moved into dst repo"
+        );
+        assert!(
+            !src.path().join("main.rs").exists(),
+            "source removed after move"
+        );
     }
 
     #[test]
@@ -2309,12 +2609,14 @@ mod tests {
     }
 
     #[test]
-    fn validate_external_write_rejects_path_outside_home() {
+    fn validate_external_write_accepts_path_outside_home() {
         let home = TempDir::new().unwrap();
-        let other = TempDir::new().unwrap(); // sibling tempdir, NOT inside `home`
-        let result = validate_external_write_path(&other.path().join("victim.txt"), home.path());
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("within the user's home"));
+        let other = TempDir::new().unwrap();
+        let result = validate_external_write_path(&other.path().join("file.txt"), home.path());
+        assert!(
+            result.is_ok(),
+            "paths outside home should be allowed for local tool"
+        );
     }
 
     #[test]
@@ -2348,20 +2650,17 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn validate_external_write_rejects_symlink_escaping_home() {
+    fn validate_external_write_accepts_symlink_target() {
         use std::os::unix::fs::symlink;
         let home = TempDir::new().unwrap();
         let outside = TempDir::new().unwrap();
-        // Create `home/escape -> outside/` so a file path like
-        // `home/escape/pwned.txt` would resolve outside home.
         let link = home.path().join("escape");
         symlink(outside.path(), &link).unwrap();
-        let target = link.join("pwned.txt");
+        let target = link.join("file.txt");
         let result = validate_external_write_path(&target, home.path());
         assert!(
-            result.is_err(),
-            "symlink-based escape must be rejected, got {:?}",
-            result
+            result.is_ok(),
+            "symlinks should be allowed — user is the trust boundary"
         );
     }
 
@@ -2583,5 +2882,140 @@ mod tests {
         assert_eq!(res.moved, 1);
         assert_eq!(res.skipped, 1);
         assert!(res.errors.is_empty());
+    }
+
+    // --- Cross-repo content search (search_content_all_impl) ---
+
+    fn ready_index(
+        dir: &std::path::Path,
+    ) -> Arc<parking_lot::RwLock<crate::content_index::ContentIndex>> {
+        Arc::new(parking_lot::RwLock::new(
+            crate::content_index::ContentIndex::build(
+                dir.to_path_buf(),
+                None,
+                std::collections::HashMap::new(),
+            ),
+        ))
+    }
+
+    #[test]
+    fn search_content_all_merges_and_tags_each_repo() {
+        let repo_a = TempDir::new().unwrap();
+        fs::write(
+            repo_a.path().join("a.txt"),
+            "the zebrafish swims in repo a\n",
+        )
+        .unwrap();
+        let repo_b = TempDir::new().unwrap();
+        fs::write(
+            repo_b.path().join("b.txt"),
+            "another zebrafish lives in repo b\n",
+        )
+        .unwrap();
+
+        let path_a = repo_a.path().to_string_lossy().to_string();
+        let path_b = repo_b.path().to_string_lossy().to_string();
+        let indices = dashmap::DashMap::new();
+        indices.insert(path_a.clone(), ready_index(repo_a.path()));
+        indices.insert(path_b.clone(), ready_index(repo_b.path()));
+
+        let result = search_content_all_impl(&indices, "zebrafish", false, 100);
+
+        assert_eq!(result.matches.len(), 2, "one match per repo");
+        let repos: std::collections::HashSet<_> = result
+            .matches
+            .iter()
+            .filter_map(|m| m.repo_path.clone())
+            .collect();
+        assert!(repos.contains(&path_a), "match tagged with repo a");
+        assert!(repos.contains(&path_b), "match tagged with repo b");
+    }
+
+    #[test]
+    fn search_content_all_skips_unready_indices() {
+        let repo_a = TempDir::new().unwrap();
+        fs::write(repo_a.path().join("a.txt"), "the zebrafish swims here\n").unwrap();
+        let repo_b = TempDir::new().unwrap();
+        fs::write(repo_b.path().join("b.txt"), "zebrafish also here\n").unwrap();
+
+        let path_a = repo_a.path().to_string_lossy().to_string();
+        let path_b = repo_b.path().to_string_lossy().to_string();
+        let indices = dashmap::DashMap::new();
+        indices.insert(path_a.clone(), ready_index(repo_a.path()));
+        // repo_b's index never built → not ready → must be skipped
+        indices.insert(
+            path_b.clone(),
+            Arc::new(parking_lot::RwLock::new(
+                crate::content_index::ContentIndex::empty(repo_b.path().to_path_buf()),
+            )),
+        );
+
+        let result = search_content_all_impl(&indices, "zebrafish", false, 100);
+
+        assert_eq!(result.matches.len(), 1, "only the ready repo contributes");
+        assert_eq!(
+            result.matches[0].repo_path.as_deref(),
+            Some(path_a.as_str())
+        );
+    }
+
+    #[test]
+    fn search_content_all_no_matches_returns_empty() {
+        let repo = TempDir::new().unwrap();
+        fs::write(repo.path().join("a.txt"), "nothing relevant here\n").unwrap();
+        let indices = dashmap::DashMap::new();
+        indices.insert(
+            repo.path().to_string_lossy().to_string(),
+            ready_index(repo.path()),
+        );
+
+        let result = search_content_all_impl(&indices, "zebrafish", false, 100);
+
+        assert!(result.matches.is_empty());
+        assert!(!result.truncated);
+    }
+
+    #[test]
+    fn atomic_write_replaces_content_and_leaves_no_temp() {
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("note.md");
+        fs::write(&target, "original").unwrap();
+
+        atomic_write(&target, b"updated content").unwrap();
+
+        assert_eq!(fs::read_to_string(&target).unwrap(), "updated content");
+        // No temp files left behind in the directory.
+        let leftovers: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains("tmp."))
+            .collect();
+        assert!(leftovers.is_empty(), "temp leaked: {leftovers:?}");
+    }
+
+    #[test]
+    fn atomic_write_creates_new_file() {
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("new.txt");
+        atomic_write(&target, b"hello").unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "hello");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_preserves_existing_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("script.sh");
+        fs::write(&target, "#!/bin/sh\necho old").unwrap();
+        // User marks the file executable (0755) — a common, legitimate mode we
+        // must NOT clobber to a restrictive 0600 on save.
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+
+        atomic_write(&target, b"#!/bin/sh\necho new").unwrap();
+
+        let mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755, "atomic_write must preserve existing file mode");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "#!/bin/sh\necho new");
     }
 }

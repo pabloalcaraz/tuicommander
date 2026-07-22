@@ -1,4 +1,5 @@
 import { createEffect, createMemo, createSignal, Match, onCleanup, onMount, Show, Switch } from "solid-js";
+import { ToastContainer } from "../components/ToastContainer/ToastContainer";
 import { appLogger } from "../stores/appLogger";
 import { notesStore } from "../stores/notes";
 import { BottomTabs, type TabId } from "./components/BottomTabs";
@@ -43,6 +44,7 @@ export default function MobileApp() {
 			cancelAnimationFrame(raf);
 			raf = requestAnimationFrame(() => {
 				document.documentElement.style.setProperty("--app-height", `${vv.height}px`);
+				document.documentElement.style.setProperty("--app-top", `${vv.offsetTop}px`);
 			});
 		};
 		const pinScroll = () => {
@@ -152,6 +154,7 @@ export default function MobileApp() {
 			>
 				<SessionDetailScreen session={lastKnownSession()!} sessionExists={sessionExists()} onBack={handleBack} />
 			</Show>
+			<ToastContainer />
 		</div>
 	);
 }

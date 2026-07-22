@@ -1,4 +1,5 @@
 import { type Component, createEffect, For, onCleanup, Show } from "solid-js";
+import { registerModal } from "../../stores/modalStack";
 import d from "../shared/dialog.module.css";
 
 export interface Contribution {
@@ -18,8 +19,12 @@ export const WhatsNewDialog: Component<WhatsNewDialogProps> = (props) => {
 	createEffect(() => {
 		if (!props.visible) return;
 
+		// Escape-to-close is handled centrally (stores/modalStack): registering routes
+		// Escape to props.onClose AND stops it reaching the terminal underneath.
+		registerModal(props.onClose);
+
 		const handleKeydown = (e: KeyboardEvent) => {
-			if (e.key === "Escape" || e.key === "Enter") {
+			if (e.key === "Enter") {
 				e.preventDefault();
 				props.onClose();
 			}
@@ -79,6 +84,34 @@ export const WhatsNewDialog: Component<WhatsNewDialogProps> = (props) => {
 							}}
 						>
 							View full changelog
+						</a>
+						<a
+							href="https://github.com/sstraus/tuicommander"
+							target="_blank"
+							rel="noopener noreferrer"
+							style={{
+								display: "flex",
+								"align-items": "center",
+								gap: "6px",
+								"margin-top": "14px",
+								"padding-top": "12px",
+								"border-top": "1px solid var(--border)",
+								"font-size": "var(--font-sm)",
+								color: "var(--fg-secondary)",
+								"text-decoration": "none",
+							}}
+						>
+							<svg
+								width="14"
+								height="14"
+								viewBox="0 0 24 24"
+								fill="currentColor"
+								style={{ color: "var(--accent)", "flex-shrink": 0 }}
+								aria-hidden="true"
+							>
+								<path d="M12 2l2.9 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14l-5-4.87 7.1-1.01L12 2z" />
+							</svg>
+							Enjoying TUICommander? Star us on GitHub
 						</a>
 					</div>
 					<div class={d.actions}>

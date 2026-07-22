@@ -1,5 +1,6 @@
 import { createEffect, createSignal, Show } from "solid-js";
 import { appLogger } from "../../stores/appLogger";
+import { toastsStore } from "../../stores/toasts";
 import { rpc } from "../../transport";
 import { sendPtyKey } from "../../utils/sendCommand";
 import type { ChoicePrompt, SlashMenuItem } from "../useSessions";
@@ -7,7 +8,7 @@ import { retryWrite } from "../utils/retryWrite";
 import { ChoicePromptOverlay } from "./ChoicePromptOverlay";
 import styles from "./CommandInput.module.css";
 import { SlashMenuOverlay } from "./SlashMenuOverlay";
-import { isPostSendGuardActive, isSupersetEcho } from "./syncGuards";
+import { computeInputDelta, isPostSendGuardActive, isSupersetEcho } from "./syncGuards";
 
 interface CommandInputProps {
 	sessionId: string;
@@ -81,21 +82,13 @@ export function CommandInput(props: CommandInputProps) {
 		});
 	}
 
-	/** Send character deltas to PTY so the remote input stays in sync. */
+	/** Send character deltas to PTY so the remote input stays in sync.
+	 *  Uses a minimal end-anchored delta (computeInputDelta) — a mid-line edit
+	 *  backspaces only the divergent tail instead of nuking and retyping the
+	 *  whole line, which previously caused a keystroke storm and visible mess. */
 	function syncDelta(newText: string) {
-		const oldText = syncedText;
-
-		if (newText.startsWith(oldText)) {
-			const delta = newText.slice(oldText.length);
-			if (delta) writePty(delta);
-		} else if (oldText.startsWith(newText)) {
-			const count = oldText.length - newText.length;
-			writePty("\x7f".repeat(count));
-		} else {
-			// Complex edit (paste, cut, etc.) — delete old text with backspaces, then type new
-			writePty("\x7f".repeat(oldText.length) + newText);
-		}
-
+		const delta = computeInputDelta(syncedText, newText);
+		if (delta) writePty(delta);
 		syncedText = newText;
 	}
 
@@ -159,6 +152,7 @@ export function CommandInput(props: CommandInputProps) {
 		} catch (err) {
 			const msg = err instanceof Error ? err.message : String(err);
 			appLogger.error("network", `Failed to send command after retries: ${msg}`);
+			toastsStore.add("Send failed", `Could not send command: ${msg}`, "error", true);
 		}
 	}
 
@@ -197,6 +191,8 @@ export function CommandInput(props: CommandInputProps) {
 			}
 		} catch (err) {
 			appLogger.warn("terminal", "ChoicePrompt sendPtyKey failed", { error: err });
+			const msg = err instanceof Error ? err.message : String(err);
+			toastsStore.add("Send failed", `Could not send choice: ${msg}`, "error", true);
 		}
 	}
 

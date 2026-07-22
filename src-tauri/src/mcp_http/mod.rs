@@ -1,6 +1,9 @@
 mod agent_routes;
+mod ai_routes;
+mod ai_stream;
 pub(crate) mod ai_terminal;
 pub(crate) mod auth;
+mod claude_routes;
 mod config_routes;
 mod fs_routes;
 mod git_routes;
@@ -9,6 +12,7 @@ mod guards;
 mod log_routes;
 pub(crate) mod mcp_transport;
 mod plugin_docs;
+mod plugin_routes;
 mod session;
 mod sse_routes;
 mod static_files;
@@ -103,6 +107,21 @@ fn err_500(msg: &str) -> Response {
         Json(serde_json::json!({"error": msg})),
     )
         .into_response()
+}
+
+/// Wrap an `Ok(T)` / `Err(String)` result from a call to an upstream API (e.g.
+/// GitHub) into a JSON HTTP response. Ok → 200 with JSON body, Err → 502 Bad
+/// Gateway with `{"error": msg}` — distinct from [`json_result`]'s 500 because
+/// the failure originates upstream, not in our own server.
+pub(crate) fn upstream_json_result<T: serde::Serialize>(result: Result<T, String>) -> Response {
+    match result {
+        Ok(val) => (StatusCode::OK, Json(serde_json::json!(val))).into_response(),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({"error": e})),
+        )
+            .into_response(),
+    }
 }
 
 /// Default IPC endpoint path for local MCP bridge connections (Unix domain socket).
@@ -354,6 +373,24 @@ async fn plugin_data_http(AxumPath((plugin_id, path)): AxumPath<(String, String)
     }
 }
 
+#[derive(serde::Deserialize)]
+struct PluginDataWriteBody {
+    content: String,
+}
+
+/// Persist plugin data over HTTP (browser/PWA parity for the credential-consent flow,
+/// which calls `write_plugin_data`). Reuses the same sandboxed write logic as the Tauri
+/// command. (`delete_plugin_data` has no frontend caller, so no route is added for it.)
+async fn plugin_data_write_http(
+    AxumPath((plugin_id, path)): AxumPath<(String, String)>,
+    Json(body): Json<PluginDataWriteBody>,
+) -> Response {
+    match crate::plugins::write_plugin_data(plugin_id, path, body.content) {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
+    }
+}
+
 /// Return the VAPID public key so the frontend can call PushManager.subscribe().
 /// No auth required — the public key is not secret.
 async fn push_vapid_key(State(state): State<Arc<AppState>>) -> Response {
@@ -485,502 +522,16 @@ fn tunnel_routes() -> Router<Arc<AppState>> {
         .route("/agent-keys", get(commands::list_agent_keys))
 }
 
-pub fn build_router(state: Arc<AppState>, remote_auth: bool, mcp_enabled: bool) -> Router {
-    // When remote access is enabled, allow any origin (Basic Auth secures the endpoint).
-    // Otherwise, restrict to localhost and Tauri webview origins.
-    let cors = if remote_auth {
-        CorsLayer::new()
-            .allow_origin(tower_http::cors::Any)
-            .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
-            .allow_headers([AUTHORIZATION, CONTENT_TYPE])
-    } else {
-        let allowed_origins = [
-            "http://localhost"
-                .parse::<axum::http::HeaderValue>()
-                .unwrap(),
-            "http://127.0.0.1"
-                .parse::<axum::http::HeaderValue>()
-                .unwrap(),
-            "tauri://localhost"
-                .parse::<axum::http::HeaderValue>()
-                .unwrap(),
-            "https://tauri.localhost"
-                .parse::<axum::http::HeaderValue>()
-                .unwrap(),
-        ];
-        CorsLayer::new()
-            .allow_origin(allowed_origins.to_vec())
-            .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
-            .allow_headers([AUTHORIZATION, CONTENT_TYPE])
-    };
-
-    let mut routes = Router::new()
-        // Health & version
-        .route("/health", get(session::health))
-        .route("/api/version", get(session::app_version))
-        // Session lifecycle
-        .route(
-            "/sessions",
-            get(session::list_sessions).post(session::create_session),
-        )
-        .route("/sessions/{id}/write", post(session::write_to_session))
-        .route("/sessions/{id}/name", put(session::set_session_name))
-        .route("/sessions/{id}/resize", post(session::resize_session))
-        .route("/sessions/{id}/output", get(session::get_output))
-        .route("/sessions/{id}/pause", post(session::pause_session))
-        .route("/sessions/{id}/resume", post(session::resume_session))
-        .route("/sessions/{id}/kitty-flags", get(session::get_kitty_flags))
-        .route(
-            "/sessions/{id}/foreground",
-            get(session::get_foreground_process),
-        )
-        .route("/sessions/{id}", delete(session::close_session))
-        // WebSocket streaming
-        .route("/sessions/{id}/stream", get(session::ws_stream))
-        // Terminal grid commands
-        .route(
-            "/sessions/{id}/terminal/scroll",
-            post(session::terminal_scroll),
-        )
-        .route(
-            "/sessions/{id}/terminal/scroll-to",
-            post(session::terminal_scroll_to),
-        )
-        .route(
-            "/sessions/{id}/terminal/scroll-info",
-            get(session::terminal_scroll_info),
-        )
-        .route(
-            "/sessions/{id}/terminal/search",
-            post(session::terminal_search),
-        )
-        .route(
-            "/sessions/{id}/terminal/search-buffer",
-            post(session::terminal_search_buffer),
-        )
-        .route(
-            "/sessions/{id}/terminal/row-text",
-            get(session::terminal_get_row_text),
-        )
-        .route(
-            "/sessions/{id}/terminal/lines",
-            get(session::terminal_get_lines),
-        )
-        .route(
-            "/sessions/{id}/terminal/cursor-line",
-            get(session::terminal_get_cursor_line),
-        )
-        .route(
-            "/sessions/{id}/terminal/hyperlink",
-            get(session::terminal_hyperlink_at),
-        )
-        .route(
-            "/sessions/{id}/terminal/request-frame",
-            post(session::terminal_request_frame),
-        )
-        // Agent sessions
-        .route("/sessions/agent", post(agent_routes::spawn_agent_session))
-        .route(
-            "/sessions/worktree",
-            post(session::create_session_with_worktree),
-        )
-        // Orchestrator
-        .route("/stats", get(session::get_stats))
-        .route("/metrics", get(session::get_metrics))
-        .route("/process/stats", get(session::get_process_stats))
-        .route("/process/monitor", get(session::process_monitor_panel))
-        // Git/GitHub
-        .route("/repo/info", get(git_routes::repo_info))
-        .route("/repo/remote-url", get(git_routes::remote_url))
-        .route("/repo/diff", get(git_routes::repo_diff))
-        .route("/repo/diff-stats", get(git_routes::repo_diff_stats))
-        .route("/repo/files", get(git_routes::repo_changed_files))
-        .route("/repo/github", get(github_routes::repo_github_status))
-        .route("/repo/prs", get(github_routes::repo_pr_statuses))
-        .route("/repo/branches", get(git_routes::repo_branches))
-        .route("/repo/ci", get(github_routes::repo_ci_checks))
-        .route("/repo/pr-diff", get(github_routes::repo_pr_diff))
-        .route("/repo/approve-pr", post(github_routes::repo_approve_pr))
-        .route(
-            "/repo/branches/merged",
-            get(git_routes::repo_merged_branches),
-        )
-        .route("/repo/summary", get(git_routes::repo_summary))
-        .route("/repo/structure", get(git_routes::repo_structure))
-        .route(
-            "/repo/diff-stats/batch",
-            get(git_routes::repo_diff_stats_batch),
-        )
-        .route("/repo/prs/batch", post(github_routes::repo_all_pr_statuses))
-        .route("/repo/issues", get(github_routes::repo_issues))
-        .route("/repo/issues/close", post(github_routes::repo_close_issue))
-        .route(
-            "/repo/issues/reopen",
-            post(github_routes::repo_reopen_issue),
-        )
-        // GitHub poller
-        .route(
-            "/repo/github-poller/start",
-            post(github_routes::poller_start),
-        )
-        .route("/repo/github-poller/stop", post(github_routes::poller_stop))
-        .route(
-            "/repo/github-poller/visibility",
-            post(github_routes::poller_set_visibility),
-        )
-        .route(
-            "/repo/github-poller/poll-repo",
-            post(github_routes::poller_poll_repo),
-        )
-        .route(
-            "/repo/github-poller/update-paths",
-            post(github_routes::poller_update_paths),
-        )
-        .route(
-            "/repo/github-poller/set-issue-filter",
-            post(github_routes::poller_set_issue_filter),
-        )
-        .route(
-            "/repo/github-poller/api-debug",
-            get(github_routes::api_debug_get).post(github_routes::api_debug_set),
-        )
-        // Watchers (for browser/mobile clients)
-        .route(
-            "/watchers/repo",
-            post(watcher_routes::start_repo_watcher_http)
-                .delete(watcher_routes::stop_repo_watcher_http),
-        )
-        .route(
-            "/watchers/dir",
-            post(watcher_routes::start_dir_watcher_http)
-                .delete(watcher_routes::stop_dir_watcher_http),
-        )
-        // Config
-        .route(
-            "/config",
-            get(config_routes::get_config).put(config_routes::put_config),
-        )
-        .route(
-            "/config/hash-password",
-            post(config_routes::hash_password_http),
-        )
-        .route(
-            "/api/auth/rotate-token",
-            post(config_routes::rotate_session_token),
-        )
-        .route(
-            "/config/notifications",
-            get(config_routes::get_notification_config).put(config_routes::put_notification_config),
-        )
-        .route(
-            "/config/ui-prefs",
-            get(config_routes::get_ui_prefs).put(config_routes::put_ui_prefs),
-        )
-        .route(
-            "/config/repo-settings",
-            get(config_routes::get_repo_settings).put(config_routes::put_repo_settings),
-        )
-        .route(
-            "/config/repo-settings/has-custom",
-            get(config_routes::check_has_custom_settings_http),
-        )
-        .route(
-            "/config/repo-defaults",
-            get(config_routes::get_repo_defaults).put(config_routes::put_repo_defaults),
-        )
-        .route(
-            "/config/repositories",
-            get(config_routes::get_repositories).put(config_routes::put_repositories),
-        )
-        .route(
-            "/config/pane-layout",
-            get(config_routes::get_pane_layout).put(config_routes::put_pane_layout),
-        )
-        .route("/config/clear-caches", post(config_routes::clear_caches))
-        .route(
-            "/config/clear-repo-caches",
-            post(config_routes::clear_repo_caches),
-        )
-        .route(
-            "/config/repo-local-config",
-            get(config_routes::get_repo_local_config),
-        )
-        .route(
-            "/config/prompt-library",
-            get(config_routes::get_prompt_library).put(config_routes::put_prompt_library),
-        )
-        .route(
-            "/config/activity",
-            get(config_routes::get_activity).put(config_routes::put_activity),
-        )
-        .route(
-            "/config/keybindings",
-            get(config_routes::get_keybindings).put(config_routes::put_keybindings),
-        )
-        .route(
-            "/config/agents",
-            get(config_routes::get_agents_config).put(config_routes::put_agents_config),
-        )
-        .route(
-            "/config/provider-registry",
-            get(config_routes::get_provider_registry).put(config_routes::put_provider_registry),
-        )
-        .route(
-            "/config/remote-connections",
-            get(config_routes::get_remote_connections).put(config_routes::put_remote_connection),
-        )
-        .route(
-            "/config/remote-connections/{id}",
-            delete(config_routes::delete_remote_connection),
-        )
-        // Logs
-        .route(
-            "/logs",
-            get(log_routes::get_logs)
-                .post(log_routes::push_log)
-                .delete(log_routes::clear_logs),
-        )
-        // Worktrees
-        .route(
-            "/worktrees",
-            get(worktree_routes::list_worktrees_http).post(worktree_routes::create_worktree_http),
-        )
-        .route(
-            "/worktrees/dir",
-            get(worktree_routes::get_worktrees_dir_http),
-        )
-        .route(
-            "/worktrees/paths",
-            get(worktree_routes::get_worktree_paths_http),
-        )
-        .route(
-            "/worktrees/generate-name",
-            post(worktree_routes::generate_worktree_name_http),
-        )
-        .route(
-            "/worktrees/finalize",
-            post(worktree_routes::finalize_merged_worktree_http),
-        )
-        .route(
-            "/worktrees/{branch}",
-            delete(worktree_routes::remove_worktree_http),
-        )
-        // File operations
-        .route("/repo/file", get(git_routes::read_file_http))
-        .route("/repo/file-diff", get(git_routes::get_file_diff_http))
-        .route(
-            "/repo/markdown-files",
-            get(git_routes::list_markdown_files_http),
-        )
-        // Branch operations
-        .route(
-            "/repo/local-branches",
-            get(worktree_routes::list_local_branches_http),
-        )
-        .route(
-            "/repo/checkout-remote",
-            post(worktree_routes::checkout_remote_branch_http),
-        )
-        .route(
-            "/repo/orphan-worktrees",
-            get(worktree_routes::detect_orphan_worktrees_http),
-        )
-        .route(
-            "/repo/remove-orphan",
-            post(worktree_routes::remove_orphan_worktree_http),
-        )
-        .route(
-            "/repo/merge-pr",
-            post(worktree_routes::merge_pr_via_github_http),
-        )
-        .route("/repo/branch/rename", post(git_routes::rename_branch_http))
-        .route("/repo/initials", get(git_routes::get_initials_http))
-        .route(
-            "/repo/is-main-branch",
-            get(git_routes::check_is_main_branch_http),
-        )
-        // Prompt processing
-        .route("/prompt/process", post(agent_routes::process_prompt_http))
-        .route(
-            "/prompt/extract-variables",
-            post(agent_routes::extract_prompt_variables_http),
-        )
-        .route(
-            "/prompt/resolve-variables",
-            post(agent_routes::resolve_context_variables_http),
-        )
-        .route(
-            "/prompt/resolve-prompt-variables",
-            post(agent_routes::resolve_prompt_variables_http),
-        )
-        .route(
-            "/prompt/execute-headless",
-            post(agent_routes::execute_headless_prompt_http),
-        )
-        .route(
-            "/prompt/execute-api",
-            post(agent_routes::execute_api_prompt_http),
-        )
-        // Agents
-        .route(
-            "/agents/verify-session",
-            post(agent_routes::verify_agent_session_http),
-        )
-        .route("/agents", get(agent_routes::detect_agents))
-        .route(
-            "/agents/detect",
-            get(agent_routes::detect_agent_binary_http),
-        )
-        .route(
-            "/agents/ides",
-            get(agent_routes::detect_installed_ides_http),
-        )
-        // File browser
-        .route("/fs/list", get(fs_routes::list_directory_http))
-        .route("/fs/search", get(fs_routes::search_files_http))
-        .route("/fs/search-content", get(fs_routes::search_content_http))
-        .route("/fs/read", get(fs_routes::fs_read_file_http))
-        .route("/fs/read-external", get(fs_routes::read_external_file_http))
-        .route("/fs/write", post(fs_routes::write_file_http))
-        .route("/fs/mkdir", post(fs_routes::create_directory_http))
-        .route("/fs/delete", post(fs_routes::delete_path_http))
-        .route("/fs/rename", post(fs_routes::rename_path_http))
-        .route("/fs/copy", post(fs_routes::copy_path_http))
-        .route("/fs/gitignore", post(fs_routes::add_to_gitignore_http))
-        // Notes
-        .route(
-            "/config/notes",
-            get(config_routes::get_notes).put(config_routes::put_notes),
-        )
-        // Recent commits
-        .route(
-            "/repo/recent-commits",
-            get(git_routes::get_recent_commits_http),
-        )
-        // GitPanel commands
-        .route("/repo/panel-context", get(git_routes::git_panel_context))
-        .route("/repo/run-git", post(git_routes::run_git_command_http))
-        .route(
-            "/repo/working-tree-status",
-            get(git_routes::working_tree_status),
-        )
-        .route("/repo/stage", post(git_routes::stage_files_http))
-        .route("/repo/unstage", post(git_routes::unstage_files_http))
-        .route("/repo/discard", post(git_routes::discard_files_http))
-        .route(
-            "/repo/apply-reverse-patch",
-            post(git_routes::apply_reverse_patch_http),
-        )
-        .route("/repo/commit", post(git_routes::git_commit_http))
-        .route("/repo/commit-log", get(git_routes::commit_log_http))
-        .route("/repo/stash", get(git_routes::stash_list_http))
-        .route("/repo/stash/apply", post(git_routes::stash_apply_http))
-        .route("/repo/stash/pop", post(git_routes::stash_pop_http))
-        .route("/repo/stash/drop", post(git_routes::stash_drop_http))
-        .route("/repo/stash/show", get(git_routes::stash_show_http))
-        .route("/repo/file-history", get(git_routes::file_history_http))
-        .route("/repo/file-blame", get(git_routes::file_blame_http))
-        // System
-        .route("/system/local-ips", get(git_routes::get_local_ips_http))
-        .route("/system/local-ip", get(git_routes::get_local_ip_http))
-        // Plugins
-        .route("/plugins/list", get(git_routes::list_user_plugins_http))
-        // Server-Sent Events (for browser/mobile clients)
-        .route("/events", get(sse_routes::sse_events))
-        // MCP status + instructions
-        .route("/mcp/status", get(config_routes::get_mcp_status_http))
-        .route("/mcp/upstream-status", get(upstream_status_handler))
-        .route(
-            "/mcp/upstreams",
-            get(load_mcp_upstreams_http).put(save_mcp_upstreams_http),
-        )
-        .route(
-            "/mcp/upstreams/reconnect",
-            post(reconnect_mcp_upstream_http),
-        )
-        .route(
-            "/mcp/upstreams/credential",
-            post(save_mcp_upstream_credential_http).delete(delete_mcp_upstream_credential_http),
-        )
-        .route(
-            "/mcp/instructions",
-            get(mcp_transport::mcp_instructions_http),
-        )
-        // Plugin docs (for MCP bridge)
-        .route("/plugins/docs", get(plugin_dev_guide_handler))
-        // Plugin data (for external HTTP clients)
-        .route(
-            "/api/plugins/{plugin_id}/data/{*path}",
-            get(plugin_data_http),
-        )
-        // Push notification API
-        .route("/api/push/vapid-key", get(push_vapid_key))
-        .route(
-            "/api/push/subscribe",
-            post(push_subscribe).delete(push_unsubscribe),
-        )
-        .route("/api/push/test", post(push_test))
-        // SSH tunnel management
-        .nest("/tunnels", tunnel_routes());
-
-    // MCP Streamable HTTP transport — only when MCP is enabled
-    if mcp_enabled {
-        routes = routes.route(
-            "/mcp",
-            post(mcp_transport::mcp_post)
-                .get(mcp_transport::mcp_get)
-                .delete(mcp_transport::mcp_delete),
-        );
-    }
-
-    // Static files — SPA frontend (desktop only; not embedded in the remote binary)
-    #[cfg(feature = "desktop")]
-    let routes = routes
-        .route("/", get(static_files::serve_index))
-        .route("/{*path}", get(static_files::serve_static));
-
-    let routes = routes
-        .with_state(state.clone())
-        .layer(cors)
-        // DefaultPredicate auto-excludes SSE (text/event-stream) and WebSocket upgrades.
-        // Do NOT replace with a bare SizeAbove — it would break streaming endpoints.
-        .layer(
-            CompressionLayer::new().compress_when(DefaultPredicate::new().and(SizeAbove::new(860))),
-        );
-
-    if remote_auth {
-        routes.layer(axum::middleware::from_fn_with_state(
-            state,
-            auth::basic_auth_middleware,
-        ))
-    } else {
-        routes
-    }
-}
-
-/// Build a minimal router for the `tuic-remote` binary.
+/// Routes shared by BOTH `build_router` (desktop/loopback) and
+/// `build_remote_router` (tuic-remote daemon) — identical method + handler in
+/// both. Returned WITHOUT `.with_state`/layers so each caller merges it before
+/// applying its own state and middleware.
 ///
-/// Includes all per-repo routes needed for remote terminal management:
-/// sessions (CRUD + stream), terminal grid, git, worktrees, file system,
-/// agents, watchers, events (SSE), and repo info.
-///
-/// Excludes desktop-only routes: config management, MCP bridge, plugins,
-/// push notifications, prompt processing, AI chat, GitHub poller, and
-/// static file serving (no frontend embedded in the remote binary).
-///
-/// Auth and compression layers are applied identically to `build_router()`.
-#[allow(dead_code)] // Used by tuic-remote binary (not(desktop) build)
-pub fn build_remote_router(state: Arc<AppState>) -> Router {
-    let cors = CorsLayer::new()
-        .allow_origin(tower_http::cors::Any)
-        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
-        .allow_headers([AUTHORIZATION, CONTENT_TYPE]);
-
-    let public_routes = Router::new()
-        .route("/health", get(session::health))
-        .with_state(state.clone());
-
-    let routes = Router::new()
+/// Router-specific routes stay in their own builder: desktop-only surfaces, the
+/// per-router `/fs/read-editor*` handler down-scope (SECURITY), and the
+/// remote-only `/watchers/hot-repos`.
+fn shared_routes() -> Router<Arc<AppState>> {
+    Router::new()
         // Version (authenticated)
         .route("/api/version", get(session::app_version))
         // Session lifecycle
@@ -992,6 +543,7 @@ pub fn build_remote_router(state: Arc<AppState>) -> Router {
         .route("/sessions/{id}/name", put(session::set_session_name))
         .route("/sessions/{id}/resize", post(session::resize_session))
         .route("/sessions/{id}/output", get(session::get_output))
+        .route("/sessions/{id}/raw-ring", get(session::get_raw_ring))
         .route("/sessions/{id}/pause", post(session::pause_session))
         .route("/sessions/{id}/resume", post(session::resume_session))
         .route("/sessions/{id}/kitty-flags", get(session::get_kitty_flags))
@@ -999,6 +551,21 @@ pub fn build_remote_router(state: Arc<AppState>) -> Router {
             "/sessions/{id}/foreground",
             get(session::get_foreground_process),
         )
+        .route("/sessions/{id}/shell-state", get(session::get_shell_state))
+        .route("/sessions/{id}/last-prompt", get(session::get_last_prompt))
+        .route(
+            "/sessions/{id}/input-buffer",
+            get(session::get_input_buffer_content),
+        )
+        .route(
+            "/sessions/{id}/leaf-pid",
+            get(session::get_session_leaf_pid),
+        )
+        .route(
+            "/sessions/{id}/has-foreground",
+            get(session::has_foreground_process),
+        )
+        .route("/sessions/{id}/visible", post(session::set_session_visible))
         .route("/sessions/{id}", delete(session::close_session))
         // WebSocket streaming
         .route("/sessions/{id}/stream", get(session::ws_stream))
@@ -1010,6 +577,10 @@ pub fn build_remote_router(state: Arc<AppState>) -> Router {
         .route(
             "/sessions/{id}/terminal/scroll-to",
             post(session::terminal_scroll_to),
+        )
+        .route(
+            "/sessions/{id}/terminal/scroll-to-offset",
+            post(session::terminal_scroll_to_offset),
         )
         .route(
             "/sessions/{id}/terminal/scroll-info",
@@ -1032,12 +603,28 @@ pub fn build_remote_router(state: Arc<AppState>) -> Router {
             get(session::terminal_get_lines),
         )
         .route(
+            "/sessions/{id}/terminal/styled-rows",
+            get(session::terminal_styled_rows),
+        )
+        .route(
             "/sessions/{id}/terminal/cursor-line",
             get(session::terminal_get_cursor_line),
         )
         .route(
             "/sessions/{id}/terminal/hyperlink",
             get(session::terminal_hyperlink_at),
+        )
+        .route(
+            "/sessions/{id}/terminal/hyperlink-span",
+            get(session::terminal_hyperlink_span),
+        )
+        .route(
+            "/sessions/{id}/terminal/selection-text",
+            get(session::terminal_get_selection_text),
+        )
+        .route(
+            "/sessions/{id}/terminal/logical-line",
+            get(session::terminal_get_logical_line),
         )
         .route(
             "/sessions/{id}/terminal/request-frame",
@@ -1088,6 +675,11 @@ pub fn build_remote_router(state: Arc<AppState>) -> Router {
             get(log_routes::get_logs)
                 .post(log_routes::push_log)
                 .delete(log_routes::clear_logs),
+        )
+        // Diagnostics
+        .route(
+            "/diagnostics",
+            get(log_routes::diagnostics_get).post(log_routes::diagnostics_set),
         )
         // Worktrees
         .route(
@@ -1162,6 +754,10 @@ pub fn build_remote_router(state: Arc<AppState>) -> Router {
         .route("/fs/list", get(fs_routes::list_directory_http))
         .route("/fs/search", get(fs_routes::search_files_http))
         .route("/fs/search-content", get(fs_routes::search_content_http))
+        .route(
+            "/fs/search-content-all",
+            get(fs_routes::search_content_all_http),
+        )
         .route("/fs/read", get(fs_routes::fs_read_file_http))
         .route("/fs/read-external", get(fs_routes::read_external_file_http))
         .route("/fs/write", post(fs_routes::write_file_http))
@@ -1170,6 +766,30 @@ pub fn build_remote_router(state: Arc<AppState>) -> Router {
         .route("/fs/rename", post(fs_routes::rename_path_http))
         .route("/fs/copy", post(fs_routes::copy_path_http))
         .route("/fs/gitignore", post(fs_routes::add_to_gitignore_http))
+        .route(
+            "/fs/resolve-terminal-path",
+            get(fs_routes::resolve_terminal_path_http),
+        )
+        .route("/fs/stat", get(fs_routes::stat_path_http))
+        .route("/fs/warm-index", post(fs_routes::warm_content_index_http))
+        .route(
+            "/fs/write-external",
+            post(fs_routes::write_external_file_http),
+        )
+        .route("/fs/copy-abs", post(fs_routes::copy_path_abs_http))
+        .route("/fs/move-abs", post(fs_routes::move_path_abs_http))
+        .route("/fs/transfer", post(fs_routes::fs_transfer_paths_http))
+        // Claude Usage dashboard
+        .route("/claude/usage", get(claude_routes::claude_usage_api))
+        .route(
+            "/claude/timeline",
+            get(claude_routes::claude_usage_timeline),
+        )
+        .route(
+            "/claude/session-stats",
+            get(claude_routes::claude_session_stats),
+        )
+        .route("/claude/projects", get(claude_routes::claude_project_list))
         // Recent commits / git panel
         .route(
             "/repo/recent-commits",
@@ -1197,11 +817,668 @@ pub fn build_remote_router(state: Arc<AppState>) -> Router {
         .route("/repo/stash/show", get(git_routes::stash_show_http))
         .route("/repo/file-history", get(git_routes::file_history_http))
         .route("/repo/file-blame", get(git_routes::file_blame_http))
+        // Git panel (story 064)
+        .route(
+            "/repo/gutter-changes",
+            get(git_routes::get_gutter_changes_http),
+        )
+        .route(
+            "/repo/branches-detail",
+            get(git_routes::get_branches_detail_http),
+        )
+        .route(
+            "/repo/recent-branches",
+            get(git_routes::get_recent_branches_http),
+        )
+        .route("/repo/branch-base", get(git_routes::get_branch_base_http))
+        .route(
+            "/repo/worktree-dirty",
+            get(git_routes::check_worktree_dirty_http),
+        )
+        .route(
+            "/repo/base-ref-options",
+            get(git_routes::list_base_ref_options_http),
+        )
+        .route(
+            "/repo/clone-branch-name",
+            post(git_routes::generate_clone_branch_name_http),
+        )
+        .route("/repo/commit-graph", get(git_routes::get_commit_graph_http))
+        .route("/repo/create-branch", post(git_routes::create_branch_http))
+        .route("/repo/delete-branch", post(git_routes::delete_branch_http))
+        .route(
+            "/repo/delete-local-branch",
+            post(git_routes::delete_local_branch_http),
+        )
+        .route(
+            "/repo/update-from-base",
+            post(git_routes::update_from_base_http),
+        )
+        .route(
+            "/repo/switch-branch",
+            post(worktree_routes::switch_branch_http),
+        )
+        .route(
+            "/repo/merge-archive-worktree",
+            post(worktree_routes::merge_and_archive_worktree_http),
+        )
         // System info
         .route("/system/local-ips", get(git_routes::get_local_ips_http))
         .route("/system/local-ip", get(git_routes::get_local_ip_http))
         // Server-Sent Events
         .route("/events", get(sse_routes::sse_events))
+}
+
+pub fn build_router(state: Arc<AppState>, remote_auth: bool, mcp_enabled: bool) -> Router {
+    // When remote access is enabled, allow any origin (Basic Auth secures the endpoint).
+    // Otherwise, restrict to localhost and Tauri webview origins.
+    let cors = if remote_auth {
+        CorsLayer::new()
+            .allow_origin(tower_http::cors::Any)
+            .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
+            .allow_headers([AUTHORIZATION, CONTENT_TYPE])
+    } else {
+        let allowed_origins = [
+            "http://localhost"
+                .parse::<axum::http::HeaderValue>()
+                .unwrap(),
+            "http://127.0.0.1"
+                .parse::<axum::http::HeaderValue>()
+                .unwrap(),
+            "tauri://localhost"
+                .parse::<axum::http::HeaderValue>()
+                .unwrap(),
+            "https://tauri.localhost"
+                .parse::<axum::http::HeaderValue>()
+                .unwrap(),
+        ];
+        CorsLayer::new()
+            .allow_origin(allowed_origins.to_vec())
+            .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
+            .allow_headers([AUTHORIZATION, CONTENT_TYPE])
+    };
+
+    let mut routes = Router::new()
+        // Routes common to the remote daemon router live in shared_routes().
+        .merge(shared_routes())
+        // Health
+        .route("/health", get(session::health))
+        // Git/GitHub (desktop-only)
+        .route("/repo/github", get(github_routes::repo_github_status))
+        .route("/repo/prs", get(github_routes::repo_pr_statuses))
+        .route("/repo/ci", get(github_routes::repo_ci_checks))
+        .route("/repo/pr-diff", get(github_routes::repo_pr_diff))
+        .route("/repo/merged-prs", get(github_routes::repo_merged_prs))
+        .route(
+            "/repo/changelog",
+            get(github_routes::repo_generate_changelog),
+        )
+        .route(
+            "/repo/conflict-assist",
+            post(github_routes::repo_conflict_assist),
+        )
+        .route("/repo/approve-pr", post(github_routes::repo_approve_pr))
+        .route("/repo/create-pr", post(github_routes::repo_create_pr))
+        .route("/repo/create-issue", post(github_routes::repo_create_issue))
+        .route(
+            "/repo/post-pr-review",
+            post(github_routes::repo_post_pr_review),
+        )
+        .route("/repo/prs/batch", post(github_routes::repo_all_pr_statuses))
+        .route("/repo/issues", get(github_routes::repo_issues))
+        .route("/repo/issue-detail", get(github_routes::repo_issue_detail))
+        .route("/repo/issues/close", post(github_routes::repo_close_issue))
+        .route(
+            "/repo/issues/reopen",
+            post(github_routes::repo_reopen_issue),
+        )
+        // GitHub poller
+        .route(
+            "/repo/github-poller/start",
+            post(github_routes::poller_start),
+        )
+        .route("/repo/github-poller/stop", post(github_routes::poller_stop))
+        .route(
+            "/repo/github-poller/visibility",
+            post(github_routes::poller_set_visibility),
+        )
+        .route(
+            "/repo/github-poller/poll-repo",
+            post(github_routes::poller_poll_repo),
+        )
+        .route(
+            "/repo/github-poller/update-paths",
+            post(github_routes::poller_update_paths),
+        )
+        .route(
+            "/repo/github-poller/set-issue-filter",
+            post(github_routes::poller_set_issue_filter),
+        )
+        .route(
+            "/repo/github-poller/api-debug",
+            get(github_routes::api_debug_get).post(github_routes::api_debug_set),
+        )
+        // GitHub auth (device-code flow) + misc — browser/PWA via loopback
+        .route(
+            "/github/viewer-login",
+            get(github_routes::github_viewer_login),
+        )
+        .route("/repo/ci-failure-logs", get(github_routes::ci_failure_logs))
+        .route(
+            "/github/pr-hide-drafts",
+            post(github_routes::github_set_hide_drafts),
+        )
+        .route(
+            "/github/auth/start",
+            post(github_routes::github_start_login),
+        )
+        .route("/github/auth/poll", post(github_routes::github_poll_login))
+        .route("/github/auth/logout", post(github_routes::github_logout))
+        .route(
+            "/github/auth/disconnect",
+            post(github_routes::github_disconnect),
+        )
+        .route(
+            "/github/auth/status",
+            get(github_routes::github_auth_status),
+        )
+        .route(
+            "/github/diagnostics",
+            get(github_routes::github_diagnostics),
+        )
+        // Multi-account repo bindings (IPC/HTTP parity). Accounts + repo resolution
+        // are gated to desktop below — their impls are #[cfg(feature = "desktop")].
+        .route(
+            "/github/bindings",
+            get(github_routes::github_list_bindings).post(github_routes::github_bind_repo),
+        )
+        .route(
+            "/github/bindings/remove",
+            post(github_routes::github_unbind_repo),
+        )
+        // AI watchers (story 070 RPC parity) — CRUD; fires surface as SessionCreated SSE
+        .route(
+            "/ai/watchers",
+            get(ai_routes::watcher_list_http).post(ai_routes::watcher_create_http),
+        )
+        .route("/ai/watchers/update", post(ai_routes::watcher_update_http))
+        .route("/ai/watchers/delete", post(ai_routes::watcher_delete_http))
+        .route("/ai/watchers/toggle", post(ai_routes::watcher_toggle_http))
+        .route("/ai/watchers/attach", post(ai_routes::watcher_attach_http))
+        .route("/ai/watchers/detach", post(ai_routes::watcher_detach_http))
+        // AI chat (story 069 RPC slice) — config + conversation CRUD
+        .route(
+            "/ai/chat/config",
+            get(ai_routes::ai_chat_config_get).put(ai_routes::ai_chat_config_put),
+        )
+        .route(
+            "/ai/chat/conversations",
+            get(ai_routes::list_conversations_http),
+        )
+        .route(
+            "/ai/chat/conversation",
+            get(ai_routes::load_conversation_http).post(ai_routes::save_conversation_http),
+        )
+        .route(
+            "/ai/chat/conversation/delete",
+            post(ai_routes::delete_conversation_http),
+        )
+        .route("/ai/chat/new-id", post(ai_routes::new_conversation_id_http))
+        // Chat registry stream — dedicated per-chat WS (event-bridge plan Step 4).
+        .route("/ai/chat/{chat_id}/stream", get(ai_stream::chat_ws))
+        // AI agent loop control + knowledge + scheduler (story 068 RPC slice)
+        .route(
+            "/ai/conversation/cancel",
+            post(ai_routes::cancel_conversation_http),
+        )
+        .route(
+            "/ai/conversation/pause",
+            post(ai_routes::pause_conversation_http),
+        )
+        .route(
+            "/ai/conversation/resume",
+            post(ai_routes::resume_conversation_http),
+        )
+        .route(
+            "/ai/conversation/approve",
+            post(ai_routes::approve_conversation_action_http),
+        )
+        // Conversation token stream — dedicated per-session WS (event-bridge
+        // plan Step 3). NOT on the global bus: high-frequency token stream.
+        .route(
+            "/ai/conversation/{session_id}/stream",
+            get(ai_stream::conversation_ws),
+        )
+        .route(
+            "/ai/session-knowledge",
+            get(ai_routes::get_session_knowledge_http),
+        )
+        .route(
+            "/ai/suggestions/toggle",
+            post(ai_routes::toggle_ai_suggestions_http),
+        )
+        .route(
+            "/ai/knowledge/sessions",
+            post(ai_routes::list_knowledge_sessions_http),
+        )
+        .route(
+            "/ai/knowledge/session",
+            get(ai_routes::get_knowledge_session_detail_http),
+        )
+        .route(
+            "/ai/scheduler/config",
+            get(ai_routes::scheduler_config_get).put(ai_routes::scheduler_config_put),
+        )
+        // Config
+        .route(
+            "/config",
+            get(config_routes::get_config).put(config_routes::put_config),
+        )
+        .route(
+            "/config/hash-password",
+            post(config_routes::hash_password_http),
+        )
+        .route(
+            "/api/auth/rotate-token",
+            post(config_routes::rotate_session_token),
+        )
+        .route(
+            "/config/notifications",
+            get(config_routes::get_notification_config).put(config_routes::put_notification_config),
+        )
+        .route(
+            "/config/ui-prefs",
+            get(config_routes::get_ui_prefs).put(config_routes::put_ui_prefs),
+        )
+        .route(
+            "/config/repo-settings",
+            get(config_routes::get_repo_settings).put(config_routes::put_repo_settings),
+        )
+        .route(
+            "/config/repo-settings/has-custom",
+            get(config_routes::check_has_custom_settings_http),
+        )
+        .route(
+            "/config/repo-defaults",
+            get(config_routes::get_repo_defaults).put(config_routes::put_repo_defaults),
+        )
+        .route(
+            "/config/repositories",
+            get(config_routes::get_repositories).put(config_routes::put_repositories),
+        )
+        .route(
+            "/config/pane-layout",
+            get(config_routes::get_pane_layout).put(config_routes::put_pane_layout),
+        )
+        .route("/config/clear-caches", post(config_routes::clear_caches))
+        .route(
+            "/config/clear-repo-caches",
+            post(config_routes::clear_repo_caches),
+        )
+        .route(
+            "/config/repo-local-config",
+            get(config_routes::get_repo_local_config)
+                .post(config_routes::save_repo_local_config_http),
+        )
+        // Story 066: config / themes / notes / misc stateless parity (loopback)
+        .route(
+            "/config/branch-label",
+            post(config_routes::set_branch_label_http),
+        )
+        .route(
+            "/config/note-image",
+            post(config_routes::save_note_image_http),
+        )
+        .route(
+            "/config/note-assets/delete",
+            post(config_routes::delete_note_assets_http),
+        )
+        .route(
+            "/config/note-assets/delete-batch",
+            post(config_routes::delete_note_assets_batch_http),
+        )
+        .route("/config/themes", get(config_routes::list_themes_http))
+        .route(
+            "/config/project-mcp-upstreams",
+            post(config_routes::set_project_mcp_upstreams_http),
+        )
+        .route(
+            "/exec/shell-script",
+            post(config_routes::execute_shell_script_http),
+        )
+        .route(
+            "/audio/output-devices",
+            get(config_routes::list_audio_output_devices_http),
+        )
+        .route(
+            "/agent/discover-session",
+            post(config_routes::discover_agent_session_http),
+        )
+        .route(
+            "/agent/claude-project-dir",
+            post(config_routes::claude_project_dir_http),
+        )
+        .route(
+            "/agent/open-in-custom",
+            post(config_routes::open_in_custom_http),
+        )
+        .route(
+            "/generators/generate",
+            post(config_routes::generate_value_http),
+        )
+        .route(
+            "/registry/plugins",
+            get(config_routes::fetch_plugin_registry_http),
+        )
+        .route(
+            "/config/prompt-library",
+            get(config_routes::get_prompt_library).put(config_routes::put_prompt_library),
+        )
+        .route(
+            "/config/ai-prompts",
+            get(config_routes::get_ai_prompts_http).put(config_routes::put_ai_prompts_http),
+        )
+        .route(
+            "/config/activity",
+            get(config_routes::get_activity).put(config_routes::put_activity),
+        )
+        .route(
+            "/config/keybindings",
+            get(config_routes::get_keybindings).put(config_routes::put_keybindings),
+        )
+        .route(
+            "/config/agents",
+            get(config_routes::get_agents_config).put(config_routes::put_agents_config),
+        )
+        .route(
+            "/config/agents/{agent}/hook-instrumentation",
+            get(config_routes::get_agent_hook_state)
+                .put(config_routes::put_agent_hook_instrumentation),
+        )
+        .route(
+            "/config/provider-registry",
+            get(config_routes::get_provider_registry).put(config_routes::put_provider_registry),
+        )
+        // Provider API keys (keyring-proxied) + slot/ollama checks — story 072
+        .route(
+            "/config/provider-key/exists",
+            get(config_routes::provider_key_exists_http),
+        )
+        .route(
+            "/config/provider-key",
+            post(config_routes::save_provider_key_http)
+                .delete(config_routes::delete_provider_key_http),
+        )
+        .route(
+            "/config/slot-test",
+            post(config_routes::test_slot_connection_http),
+        )
+        .route(
+            "/config/ollama-models",
+            post(config_routes::check_ollama_models_http),
+        )
+        .route(
+            "/config/remote-connections",
+            get(config_routes::get_remote_connections).put(config_routes::put_remote_connection),
+        )
+        .route(
+            "/config/remote-connections/{id}",
+            delete(config_routes::delete_remote_connection),
+        )
+        // Debug: execute JS in the main WebView (loopback-only, enforced in handler).
+        // Local router only — never the remote router (this is an RCE surface).
+        .route("/debug/invoke_js", post(log_routes::invoke_js_http))
+        // Branch operations (desktop-only)
+        .route(
+            "/repo/merge-pr",
+            post(worktree_routes::merge_pr_via_github_http),
+        )
+        // Prompt processing
+        .route("/prompt/process", post(agent_routes::process_prompt_http))
+        .route(
+            "/prompt/extract-variables",
+            post(agent_routes::extract_prompt_variables_http),
+        )
+        .route(
+            "/prompt/resolve-variables",
+            post(agent_routes::resolve_context_variables_http),
+        )
+        .route(
+            "/prompt/resolve-prompt-variables",
+            post(agent_routes::resolve_prompt_variables_http),
+        )
+        .route(
+            "/prompt/execute-headless",
+            post(agent_routes::execute_headless_prompt_http),
+        )
+        .route(
+            "/prompt/execute-api",
+            post(agent_routes::execute_api_prompt_http),
+        )
+        // File browser — desktop gets the large (250 MB) editor read cap; the
+        // remote router down-scopes these two paths to the standard-cap handlers.
+        .route("/fs/read-editor", get(fs_routes::read_editor_file_http))
+        .route(
+            "/fs/read-editor-external",
+            get(fs_routes::read_editor_file_external_http),
+        )
+        // Notes
+        .route(
+            "/config/notes",
+            get(config_routes::get_notes).put(config_routes::put_notes),
+        )
+        // Plugins
+        .route("/plugins/list", get(git_routes::list_user_plugins_http))
+        // MCP status + instructions
+        .route("/mcp/status", get(config_routes::get_mcp_status_http))
+        .route("/mcp/upstream-status", get(upstream_status_handler))
+        .route(
+            "/mcp/upstreams",
+            get(load_mcp_upstreams_http).put(save_mcp_upstreams_http),
+        )
+        .route(
+            "/mcp/upstreams/reconnect",
+            post(reconnect_mcp_upstream_http),
+        )
+        .route(
+            "/mcp/upstreams/credential",
+            post(save_mcp_upstream_credential_http).delete(delete_mcp_upstream_credential_http),
+        )
+        .route(
+            "/mcp/instructions",
+            get(mcp_transport::mcp_instructions_http),
+        )
+        // Plugin docs (for MCP bridge)
+        .route("/plugins/docs", get(plugin_dev_guide_handler))
+        // Plugin data (for external HTTP clients)
+        .route(
+            "/api/plugins/{plugin_id}/data/{*path}",
+            get(plugin_data_http).post(plugin_data_write_http),
+        )
+        // Plugin RPC commands (story 071)
+        .route(
+            "/api/plugins/{plugin_id}/fs/read",
+            get(plugin_routes::plugin_fs_read),
+        )
+        .route(
+            "/api/plugins/{plugin_id}/fs/read-base64",
+            get(plugin_routes::plugin_fs_read_base64),
+        )
+        .route(
+            "/api/plugins/{plugin_id}/fs/tail",
+            get(plugin_routes::plugin_fs_tail),
+        )
+        .route(
+            "/api/plugins/{plugin_id}/fs/list",
+            get(plugin_routes::plugin_fs_list),
+        )
+        .route(
+            "/api/plugins/{plugin_id}/fs/write",
+            post(plugin_routes::plugin_fs_write),
+        )
+        .route(
+            "/api/plugins/{plugin_id}/fs/rename",
+            post(plugin_routes::plugin_fs_rename),
+        )
+        .route(
+            "/api/plugins/{plugin_id}/build-artifacts/scan",
+            post(plugin_routes::plugin_scan_build_artifacts),
+        )
+        .route(
+            "/api/plugins/{plugin_id}/build-artifacts/delete",
+            post(plugin_routes::plugin_delete_build_artifact),
+        )
+        .route(
+            "/api/plugins/{plugin_id}/exec",
+            post(plugin_routes::plugin_exec),
+        )
+        .route(
+            "/api/plugins/{plugin_id}/http",
+            post(plugin_routes::plugin_http_fetch),
+        )
+        .route(
+            "/api/plugins/{plugin_id}/pty/output",
+            get(plugin_routes::plugin_pty_output),
+        )
+        .route(
+            "/api/plugins/{plugin_id}/register",
+            post(plugin_routes::plugin_register),
+        )
+        .route(
+            "/api/plugins/{plugin_id}/unregister",
+            post(plugin_routes::plugin_unregister),
+        )
+        .route(
+            "/api/plugins/{plugin_id}/readme",
+            get(plugin_routes::plugin_readme),
+        )
+        // Push notification API
+        .route("/api/push/vapid-key", get(push_vapid_key))
+        .route(
+            "/api/push/subscribe",
+            post(push_subscribe).delete(push_unsubscribe),
+        )
+        .route("/api/push/test", post(push_test))
+        // SSH tunnel management
+        .nest("/tunnels", tunnel_routes());
+
+    // MCP Streamable HTTP transport — only when MCP is enabled
+    if mcp_enabled {
+        routes = routes.route(
+            "/mcp",
+            post(mcp_transport::mcp_post)
+                .get(mcp_transport::mcp_get)
+                .delete(mcp_transport::mcp_delete),
+        );
+    }
+
+    // Multi-account accounts + repo resolution — desktop-only: add/remove/resolve go
+    // through the keychain-backed #[cfg(feature = "desktop")] impls in github_account.rs.
+    // The remote daemon never serves GitHub routes (build_remote_router omits them), so
+    // gate these out of the always-compiled build_router so the lib builds for
+    // tuic-remote (#094-ec55 remote-target fix).
+    #[cfg(feature = "desktop")]
+    let routes = routes
+        .route(
+            "/github/accounts",
+            get(github_routes::github_list_accounts).post(github_routes::github_add_account),
+        )
+        .route(
+            "/github/accounts/remove",
+            post(github_routes::github_remove_account),
+        )
+        .route(
+            "/github/resolve-repo",
+            get(github_routes::github_resolve_repo),
+        )
+        .route(
+            "/github/resolve-repos",
+            post(github_routes::github_resolve_repos),
+        );
+
+    // Diff triage trigger (event-bridge plan Step 2) — desktop-only: the triage
+    // LLM pipeline needs the desktop providers. Progress streams over `/events`.
+    #[cfg(feature = "desktop")]
+    let routes = routes.route("/ai/triage/run", post(ai_routes::run_diff_triage_http));
+    #[cfg(feature = "desktop")]
+    let routes = routes.route("/ai/review/pr", post(ai_routes::run_pr_review_http));
+    #[cfg(feature = "desktop")]
+    let routes = routes.route(
+        "/ai/improvements/scan",
+        post(ai_routes::run_improvement_scan_http),
+    );
+    #[cfg(feature = "desktop")]
+    let routes = routes.route(
+        "/repo/create-issue-from-proposal",
+        post(ai_routes::create_issue_from_proposal_http),
+    );
+
+    // Static files — SPA frontend (desktop only; not embedded in the remote binary)
+    #[cfg(feature = "desktop")]
+    let routes = routes
+        .route("/", get(static_files::serve_index))
+        .route("/{*path}", get(static_files::serve_static));
+
+    let routes = routes
+        .with_state(state.clone())
+        .layer(cors)
+        // DefaultPredicate auto-excludes SSE (text/event-stream) and WebSocket upgrades.
+        // Do NOT replace with a bare SizeAbove — it would break streaming endpoints.
+        .layer(
+            CompressionLayer::new().compress_when(DefaultPredicate::new().and(SizeAbove::new(860))),
+        );
+
+    if remote_auth {
+        routes.layer(axum::middleware::from_fn_with_state(
+            state,
+            auth::basic_auth_middleware,
+        ))
+    } else {
+        routes
+    }
+}
+
+/// Build a minimal router for the `tuic-remote` binary.
+///
+/// Includes all per-repo routes needed for remote terminal management:
+/// sessions (CRUD + stream), terminal grid, git, worktrees, file system,
+/// agents, watchers, events (SSE), and repo info.
+///
+/// Excludes desktop-only routes: config management, MCP bridge, plugins,
+/// push notifications, prompt processing, AI chat, GitHub poller, and
+/// static file serving (no frontend embedded in the remote binary).
+///
+/// Auth and compression layers are applied identically to `build_router()`.
+#[allow(dead_code)] // Used by tuic-remote binary (not(desktop) build)
+pub fn build_remote_router(state: Arc<AppState>) -> Router {
+    let cors = CorsLayer::new()
+        .allow_origin(tower_http::cors::Any)
+        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
+        .allow_headers([AUTHORIZATION, CONTENT_TYPE]);
+
+    let public_routes = Router::new()
+        .route("/health", get(session::health))
+        .layer(cors.clone())
+        .with_state(state.clone());
+
+    let routes = Router::new()
+        // Routes common to the desktop/loopback router live in shared_routes().
+        .merge(shared_routes())
+        // SECURITY: remote clients get the standard (10 MB) cap, NOT the large
+        // editor cap. The 250 MB editor read is a desktop-local feature; serving
+        // it over a (possibly metered/slow) remote link risks OOM/latency since
+        // the whole file is read into a String→JSON with no streaming. Route the
+        // editor paths through the standard-cap handlers remotely.
+        .route("/fs/read-editor", get(fs_routes::fs_read_file_http))
+        .route(
+            "/fs/read-editor-external",
+            get(fs_routes::read_external_file_http),
+        )
+        // Watchers — remote-only hot-repos toggle
+        .route(
+            "/watchers/hot-repos",
+            put(watcher_routes::set_hot_repos_http),
+        )
         // SSH tunnel management
         .nest("/tunnels", tunnel_routes())
         .with_state(state.clone())
@@ -1255,7 +1532,17 @@ pub async fn start_server(
         .ipc_started
         .swap(true, std::sync::atomic::Ordering::AcqRel);
 
+    tracing::info!(
+        source = "mcp_http",
+        first_start,
+        mcp_enabled,
+        remote_enabled,
+        "HTTP server lifecycle starting"
+    );
+
     if first_start {
+        crate::pty::spawn_process_snapshot_refresher(Arc::clone(&state));
+
         // Spawn MCP session reaper: evicts stale protocol sessions every 60s (1h TTL)
         let reaper_state = state.clone();
         tokio::spawn(async move {
@@ -1300,6 +1587,26 @@ pub async fn start_server(
                         .agent_inbox
                         .retain(|tuic, _| known_tuic.contains(tuic));
                 }
+
+                // Sweep expired auth rate-limit entries so the map can't grow
+                // unbounded for IPs that fail once and never return (scanners,
+                // IPv6 rotation). Window is read fresh each pass so runtime
+                // config changes take effect on the next sweep.
+                let rl_window = reaper_state
+                    .config
+                    .read()
+                    .services
+                    .auth
+                    .auth_rate_limit_window_secs;
+                let evicted =
+                    auth::sweep_expired_rate_limits(&reaper_state.auth_rate_limits, rl_window);
+                if evicted > 0 {
+                    tracing::debug!(
+                        source = "auth",
+                        evicted,
+                        "Swept expired auth rate-limit entries"
+                    );
+                }
             }
         });
 
@@ -1307,6 +1614,10 @@ pub async fn start_server(
         crate::mcp_proxy::registry::UpstreamRegistry::spawn_health_checker(Arc::clone(
             &state.mcp_upstream_registry,
         ));
+
+        // Spawn standby checker: SIGSTOP idle+unfocused sessions after timeout
+        #[cfg(unix)]
+        crate::pty::spawn_standby_checker(Arc::clone(&state));
 
         // --- Unix socket listener (always on, no auth) ---
         #[cfg(unix)]
@@ -1360,14 +1671,15 @@ pub async fn start_server(
                             let app = build_router(watchdog_state.clone(), false, mcp_enabled);
                             let app =
                                 app.layer(axum::middleware::from_fn(inject_localhost_connect_info));
-                            if let Err(e) = axum::serve(uds, app.into_make_service()).await {
-                                tracing::error!(
+                            match axum::serve(uds, app.into_make_service()).await {
+                                Err(e) => tracing::error!(
                                     source = "mcp_http",
                                     "Unix socket server error: {e}"
-                                );
-                            } else {
-                                // Clean exit (should not happen now — nobody aborts us).
-                                break;
+                                ),
+                                Ok(()) => tracing::warn!(
+                                    source = "mcp_http",
+                                    "Unix socket server exited cleanly (unexpected)"
+                                ),
                             }
                             // Unexpected exit — rebind and restart.
                             tracing::warn!(source = "mcp_http", path = %sock.display(), "Unix socket server stopped unexpectedly, restarting…");
@@ -1401,8 +1713,14 @@ pub async fn start_server(
                     let app = build_router(state.clone(), false, mcp_enabled);
                     let app = app.layer(axum::middleware::from_fn(inject_localhost_connect_info));
                     tokio::spawn(async move {
-                        if let Err(e) = axum::serve(pipe, app.into_make_service()).await {
-                            tracing::error!(source = "mcp_http", "Named pipe server error: {e}");
+                        match axum::serve(pipe, app.into_make_service()).await {
+                            Err(e) => {
+                                tracing::error!(source = "mcp_http", "Named pipe server error: {e}")
+                            }
+                            Ok(()) => tracing::warn!(
+                                source = "mcp_http",
+                                "Named pipe server exited cleanly (unexpected)"
+                            ),
                         }
                     });
                 }
@@ -1427,32 +1745,66 @@ pub async fn start_server(
             "0.0.0.0"
         };
         const MAX_PORT_ATTEMPTS: u16 = 3;
+        // Boot-race resilience: on a `make dev` restart the outgoing process
+        // (debug builds skip the single-instance lock) may still hold the port
+        // for a moment, so the fresh boot's bind loses the race. Without a retry
+        // the server would run Unix-socket-only until a settings toggle triggers
+        // restart_server — the "starts without :9876, comes alive when I touch
+        // settings" symptom. Retry the full port sweep with backoff so the boot
+        // waits for the port to free. A genuine 2nd live instance still binds
+        // base_port+1 on the first sweep, so it pays no delay.
+        const BIND_RETRY_ROUNDS: u32 = 6;
+        const BIND_RETRY_BACKOFF_MS: u64 = 500;
 
         let mut listener_result: Option<std::net::TcpListener> = None;
         // Port 0 = OS-assigned, no retry needed
         let attempts = if base_port == 0 { 1 } else { MAX_PORT_ATTEMPTS };
-        for attempt in 0..attempts {
-            let port = base_port + attempt;
-            let bind_addr = format!("{host}:{port}");
-            match std::net::TcpListener::bind(&bind_addr) {
-                Ok(listener) => {
-                    listener.set_nonblocking(true).ok();
-                    if attempt > 0 {
-                        tracing::info!(source = "mcp_http", "Port {base_port} busy, using {port}");
+        'bind: for round in 0..BIND_RETRY_ROUNDS {
+            for attempt in 0..attempts {
+                let port = base_port + attempt;
+                let bind_addr = format!("{host}:{port}");
+                match std::net::TcpListener::bind(&bind_addr) {
+                    Ok(listener) => {
+                        listener.set_nonblocking(true).ok();
+                        if attempt > 0 {
+                            tracing::info!(
+                                source = "mcp_http",
+                                "Port {base_port} busy, using {port}"
+                            );
+                        }
+                        listener_result = Some(listener);
+                        break 'bind;
                     }
-                    listener_result = Some(listener);
-                    break;
-                }
-                Err(_) if attempt + 1 < attempts => {
-                    tracing::warn!(source = "mcp_http", "Port {port} busy, trying {}", port + 1);
-                }
-                Err(e) => {
-                    tracing::error!(
-                        source = "mcp_http",
-                        "Failed to bind TCP on ports {base_port}–{port}: {e}"
-                    );
+                    Err(_) if attempt + 1 < attempts => {
+                        tracing::warn!(
+                            source = "mcp_http",
+                            "Port {port} busy, trying {}",
+                            port + 1
+                        );
+                    }
+                    Err(e) => {
+                        // Whole sweep failed this round. Retry after a backoff to
+                        // ride out a restart race, unless rounds are exhausted.
+                        if round + 1 < BIND_RETRY_ROUNDS {
+                            tracing::warn!(
+                                source = "mcp_http",
+                                "Ports {base_port}–{port} busy (round {}/{BIND_RETRY_ROUNDS}); retrying in {BIND_RETRY_BACKOFF_MS}ms",
+                                round + 1
+                            );
+                        } else {
+                            tracing::error!(
+                                source = "mcp_http",
+                                "Failed to bind TCP on ports {base_port}–{port} after {BIND_RETRY_ROUNDS} rounds: {e}"
+                            );
+                        }
+                    }
                 }
             }
+            // OS-assigned port can't fail meaningfully; don't sleep past the last round.
+            if base_port == 0 || round + 1 >= BIND_RETRY_ROUNDS {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(BIND_RETRY_BACKOFF_MS)).await;
         }
 
         if let Some(listener) = listener_result {
@@ -1513,6 +1865,12 @@ pub async fn start_server(
 
     // Wait for shutdown signal
     let _ = shutdown_rx.await;
+
+    tracing::info!(
+        source = "mcp_http",
+        remote_enabled,
+        "TCP server lifecycle stopping; local MCP IPC remains active"
+    );
 
     // Abort only TCP-bound listeners — IPC listeners, reaper, and health
     // checker persist across restarts. Socket-file cleanup is deferred to the
@@ -1592,6 +1950,9 @@ mod tests {
             config: parking_lot::RwLock::new(crate::config::AppConfig::default()),
             git_cache: crate::state::GitCacheState::new(),
             repo_watchers: DashMap::new(),
+            repo_git_fingerprints: DashMap::new(),
+            repo_head_targets: DashMap::new(),
+            repo_head_emits_suppressed: std::sync::atomic::AtomicU64::new(0),
             dir_watchers: DashMap::new(),
             theme_watcher: parking_lot::Mutex::new(None),
             mdkb_daemon: crate::mdkb_daemon::create_shared_daemon(),
@@ -1602,6 +1963,7 @@ mod tests {
             github_poller: parking_lot::Mutex::new(None),
             github_viewer_login: parking_lot::RwLock::new(None),
             github_rate_limit_remaining: std::sync::atomic::AtomicU32::new(u32::MAX),
+            ghe_state: dashmap::DashMap::new(),
             server_shutdown: parking_lot::Mutex::new(None),
             ipc_started: std::sync::atomic::AtomicBool::new(false),
             session_token: parking_lot::RwLock::new(uuid::Uuid::new_v4().to_string()),
@@ -1611,10 +1973,12 @@ mod tests {
             plugin_watchers: DashMap::new(),
             ansi_colors: parking_lot::RwLock::new(None),
             vt_log_buffers: DashMap::new(),
+            pty_raw_rings: DashMap::new(),
             #[cfg(feature = "desktop")]
             grid_channels: DashMap::new(),
             grid_watch: DashMap::new(),
             grid_frame_in_flight: DashMap::new(),
+            pending_scroll: DashMap::new(),
             kitty_states: DashMap::new(),
             input_buffers: DashMap::new(),
             last_prompts: DashMap::new(),
@@ -1637,11 +2001,19 @@ mod tests {
                 crate::tool_search::ToolSearchIndex::build(&[]),
             )),
             content_indices: DashMap::new(),
+            index_in_flight: std::sync::Arc::new(dashmap::DashSet::new()),
+            worktree_recreate_in_flight: std::sync::Arc::new(dashmap::DashSet::new()),
+            index_build_sem: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+            monitoring_git_sem: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                crate::state::MONITORING_GIT_CONCURRENCY,
+            )),
             indexer_throttle: std::sync::Arc::new(crate::content_index::IndexerThrottle::default()),
             slash_mode: DashMap::new(),
             last_output_ms: DashMap::new(),
+            last_input_ms: DashMap::new(),
             shell_states: DashMap::new(),
             terminal_rows: DashMap::new(),
+            resize_locks: DashMap::new(),
             exit_codes: DashMap::new(),
             shell_state_since_ms: DashMap::new(),
             loaded_plugins: DashMap::new(),
@@ -1649,11 +2021,15 @@ mod tests {
             peer_agents: DashMap::new(),
             agent_inbox: DashMap::new(),
             agent_inbox_evictions: DashMap::new(),
+            pending_injections: DashMap::new(),
+            pending_initial_prompts: DashMap::new(),
+            active_agent_waiters: DashMap::new(),
             session_html_tabs: DashMap::new(),
             mcp_to_session: DashMap::new(),
             session_to_mcp: DashMap::new(),
             session_parent: DashMap::new(),
             messaging_channels: DashMap::new(),
+            pty_event_channels: DashMap::new(),
             session_knowledge: DashMap::new(),
             knowledge_dirty: DashMap::new(),
             has_osc133_integration: DashMap::new(),
@@ -1691,6 +2067,9 @@ mod tests {
             )),
             connections_lock: tokio::sync::Mutex::new(()),
             screenshot_responses: DashMap::new(),
+            standby_sessions: DashMap::new(),
+            process_snapshot_cache: crate::pty::ProcessSnapshotCache::default(),
+            hot_repo_paths: parking_lot::RwLock::new(std::collections::HashSet::new()),
         });
         // Override default disabled_native_tools so all 8 tools are visible in tests
         state.config.write().disabled_native_tools = Vec::new();
@@ -1712,6 +2091,116 @@ mod tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn shared_routes_surface_is_locked_and_desktop_only_excluded() {
+        // Drift guard (#094-ec55): shared_routes() is the single source both build_router
+        // and build_remote_router merge, so a shared route present in only one router is
+        // impossible by construction. This test pins the shared SURFACE so (a) a shared
+        // route silently dropped from shared_routes() is caught, and (b) a desktop-only
+        // route accidentally added to shared_routes() — which would re-expose it on the
+        // remote daemon — is caught. We probe with PATCH — a method NO shared route uses —
+        // so a registered path returns 405 (method-not-allowed, router level) while an
+        // unregistered path returns 404. This reflects ROUTE EXISTENCE only, never a
+        // handler's own 404 (e.g. get_output 404s for a missing session, which would
+        // false-fail a GET probe). Path params are filled with a placeholder segment.
+        let must_exist = [
+            "/api/version",
+            "/sessions",
+            "/sessions/x/write",
+            "/sessions/x/output",
+            "/sessions/x/terminal/scroll",
+            "/sessions/x/terminal/lines",
+            "/sessions/agent",
+            "/sessions/worktree",
+            "/stats",
+            "/metrics",
+            "/process/stats",
+            "/repo/info",
+            "/repo/diff",
+            "/repo/files",
+            "/repo/branches",
+            "/repo/commit",
+            "/repo/stash",
+            "/repo/gutter-changes",
+            "/repo/create-branch",
+            "/watchers/repo",
+            "/watchers/dir",
+            "/logs",
+            "/diagnostics",
+            "/worktrees",
+            "/worktrees/x",
+            "/agents",
+            "/agents/detect",
+            "/fs/list",
+            "/fs/read",
+            "/fs/write",
+            "/fs/stat",
+            "/claude/usage",
+            "/claude/projects",
+            "/system/local-ip",
+        ];
+        // Desktop-only or router-specific — MUST NOT be in shared_routes():
+        // /health (public_routes only), /fs/read-editor & /watchers/hot-repos
+        // (router-specific handlers), and every desktop-only family.
+        let must_not_exist = [
+            "/health",
+            "/fs/read-editor",
+            "/watchers/hot-repos",
+            "/github/accounts",
+            "/github/resolve-repo",
+            "/repo/github",
+            "/repo/prs",
+            "/ai/watchers",
+            "/ai/chat/conversations",
+            "/config",
+            "/config/themes",
+            "/mcp/status",
+            "/plugins/list",
+            "/api/push/test",
+            "/prompt/process",
+            "/debug/invoke_js",
+            "/exec/shell-script",
+        ];
+        let state = test_state();
+        let app = shared_routes().with_state(state);
+        for p in must_exist {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("PATCH")
+                        .uri(p)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_ne!(
+                resp.status(),
+                StatusCode::NOT_FOUND,
+                "shared route missing from shared_routes(): {p}"
+            );
+        }
+        for p in must_not_exist {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("PATCH")
+                        .uri(p)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::NOT_FOUND,
+                "desktop-only/router-specific path leaked into shared_routes(): {p}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1798,6 +2287,16 @@ mod tests {
     #[tokio::test]
     async fn test_config_strips_password_hash() {
         let state = test_state();
+        {
+            let mut cfg = state.config.write();
+            cfg.services.auth.password_hash = "password-hash".to_string();
+            cfg.services.auth.session_token = "session-secret".to_string();
+            cfg.services.auth.session_token_exists = true;
+            cfg.services.relay.token = "relay-secret".to_string();
+            cfg.services.relay.token_exists = Some(true);
+            cfg.services.push.vapid_private_key = "vapid-secret".to_string();
+            cfg.services.push.vapid_private_key_exists = true;
+        }
         let app = build_router(state, false, true);
         let resp = app.oneshot(get_localhost("/config")).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -1808,6 +2307,30 @@ mod tests {
         assert!(
             config.pointer("/services/auth/password_hash").is_none(),
             "Password hash should be stripped from HTTP response"
+        );
+        assert!(
+            config.pointer("/services/auth/session_token").is_none(),
+            "Session token should be stripped from HTTP response"
+        );
+        assert_eq!(
+            config.pointer("/services/auth/session_token_exists"),
+            Some(&serde_json::Value::Bool(true))
+        );
+        assert!(
+            config.pointer("/services/relay/token").is_none(),
+            "Relay token should be stripped from HTTP response"
+        );
+        assert_eq!(
+            config.pointer("/services/relay/token_exists"),
+            Some(&serde_json::Value::Bool(true))
+        );
+        assert!(
+            config.pointer("/services/push/vapid_private_key").is_none(),
+            "VAPID private key should be stripped from HTTP response"
+        );
+        assert_eq!(
+            config.pointer("/services/push/vapid_private_key_exists"),
+            Some(&serde_json::Value::Bool(true))
         );
     }
 
@@ -2495,6 +3018,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mcp_regression_ping_is_lightweight_and_refreshes_session() {
+        let state = test_state();
+        state.mcp_sessions.insert(
+            "ping-session".to_string(),
+            crate::state::McpSessionMeta {
+                last_activity: std::time::Instant::now() - std::time::Duration::from_secs(60),
+                is_claude_code: true,
+                has_sse_stream: false,
+                repo_path: None,
+            },
+        );
+        let app = build_router(state.clone(), false, true);
+        let body = serde_json::json!({"jsonrpc": "2.0", "id": 9, "method": "ping"});
+
+        let resp = app
+            .oneshot(mcp_post_with_session("/mcp", &body, "ping-session"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["result"], serde_json::json!({}));
+        assert!(
+            state
+                .mcp_sessions
+                .get("ping-session")
+                .unwrap()
+                .last_activity
+                .elapsed()
+                < std::time::Duration::from_secs(1)
+        );
+    }
+
+    #[tokio::test]
     async fn test_mcp_tools_list_respects_disabled_native_tools() {
         let state = test_state();
         state.config.write().disabled_native_tools = vec!["debug".to_string()];
@@ -2966,11 +3525,36 @@ mod tests {
     #[tokio::test]
     async fn test_config_get() {
         let state = test_state();
+        {
+            let mut cfg = state.config.write();
+            cfg.services.auth.password_hash = "password-hash".to_string();
+            cfg.services.auth.session_token = "session-secret".to_string();
+            cfg.services.auth.session_token_exists = true;
+            cfg.services.relay.token = "relay-secret".to_string();
+            cfg.services.relay.token_exists = Some(true);
+            cfg.services.push.vapid_private_key = "vapid-secret".to_string();
+            cfg.services.push.vapid_private_key_exists = true;
+        }
         let result = call_mcp_tool(&state, "config", serde_json::json!({"action": "get"})).await;
         assert!(result["font_family"].as_str().is_some());
         assert!(
             result.pointer("/services/auth/password_hash").is_none(),
             "Password hash should be stripped from MCP tool response"
+        );
+        assert!(result.pointer("/services/auth/session_token").is_none());
+        assert_eq!(
+            result.pointer("/services/auth/session_token_exists"),
+            Some(&serde_json::Value::Bool(true))
+        );
+        assert!(result.pointer("/services/relay/token").is_none());
+        assert_eq!(
+            result.pointer("/services/relay/token_exists"),
+            Some(&serde_json::Value::Bool(true))
+        );
+        assert!(result.pointer("/services/push/vapid_private_key").is_none());
+        assert_eq!(
+            result.pointer("/services/push/vapid_private_key_exists"),
+            Some(&serde_json::Value::Bool(true))
         );
     }
 

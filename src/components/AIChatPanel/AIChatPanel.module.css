@@ -283,7 +283,7 @@
   flex: 1;
   background: var(--bg-tertiary);
   border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
+  border-radius: var(--radius-sm);
   color: var(--fg-primary);
   font-size: var(--font-base);
   font-family: var(--font-ui);
@@ -315,7 +315,7 @@
   background: var(--accent);
   color: var(--text-on-accent);
   border: none;
-  border-radius: var(--radius-lg);
+  border-radius: var(--radius-sm);
   cursor: pointer;
   flex-shrink: 0;
   transition: opacity 0.15s ease;
@@ -339,7 +339,7 @@
   background: var(--error);
   color: var(--text-on-error);
   border: none;
-  border-radius: var(--radius-lg);
+  border-radius: var(--radius-sm);
   cursor: pointer;
   flex-shrink: 0;
   transition: opacity 0.15s ease;
@@ -372,6 +372,9 @@
 }
 
 .agentBannerBtn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   background: none;
   border: 1px solid var(--accent);
   border-radius: var(--radius-md);
@@ -588,8 +591,8 @@
 }
 
 .alwaysAllowBtn {
-  background: var(--fg-tertiary, #888);
-  color: var(--bg-primary, #fff);
+  background: var(--fg-muted);
+  color: var(--bg-primary);
 }
 
 /* ── Model picker ──────────────────────────────────────── */
@@ -597,7 +600,7 @@
   font-size: var(--font-xs);
   background: var(--bg-secondary);
   color: var(--fg-secondary);
-  border: 1px solid var(--border-subtle);
+  border: 1px solid var(--border);
   border-radius: var(--radius-md);
   padding: 1px 4px;
   cursor: pointer;
@@ -613,7 +616,7 @@
   font-size: var(--font-xs);
   background: var(--bg-secondary);
   color: var(--fg-secondary);
-  border: 1px solid var(--border-subtle);
+  border: 1px solid var(--border);
   border-radius: var(--radius-md);
   padding: 1px 4px;
   width: 48px;
@@ -687,7 +690,7 @@
 }
 
 .historyItem:hover {
-  background: var(--bg-hover);
+  background: var(--bg-highlight);
 }
 
 .historyTitle {
@@ -717,7 +720,7 @@
 }
 
 .historyModel {
-  color: var(--fg-accent, #7cb8ff);
+  color: var(--accent);
   font-size: 10px;
   opacity: 0.8;
 }
@@ -741,3 +744,36 @@
   line-height: 1.4;
 }
 
+
+/* Extended-thinking disclosure (Opus 4.7+ reasoning) */
+.reasoningDisclosure {
+  margin: 4px 0;
+  border-left: 2px solid var(--border);
+  padding-left: 8px;
+}
+
+.reasoningSummary {
+  cursor: pointer;
+  font-size: var(--font-sm);
+  color: var(--fg-secondary);
+  user-select: none;
+  list-style: none;
+}
+
+.reasoningSummary::before {
+  content: "▸";
+  display: inline-block;
+  margin-right: 6px;
+  transition: transform var(--t-norm, 0.15s);
+}
+
+.reasoningDisclosure[open] > .reasoningSummary::before {
+  transform: rotate(90deg);
+}
+
+.reasoningBody {
+  margin-top: 4px;
+  font-size: var(--font-sm);
+  color: var(--fg-muted);
+  opacity: 0.85;
+}

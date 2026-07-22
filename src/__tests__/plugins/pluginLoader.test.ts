@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, type Mock, vi } from "vitest";
 import type { PluginManifest } from "../../plugins/pluginLoader";
-import { loadUserPlugins, validateManifest, validateModule } from "../../plugins/pluginLoader";
+import { loadUserPlugins, pluginModuleBaseUrl, validateManifest, validateModule } from "../../plugins/pluginLoader";
 
 // Mock invoke
 vi.mock("../../invoke", () => ({
@@ -23,6 +23,15 @@ vi.mock("../../stores/pluginStore", () => ({
 		updatePlugin: vi.fn(),
 		getLogger: vi.fn(() => ({ info: vi.fn(), error: vi.fn(), warn: vi.fn() })),
 		removePlugin: vi.fn(),
+	},
+}));
+
+vi.mock("../../stores/appLogger", () => ({
+	appLogger: {
+		debug: vi.fn(),
+		info: vi.fn(),
+		warn: vi.fn(),
+		error: vi.fn(),
 	},
 }));
 
@@ -121,6 +130,25 @@ describe("validateModule", () => {
 			default: { id: "wrong-id", onload: () => {}, onunload: () => {} },
 		};
 		expect(validateModule(mod, "expected-id")).toContain("id mismatch");
+	});
+});
+
+// ---------------------------------------------------------------------------
+// pluginModuleBaseUrl
+// ---------------------------------------------------------------------------
+
+describe("pluginModuleBaseUrl", () => {
+	it("uses the raw plugin:// scheme off Windows (macOS/Linux)", () => {
+		// wry serves custom schemes under their raw scheme on macOS/Linux.
+		expect(pluginModuleBaseUrl("mdkb-dashboard", "main.js", false)).toBe("plugin://mdkb-dashboard/main.js");
+	});
+
+	it("uses http://plugin.localhost on Windows (WebView2)", () => {
+		// WebView2 only serves register_uri_scheme_protocol schemes via
+		// http://{scheme}.localhost — see issue #86. plugins.rs parses this form.
+		expect(pluginModuleBaseUrl("mdkb-dashboard", "main.js", true)).toBe(
+			"http://plugin.localhost/mdkb-dashboard/main.js",
+		);
 	});
 });
 

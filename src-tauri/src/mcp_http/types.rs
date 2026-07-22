@@ -37,6 +37,12 @@ pub(super) struct CreateSessionRequest {
     pub cols: Option<u16>,
     pub shell: Option<String>,
     pub cwd: Option<String>,
+    /// Client-provided session id. Browser clients generate the id up front and
+    /// register it locally BEFORE this request so the `session-created` echo
+    /// (delivered over SSE, which can beat the HTTP response) is recognized as
+    /// locally-created and does not spawn a duplicate "PTY:" tab. Honored only
+    /// when non-empty and not already in use; otherwise the backend mints one.
+    pub session_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -88,11 +94,58 @@ pub(super) struct PrDiffQuery {
 }
 
 #[derive(Deserialize)]
+pub(super) struct ChangelogQuery {
+    pub path: String,
+    #[serde(default, rename = "sinceTag")]
+    pub since_tag: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub(super) struct ConflictAssistRequest {
+    #[serde(rename = "repoPath")]
+    pub repo_path: String,
+    #[serde(rename = "prNumber")]
+    pub pr_number: i64,
+}
+
+#[derive(Deserialize)]
 pub(super) struct ApprovePrRequest {
     #[serde(rename = "repoPath")]
     pub repo_path: String,
     #[serde(rename = "prNumber")]
     pub pr_number: i64,
+}
+
+#[derive(Deserialize)]
+pub(super) struct CreatePrRequest {
+    #[serde(rename = "repoPath")]
+    pub repo_path: String,
+    pub title: String,
+    pub body: String,
+    pub base: String,
+    pub head: String,
+    #[serde(default)]
+    pub draft: bool,
+}
+
+#[derive(Deserialize)]
+pub(super) struct CreateIssueRequest {
+    #[serde(rename = "repoPath")]
+    pub repo_path: String,
+    pub title: String,
+    pub body: String,
+}
+
+#[derive(Deserialize)]
+pub(super) struct PostPrReviewRequest {
+    #[serde(rename = "repoPath")]
+    pub repo_path: String,
+    #[serde(rename = "prNumber")]
+    pub pr_number: i64,
+    pub body: String,
+    pub event: Option<String>,
+    #[serde(default)]
+    pub comments: Vec<crate::github::PrReviewInlineComment>,
 }
 
 #[derive(Deserialize)]
@@ -129,6 +182,11 @@ pub(super) struct RemoveWorktreeQuery {
     /// When true, also delete the local branch. Defaults to true.
     #[serde(rename = "deleteBranch", default)]
     pub delete_branch: Option<bool>,
+    /// When true, force-remove a locked worktree (mirrors the desktop
+    /// confirmation dialog). Also switches the branch deletion from `git
+    /// branch -d` (safe) to `-D` (force). Defaults to false.
+    #[serde(default)]
+    pub force: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -223,6 +281,14 @@ pub(super) struct FsSearchContentQuery {
 }
 
 #[derive(Deserialize)]
+pub(super) struct FsSearchContentAllQuery {
+    pub query: String,
+    #[serde(rename = "caseSensitive")]
+    pub case_sensitive: Option<bool>,
+    pub limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
 pub(super) struct FsExternalFileQuery {
     pub path: String,
 }
@@ -273,6 +339,42 @@ pub(super) struct FsGitignoreRequest {
 }
 
 #[derive(Deserialize)]
+pub(super) struct FsResolveTerminalPathQuery {
+    pub cwd: String,
+    pub candidate: String,
+}
+
+#[derive(Deserialize)]
+pub(super) struct FsWarmIndexRequest {
+    #[serde(rename = "repoPath")]
+    pub repo_path: String,
+}
+
+#[derive(Deserialize)]
+pub(super) struct FsExternalWriteRequest {
+    pub path: String,
+    pub content: String,
+}
+
+/// Absolute-path single-file copy/move (FileBrowser cross-repo cut/paste).
+#[derive(Deserialize)]
+pub(super) struct FsAbsTransferRequest {
+    pub from: String,
+    pub to: String,
+}
+
+/// Bulk OS drag-drop transfer (move/copy) into a destination directory.
+#[derive(Deserialize)]
+pub(super) struct FsTransferPathsRequest {
+    #[serde(rename = "destDir")]
+    pub dest_dir: String,
+    pub paths: Vec<String>,
+    pub mode: crate::fs::TransferMode,
+    #[serde(rename = "allowRecursive")]
+    pub allow_recursive: bool,
+}
+
+#[derive(Deserialize)]
 pub(super) struct FinalizeMergeRequest {
     #[serde(rename = "repoPath")]
     pub repo_path: String,
@@ -296,6 +398,29 @@ pub(super) struct RemoveOrphanRequest {
     pub repo_path: String,
     #[serde(rename = "worktreePath")]
     pub worktree_path: String,
+}
+
+#[derive(Deserialize)]
+pub(super) struct SwitchBranchRequest {
+    #[serde(rename = "repoPath")]
+    pub repo_path: String,
+    #[serde(rename = "branchName")]
+    pub branch_name: String,
+    pub force: bool,
+    pub stash: bool,
+}
+
+#[derive(Deserialize)]
+pub(super) struct MergeArchiveRequest {
+    #[serde(rename = "repoPath")]
+    pub repo_path: String,
+    #[serde(rename = "branchName")]
+    pub branch_name: String,
+    #[serde(rename = "targetBranch")]
+    pub target_branch: String,
+    /// "archive", "delete", or "ask"
+    #[serde(rename = "afterMerge")]
+    pub after_merge: String,
 }
 
 #[derive(Deserialize)]
@@ -345,6 +470,161 @@ pub(super) struct IssueActionRequest {
     pub repo_path: String,
     #[serde(rename = "issueNumber")]
     pub issue_number: i64,
+}
+
+#[derive(Deserialize)]
+pub(super) struct IssueDetailQuery {
+    #[serde(rename = "repoPath")]
+    pub repo_path: String,
+    #[serde(rename = "issueNumber")]
+    pub issue_number: i64,
+}
+
+// --- GitHub auth / misc ---
+
+#[derive(Deserialize)]
+pub(super) struct CiFailureLogsQuery {
+    #[serde(rename = "repoPath")]
+    pub repo_path: String,
+    pub branch: String,
+}
+
+#[derive(Deserialize)]
+pub(super) struct GithubSetHideDraftsRequest {
+    pub hide: bool,
+}
+
+#[derive(Deserialize)]
+pub(super) struct GithubPollLoginRequest {
+    #[serde(rename = "deviceCode")]
+    pub device_code: String,
+}
+
+#[derive(Deserialize)]
+pub(super) struct GithubAddAccountRequest {
+    pub host: String,
+    pub pat: String,
+}
+
+#[derive(Deserialize)]
+pub(super) struct GithubRemoveAccountRequest {
+    pub id: String,
+}
+
+#[derive(Deserialize)]
+pub(super) struct GithubBindRepoRequest {
+    #[serde(rename = "repoPath")]
+    pub repo_path: String,
+    #[serde(rename = "accountId")]
+    pub account_id: String,
+    #[serde(rename = "remoteName")]
+    pub remote_name: String,
+}
+
+#[derive(Deserialize)]
+pub(super) struct GithubRepoPathBody {
+    #[serde(rename = "repoPath")]
+    pub repo_path: String,
+}
+
+#[derive(Deserialize)]
+pub(super) struct GithubResolveRepoQuery {
+    #[serde(rename = "repoPath")]
+    pub repo_path: String,
+}
+
+#[derive(Deserialize)]
+pub(super) struct GithubResolveReposRequest {
+    #[serde(rename = "repoPaths")]
+    pub repo_paths: Vec<String>,
+}
+
+// --- Config / themes / notes / misc (story 066) ---
+
+#[derive(Deserialize)]
+pub(super) struct SaveRepoLocalConfigRequest {
+    #[serde(rename = "repoPath")]
+    pub repo_path: String,
+}
+
+#[derive(Deserialize)]
+pub(super) struct SetBranchLabelRequest {
+    #[serde(rename = "repoPath")]
+    pub repo_path: String,
+    #[serde(rename = "branchName")]
+    pub branch_name: String,
+    pub label: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub(super) struct SaveNoteImageRequest {
+    #[serde(rename = "noteId")]
+    pub note_id: String,
+    #[serde(rename = "dataBase64")]
+    pub data_base64: String,
+    pub extension: String,
+}
+
+#[derive(Deserialize)]
+pub(super) struct DeleteNoteAssetsRequest {
+    #[serde(rename = "noteId")]
+    pub note_id: String,
+}
+
+#[derive(Deserialize)]
+pub(super) struct DeleteNoteAssetsBatchRequest {
+    #[serde(rename = "noteIds")]
+    pub note_ids: Vec<String>,
+}
+
+#[derive(Deserialize)]
+pub(super) struct ExecuteShellScriptRequest {
+    #[serde(rename = "scriptContent")]
+    pub script_content: String,
+    #[serde(rename = "timeoutMs")]
+    pub timeout_ms: u64,
+    #[serde(rename = "repoPath")]
+    pub repo_path: String,
+}
+
+#[derive(Deserialize)]
+pub(super) struct DiscoverAgentSessionRequest {
+    #[serde(rename = "agentType")]
+    pub agent_type: String,
+    pub cwd: String,
+    #[serde(rename = "claimedIds")]
+    pub claimed_ids: Vec<String>,
+    #[serde(rename = "agentPid")]
+    pub agent_pid: Option<u32>,
+    #[serde(rename = "envOverrides")]
+    pub env_overrides: std::collections::HashMap<String, String>,
+}
+
+#[derive(Deserialize)]
+pub(super) struct ClaudeProjectDirRequest {
+    pub cwd: String,
+    #[serde(rename = "claudeConfigDir")]
+    pub claude_config_dir: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub(super) struct OpenInCustomRequest {
+    pub executable: String,
+    pub args: Vec<String>,
+    pub ctx: crate::agent::LaunchContext,
+}
+
+#[derive(Deserialize)]
+pub(super) struct GenerateValueRequest {
+    pub request: crate::generators::GeneratorRequest,
+}
+
+#[derive(Deserialize)]
+pub(super) struct SetProjectMcpUpstreamsRequest {
+    #[serde(rename = "repoPath")]
+    pub repo_path: String,
+    #[serde(rename = "upstreamNames")]
+    pub upstream_names: Option<Vec<String>>,
 }
 
 // --- GitPanel commands ---
@@ -409,6 +689,10 @@ pub(super) struct RunGitCommandRequest {
 pub(super) struct StartPollingRequest {
     pub paths: Vec<String>,
     pub issue_filter: String,
+    /// Mirrors the `pr_hide_drafts` arg of the `github_start_polling` Tauri
+    /// command so the HTTP route reaches parity. Optional for older clients.
+    #[serde(default)]
+    pub pr_hide_drafts: bool,
 }
 
 #[derive(Deserialize)]
@@ -449,6 +733,11 @@ pub(super) struct TerminalScrollToRequest {
 }
 
 #[derive(Deserialize)]
+pub(super) struct TerminalScrollToOffsetRequest {
+    pub offset: usize,
+}
+
+#[derive(Deserialize)]
 pub(super) struct TerminalSearchRequest {
     pub query: String,
 }
@@ -465,7 +754,125 @@ pub(super) struct TerminalLinesQuery {
 }
 
 #[derive(Deserialize)]
+pub(super) struct TerminalStyledRowsQuery {
+    pub start: usize,
+    pub count: usize,
+}
+
+#[derive(Deserialize)]
 pub(super) struct TerminalCellQuery {
     pub row: usize,
     pub col: usize,
+}
+
+#[derive(Deserialize)]
+pub(super) struct TerminalSelectionQuery {
+    #[serde(rename = "startRow")]
+    pub start_row: usize,
+    #[serde(rename = "startCol")]
+    pub start_col: usize,
+    #[serde(rename = "endRow")]
+    pub end_row: usize,
+    #[serde(rename = "endCol")]
+    pub end_col: usize,
+}
+
+#[derive(Deserialize)]
+pub(super) struct SessionVisibleRequest {
+    pub visible: bool,
+}
+
+#[derive(Deserialize)]
+pub(super) struct ClaudeTimelineQuery {
+    pub scope: String,
+    pub days: Option<u32>,
+}
+
+#[derive(Deserialize)]
+pub(super) struct ClaudeStatsQuery {
+    pub scope: String,
+}
+
+// --- Git panel (story 064) ---
+
+#[derive(Deserialize)]
+pub(super) struct GitGutterQuery {
+    pub path: String,
+    pub file: String,
+    pub scope: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub(super) struct GitRecentBranchesQuery {
+    pub path: String,
+    pub limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+pub(super) struct GitBranchBaseQuery {
+    pub path: String,
+    #[serde(rename = "branchName")]
+    pub branch_name: String,
+}
+
+#[derive(Deserialize)]
+pub(super) struct GitWorktreeDirtyQuery {
+    #[serde(rename = "repoPath")]
+    pub repo_path: String,
+    #[serde(rename = "branchName")]
+    pub branch_name: String,
+}
+
+#[derive(Deserialize)]
+pub(super) struct GitRepoQuery {
+    #[serde(rename = "repoPath")]
+    pub repo_path: String,
+}
+
+#[derive(Deserialize)]
+pub(super) struct GitCommitGraphQuery {
+    pub path: String,
+    pub count: Option<u32>,
+}
+
+#[derive(Deserialize)]
+pub(super) struct GitCloneBranchNameRequest {
+    #[serde(rename = "sourceBranch")]
+    pub source_branch: String,
+    #[serde(rename = "existingNames")]
+    pub existing_names: Vec<String>,
+}
+
+#[derive(Deserialize)]
+pub(super) struct GitCreateBranchRequest {
+    pub path: String,
+    pub name: String,
+    #[serde(rename = "startPoint")]
+    pub start_point: Option<String>,
+    pub checkout: bool,
+}
+
+#[derive(Deserialize)]
+pub(super) struct GitDeleteBranchRequest {
+    pub path: String,
+    pub name: String,
+    pub force: bool,
+}
+
+#[derive(Deserialize)]
+pub(super) struct GitDeleteLocalBranchRequest {
+    #[serde(rename = "repoPath")]
+    pub repo_path: String,
+    #[serde(rename = "branchName")]
+    pub branch_name: String,
+    #[serde(rename = "keepWorktree")]
+    pub keep_worktree: Option<bool>,
+}
+
+#[derive(Deserialize)]
+pub(super) struct GitUpdateFromBaseRequest {
+    pub path: String,
+    #[serde(rename = "branchName")]
+    pub branch_name: String,
+    pub strategy: Option<String>,
 }

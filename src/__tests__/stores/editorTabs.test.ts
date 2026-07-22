@@ -73,12 +73,15 @@ describe("editorTabsStore", () => {
 			});
 		});
 
-		it("falls back to last remaining tab as active", () => {
+		it("does not promote another tab when the active one is removed (caller selects the replacement)", () => {
 			testInScope(() => {
 				const id1 = editorTabsStore.add("/repo", "a.ts");
 				const id2 = editorTabsStore.add("/repo", "b.ts");
 				editorTabsStore.remove(id2); // remove active
-				expect(editorTabsStore.state.activeId).toBe(id1);
+				expect(editorTabsStore.get(id1)).toBeDefined();
+				// No auto-promotion: id1 could be scoped to another branch/repo —
+				// visibility-aware selection happens in useTerminalLifecycle.
+				expect(editorTabsStore.state.activeId).toBeNull();
 			});
 		});
 
@@ -159,6 +162,33 @@ describe("editorTabsStore", () => {
 		it("ignores unknown tab id", () => {
 			testInScope(() => {
 				expect(() => editorTabsStore.setDirty("nonexistent", true)).not.toThrow();
+			});
+		});
+	});
+
+	describe("setCursor()", () => {
+		it("records cursor line and column on the tab", () => {
+			testInScope(() => {
+				const id = editorTabsStore.add("/repo", "file.ts");
+				editorTabsStore.setCursor(id, 42, 7);
+				expect(editorTabsStore.get(id)?.cursorLine).toBe(42);
+				expect(editorTabsStore.get(id)?.cursorCol).toBe(7);
+			});
+		});
+
+		it("getActive() reflects the recorded cursor", () => {
+			testInScope(() => {
+				const id = editorTabsStore.add("/repo", "file.ts");
+				editorTabsStore.setCursor(id, 3, 1);
+				const active = editorTabsStore.getActive();
+				expect(active?.cursorLine).toBe(3);
+				expect(active?.cursorCol).toBe(1);
+			});
+		});
+
+		it("ignores unknown tab id", () => {
+			testInScope(() => {
+				expect(() => editorTabsStore.setCursor("nonexistent", 1, 1)).not.toThrow();
 			});
 		});
 	});

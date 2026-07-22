@@ -59,6 +59,43 @@ fn goto_editor_cmd(
     }
 }
 
+/// Build a Command for a JetBrains IDE launcher (idea, pycharm, webstorm, ...).
+/// JetBrains launchers use `--line`/`--column` goto syntax. Falls back to
+/// `open -a` on macOS when the CLI launcher isn't on PATH (the user hasn't
+/// enabled Toolbox shell scripts).
+fn jetbrains_cmd(
+    cli_name: &str,
+    #[cfg_attr(not(target_os = "macos"), allow(unused))] app_name: &str,
+    path: &str,
+    line: Option<u32>,
+    col: Option<u32>,
+) -> Command {
+    let resolved = resolve_cli(cli_name);
+    if resolved != cli_name || has_cli(cli_name) {
+        let mut c = Command::new(&resolved);
+        if let Some(l) = line {
+            c.arg("--line").arg(l.to_string());
+            if let Some(col) = col {
+                c.arg("--column").arg(col.to_string());
+            }
+        }
+        c.arg(path);
+        return c;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut c = Command::new("open");
+        c.arg("-a").arg(app_name).arg(path);
+        c
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let mut c = Command::new(cli_name);
+        c.arg(path);
+        c
+    }
+}
+
 /// Open a path in an IDE or application.
 /// `line` and `col` are optional and only used by editors that support them.
 #[cfg_attr(feature = "desktop", tauri::command)]
@@ -93,6 +130,20 @@ pub(crate) fn open_in_app(
             c.arg(&path);
             c
         }
+
+        // JetBrains IDEs — CLI launchers with --line/--column, `open -a` fallback on macOS
+        "intellij" => jetbrains_cmd("idea", "IntelliJ IDEA", &path, line, col),
+        "pycharm" => jetbrains_cmd("pycharm", "PyCharm", &path, line, col),
+        "webstorm" => jetbrains_cmd("webstorm", "WebStorm", &path, line, col),
+        "goland" => jetbrains_cmd("goland", "GoLand", &path, line, col),
+        "clion" => jetbrains_cmd("clion", "CLion", &path, line, col),
+        "phpstorm" => jetbrains_cmd("phpstorm", "PhpStorm", &path, line, col),
+        "rubymine" => jetbrains_cmd("rubymine", "RubyMine", &path, line, col),
+        "rider" => jetbrains_cmd("rider", "Rider", &path, line, col),
+        "datagrip" => jetbrains_cmd("datagrip", "DataGrip", &path, line, col),
+        "rustrover" => jetbrains_cmd("rustrover", "RustRover", &path, line, col),
+        "android-studio" => jetbrains_cmd("studio", "Android Studio", &path, line, col),
+        "fleet" => jetbrains_cmd("fleet", "Fleet", &path, line, col),
 
         // Terminal emulators with CLI (cross-platform)
         "kitty" => {
@@ -156,6 +207,16 @@ pub(crate) fn open_in_app(
             "warp" => {
                 let mut c = Command::new("open");
                 c.arg("-a").arg("Warp").arg(&path);
+                c
+            }
+            "iterm2" => {
+                let mut c = Command::new("open");
+                c.arg("-a").arg("iTerm").arg(&path);
+                c
+            }
+            "tower" => {
+                let mut c = Command::new("open");
+                c.arg("-a").arg("Tower").arg(&path);
                 c
             }
             "terminal" => {
@@ -266,6 +327,84 @@ pub(crate) fn open_in_app(
     Ok(())
 }
 
+/// Launch context for a custom tool: the paths and cursor position that feed
+/// the placeholder expander. `file` is the focused editor file (absent when no
+/// file is open); `repo` is the active repo/worktree root and acts as the
+/// fallback for `{path}`/`{file}`/`{fileDir}`/`{cwd}`.
+#[derive(serde::Deserialize)]
+pub(crate) struct LaunchContext {
+    /// Focused editor file. `None` → `{path}`/`{file}`/`{fileDir}` fall back to `repo`.
+    file: Option<String>,
+    /// Active repo/worktree root. Required; the universal fallback.
+    repo: String,
+    /// Focused terminal's working directory. `None` → `{cwd}` falls back to `repo`.
+    cwd: Option<String>,
+    line: Option<u32>,
+    col: Option<u32>,
+}
+
+/// Expand placeholders in a custom launcher's argument template:
+/// `{path}`/`{file}` (focused file, else repo), `{repo}`, `{fileDir}` (parent
+/// of the focused file, else repo), `{cwd}` (focused terminal cwd, else repo),
+/// `{home}` (user home), `{line}`/`{column}` (cursor, default 1 — e.g. when
+/// opening a folder — so editor goto args still resolve).
+pub(crate) fn expand_placeholders(args: &[String], ctx: &LaunchContext) -> Vec<String> {
+    let file = ctx.file.as_deref().unwrap_or(&ctx.repo);
+    let file_dir = ctx
+        .file
+        .as_deref()
+        .and_then(|f| std::path::Path::new(f).parent())
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| ctx.repo.clone());
+    let cwd = ctx.cwd.as_deref().unwrap_or(&ctx.repo);
+    let home = dirs::home_dir()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| {
+            tracing::warn!(
+                source = "agent",
+                "Home directory unresolvable; {{home}} placeholder expands to empty"
+            );
+            String::new()
+        });
+    let line_s = ctx.line.unwrap_or(1).to_string();
+    let col_s = ctx.col.unwrap_or(1).to_string();
+    args.iter()
+        .map(|a| {
+            a.replace("{path}", file)
+                .replace("{file}", file)
+                .replace("{repo}", &ctx.repo)
+                .replace("{fileDir}", &file_dir)
+                .replace("{cwd}", cwd)
+                .replace("{home}", &home)
+                .replace("{line}", &line_s)
+                .replace("{column}", &col_s)
+        })
+        .collect()
+}
+
+/// Launch a user-defined custom tool: spawn `executable` with the
+/// placeholder-expanded args. No shell parsing — args are passed verbatim, so
+/// paths with spaces are safe on every platform. `executable` may be a bare
+/// name (resolved on PATH) or an absolute path.
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub(crate) fn open_in_custom(
+    executable: String,
+    args: Vec<String>,
+    ctx: LaunchContext,
+) -> Result<(), String> {
+    if executable.trim().is_empty() {
+        return Err("Custom launcher has no executable".to_string());
+    }
+    // Drop blank lines from the args editor (textarea is one-arg-per-line).
+    let args: Vec<String> = args.into_iter().filter(|a| !a.trim().is_empty()).collect();
+    let expanded = expand_placeholders(&args, &ctx);
+    Command::new(resolve_cli(&executable))
+        .args(&expanded)
+        .spawn()
+        .map_err(|e| format!("Failed to launch {executable}: {e}"))?;
+    Ok(())
+}
+
 /// Detect installed IDE applications (cross-platform)
 #[cfg_attr(feature = "desktop", tauri::command)]
 pub(crate) fn detect_installed_ides() -> Vec<String> {
@@ -280,6 +419,19 @@ pub(crate) fn detect_installed_ides() -> Vec<String> {
         ("neovim", "nvim"),
         ("smerge", "smerge"),
         ("kitty", "kitty"),
+        // JetBrains CLI launchers (present when Toolbox shell scripts are enabled)
+        ("intellij", "idea"),
+        ("pycharm", "pycharm"),
+        ("webstorm", "webstorm"),
+        ("goland", "goland"),
+        ("clion", "clion"),
+        ("phpstorm", "phpstorm"),
+        ("rubymine", "rubymine"),
+        ("rider", "rider"),
+        ("datagrip", "datagrip"),
+        ("rustrover", "rustrover"),
+        ("android-studio", "studio"),
+        ("fleet", "fleet"),
     ];
     for (id, bin) in cli_tools {
         if has_cli(bin) {
@@ -301,10 +453,26 @@ pub(crate) fn detect_installed_ides() -> Vec<String> {
             ("github-desktop", "/Applications/GitHub Desktop.app"),
             ("fork", "/Applications/Fork.app"),
             ("gitkraken", "/Applications/GitKraken.app"),
+            ("tower", "/Applications/Tower.app"),
             ("ghostty", "/Applications/Ghostty.app"),
             ("wezterm", "/Applications/WezTerm.app"),
             ("alacritty", "/Applications/Alacritty.app"),
             ("warp", "/Applications/Warp.app"),
+            ("iterm2", "/Applications/iTerm.app"),
+            // JetBrains .app bundles (CLI symlinks may not be on PATH when
+            // launched from Finder; best-effort — Toolbox naming can vary)
+            ("intellij", "/Applications/IntelliJ IDEA.app"),
+            ("pycharm", "/Applications/PyCharm.app"),
+            ("webstorm", "/Applications/WebStorm.app"),
+            ("goland", "/Applications/GoLand.app"),
+            ("clion", "/Applications/CLion.app"),
+            ("phpstorm", "/Applications/PhpStorm.app"),
+            ("rubymine", "/Applications/RubyMine.app"),
+            ("rider", "/Applications/Rider.app"),
+            ("datagrip", "/Applications/DataGrip.app"),
+            ("rustrover", "/Applications/RustRover.app"),
+            ("android-studio", "/Applications/Android Studio.app"),
+            ("fleet", "/Applications/Fleet.app"),
         ];
         for (id, path) in app_bundles {
             if std::path::Path::new(path).exists() && !installed.contains(&id.to_string()) {
@@ -629,6 +797,58 @@ fn get_binary_version(path: &str) -> Option<String> {
     None
 }
 
+/// Whether an agent's CLI accepts a bare positional prompt as its first argument.
+///
+/// Only Claude's CLI does. codex/gemini/aider/goose require a subcommand or an
+/// explicit flag, and hand a bare prompt straight to their clap parser, which
+/// rejects it with a usage error and exits with code 2. Spawn paths use this to
+/// fail fast instead of launching a process that dies immediately with no report.
+pub(crate) fn agent_accepts_bare_prompt(agent_type: &str) -> bool {
+    agent_type == "claude"
+}
+
+/// Default spawn arguments (with a `{prompt}` placeholder) for an agent launched
+/// via MCP without an explicit run config. Mirrors the per-agent `spawnArgs` the
+/// frontend uses in `src/agents.ts` — the authoritative, shipped knowledge of
+/// each CLI's invocation. Lets `agent action=spawn agent_type=codex` work out of
+/// the box. Model/print flags are layered on separately by
+/// `merge_mcp_params_into_args`, so this only encodes the prompt-carrying shape.
+/// Returns `None` for agents we can't launch non-interactively (caller must pass
+/// explicit `args`).
+pub(crate) fn default_prompt_args(agent_type: &str) -> Option<Vec<String>> {
+    let args: &[&str] = match agent_type {
+        // Claude: bare positional prompt, submitted and run immediately.
+        // (Folded from the old dedicated spawn branch — story 092. Flag order
+        // is preserved by merge_mcp_params_into_args's claude flags-first rule.)
+        "claude" => &["{prompt}"],
+        // Positional prompt (interactive with the task pre-filled).
+        "gemini" | "codex" | "opencode" | "grok" | "amp" | "cursor" | "droid" => &["{prompt}"],
+        // Aider: non-interactive single message, auto-confirm edits.
+        "aider" => &["--yes-always", "--message", "{prompt}"],
+        // Goose: the `session` subcommand carries the prompt.
+        "goose" => &["session", "{prompt}"],
+        _ => return None,
+    };
+    Some(args.iter().map(|s| s.to_string()).collect())
+}
+
+/// Agents whose positional argv cannot carry the task for an orchestrated
+/// spawn (verified live, story 091):
+/// - codex 0.142: the positional prompt only PREFILLS the interactive TUI input
+///   without submitting — the child parks at its ready prompt forever.
+/// - opencode: the default positional is a PROJECT PATH (`opencode [project]`),
+///   so a prompt argv crashes it with ENAMETOOLONG; `opencode run` is one-shot.
+///
+/// For these agents the spawn path launches the bare TUI and delivers the
+/// initial prompt through the pending-injection path (bracketed-paste + CR
+/// split write) once the TUI reaches its first idle, unifying initial-task
+/// delivery with peer-message delivery. One-shot subcommands (`codex exec`,
+/// `opencode run`) are NOT an alternative here: they exit after the task,
+/// collapsing the persistent session an orchestrator needs to keep messaging.
+pub(crate) fn prompt_prefill_only(agent_type: &str) -> bool {
+    matches!(agent_type, "codex" | "opencode")
+}
+
 /// Detect claude binary location (legacy, delegates to detect_agent_binary)
 #[cfg_attr(feature = "desktop", tauri::command)]
 pub(crate) fn detect_claude_binary() -> Result<String, String> {
@@ -682,6 +902,7 @@ pub(crate) async fn spawn_agent(
 
     // Build agent command
     let mut cmd = CommandBuilder::new(&binary_path);
+    crate::pty::sanitize_pty_parent_env(&mut cmd);
 
     // If custom args are provided, use them directly
     if let Some(ref args) = agent_config.args {
@@ -786,6 +1007,63 @@ mod tests {
     // resolve_cli and extra_bin_dirs tests are now in cli.rs
 
     #[test]
+    fn only_claude_accepts_a_bare_prompt() {
+        assert!(agent_accepts_bare_prompt("claude"));
+        // Every other known agent CLI would exit with code 2 on a bare prompt.
+        for agent in ["codex", "gemini", "aider", "goose", "opencode", "amp"] {
+            assert!(
+                !agent_accepts_bare_prompt(agent),
+                "{agent} must not be treated as accepting a bare prompt"
+            );
+        }
+    }
+
+    #[test]
+    fn default_prompt_args_cover_known_agents() {
+        // Positional-prompt agents.
+        for agent in [
+            "gemini", "codex", "opencode", "grok", "amp", "cursor", "droid",
+        ] {
+            assert_eq!(
+                default_prompt_args(agent),
+                Some(vec!["{prompt}".to_string()]),
+                "{agent} should get a positional prompt template"
+            );
+        }
+        // Aider: non-interactive message with auto-confirm.
+        assert_eq!(
+            default_prompt_args("aider"),
+            Some(vec![
+                "--yes-always".to_string(),
+                "--message".to_string(),
+                "{prompt}".to_string()
+            ])
+        );
+        // Goose: session subcommand carries the prompt.
+        assert_eq!(
+            default_prompt_args("goose"),
+            Some(vec!["session".to_string(), "{prompt}".to_string()])
+        );
+        // Every template must contain the placeholder so substitution works.
+        for agent in ["gemini", "codex", "aider", "goose"] {
+            assert!(
+                default_prompt_args(agent)
+                    .unwrap()
+                    .iter()
+                    .any(|a| a.contains("{prompt}")),
+                "{agent} template must carry the {{prompt}} placeholder"
+            );
+        }
+        // Claude: folded into the table (story 092) — bare positional prompt.
+        assert_eq!(
+            default_prompt_args("claude"),
+            Some(vec!["{prompt}".to_string()])
+        );
+        // Unknown agents have no template → caller must pass explicit args.
+        assert_eq!(default_prompt_args("totally-unknown"), None);
+    }
+
+    #[test]
     fn test_detect_claude_binary() {
         // This test checks that detect_claude_binary returns a result
         // It may succeed or fail depending on whether claude is installed
@@ -800,5 +1078,112 @@ mod tests {
                 assert!(msg.contains("not found") || msg.contains("Install"));
             }
         }
+    }
+
+    fn ctx(
+        file: Option<&str>,
+        repo: &str,
+        cwd: Option<&str>,
+        line: Option<u32>,
+        col: Option<u32>,
+    ) -> LaunchContext {
+        LaunchContext {
+            file: file.map(str::to_string),
+            repo: repo.to_string(),
+            cwd: cwd.map(str::to_string),
+            line,
+            col,
+        }
+    }
+
+    #[test]
+    fn expand_placeholders_substitutes_path_and_location() {
+        let args = vec!["--goto".to_string(), "{file}:{line}:{column}".to_string()];
+        let out = expand_placeholders(
+            &args,
+            &ctx(Some("/repo/src/main.rs"), "/repo", None, Some(42), Some(7)),
+        );
+        assert_eq!(out, vec!["--goto", "/repo/src/main.rs:42:7"]);
+    }
+
+    #[test]
+    fn expand_placeholders_path_and_file_are_aliases() {
+        let args = vec!["{path}".to_string(), "{file}".to_string()];
+        let out = expand_placeholders(&args, &ctx(Some("/a/b"), "/a", None, None, None));
+        assert_eq!(out, vec!["/a/b", "/a/b"]);
+    }
+
+    #[test]
+    fn expand_placeholders_repo_filedir_and_cwd() {
+        let args = vec![
+            "{repo}".to_string(),
+            "{fileDir}".to_string(),
+            "{cwd}".to_string(),
+        ];
+        let out = expand_placeholders(
+            &args,
+            &ctx(
+                Some("/repo/src/main.rs"),
+                "/repo",
+                Some("/tmp/work"),
+                None,
+                None,
+            ),
+        );
+        assert_eq!(out, vec!["/repo", "/repo/src", "/tmp/work"]);
+    }
+
+    #[test]
+    fn expand_placeholders_no_file_falls_back_to_repo() {
+        // No focused file: {path}/{file}/{fileDir} all resolve to the repo root.
+        let args = vec![
+            "{path}".to_string(),
+            "{file}".to_string(),
+            "{fileDir}".to_string(),
+        ];
+        let out = expand_placeholders(&args, &ctx(None, "/proj", None, None, None));
+        assert_eq!(out, vec!["/proj", "/proj", "/proj"]);
+    }
+
+    #[test]
+    fn expand_placeholders_cwd_falls_back_to_repo() {
+        let args = vec!["{cwd}".to_string()];
+        let out = expand_placeholders(&args, &ctx(Some("/repo/f.rs"), "/repo", None, None, None));
+        assert_eq!(out, vec!["/repo"]);
+    }
+
+    #[test]
+    fn expand_placeholders_home_is_substituted() {
+        let args = vec!["{home}".to_string()];
+        let out = expand_placeholders(&args, &ctx(None, "/proj", None, None, None));
+        // Home resolves to a real path on the dev/CI machine — never left literal.
+        assert_ne!(out[0], "{home}");
+        assert!(!out[0].is_empty());
+    }
+
+    #[test]
+    fn expand_placeholders_defaults_line_col_to_one() {
+        // Opening a folder: no line/col → placeholders still resolve to 1.
+        let args = vec![
+            "{path}".to_string(),
+            "+{line}".to_string(),
+            "{column}".to_string(),
+        ];
+        let out = expand_placeholders(&args, &ctx(None, "/proj", None, None, None));
+        assert_eq!(out, vec!["/proj", "+1", "1"]);
+    }
+
+    #[test]
+    fn expand_placeholders_leaves_literals_untouched() {
+        let args = vec!["--wait".to_string(), "--reuse-window".to_string()];
+        let out = expand_placeholders(&args, &ctx(Some("/x"), "/x", None, Some(3), Some(1)));
+        assert_eq!(out, vec!["--wait", "--reuse-window"]);
+    }
+
+    #[test]
+    fn open_in_custom_rejects_empty_executable() {
+        let err = open_in_custom("  ".to_string(), vec![], ctx(None, "/x", None, None, None));
+        assert!(err.is_err());
+        assert!(err.unwrap_err().contains("no executable"));
     }
 }

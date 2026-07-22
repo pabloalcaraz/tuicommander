@@ -3,6 +3,7 @@ import { createStore, produce } from "solid-js/store";
 import type { AgentType } from "../agents";
 import { rpc } from "../transport";
 import type { TerminalMatch } from "../types";
+import { isPerfDebug } from "../utils/perfDebug";
 import { appLogger } from "./appLogger";
 
 /** Type of input being awaited */
@@ -28,6 +29,8 @@ export interface CommandBlock {
 
 /** Shell activity state: null=never had output, busy=producing output, idle=waiting for input, exited=process terminated */
 export type ShellState = "busy" | "idle" | "exited" | null;
+/** Authoritative task lifecycle from the backend; distinct from PTY activity. */
+export type AgentLifecycleState = "starting" | "working" | "awaiting_input" | "idle" | "completed" | null;
 
 const VALID_SHELL_STATES = new Set<string>(["busy", "idle", "exited"]);
 
@@ -50,11 +53,17 @@ export interface TerminalData {
 	unseen: boolean; // Terminal completed work while user wasn't viewing it
 	progress: number | null; // OSC 9;4 progress (0-100), null when inactive
 	shellState: ShellState;
+	/** Monotonic local event revision; prevents a stale session snapshot from overwriting PTY state. */
+	shellStateRevision: number;
+	agentState: AgentLifecycleState;
+	backgroundWork: boolean;
 	agentType: AgentType | null; // Detected foreground agent process (e.g. "claude")
+	agentLaunchCommand: string | null; // Run-config command used to launch (e.g. "c"), for accurate resume
 	pendingResumeCommand: string | null; // Set at restore time, consumed on first shell idle
 	pendingInitCommand: string | null; // Setup/run script to auto-execute on first shell idle
 	usageLimit: { percentage: number; limitType: string } | null; // Claude Code usage limit
 	lastDataAt: number | null; // Timestamp of last PTY output
+	idleSince: number | null; // Timestamp when shellState transitioned to idle
 	lastPrompt: string | null; // Last relevant user prompt (>= 10 words), set by Rust
 	agentIntent: string | null; // LLM-declared intent via intent: token
 	currentTask: string | null; // Current agent task from status-line parsing (e.g. "Reading files")
@@ -66,8 +75,11 @@ export interface TerminalData {
 	suggestDismissed: boolean; // true after user dismissed/selected/typed — resets on shell-state:idle
 	commandBlocks: CommandBlock[]; // Completed command blocks from OSC 133
 	activeBlock: CommandBlock | null; // Current in-progress block (A received, D not yet)
+	lastCommandExecAt: number | null; // Timestamp of last OSC 133 "C" (real command execution); monotonic, never evicted — used to gate completion against prompt-redraw/wake false-busy
 	foldedBlocks: Set<number>; // promptLine values of folded blocks
+	userPromptLines: number[]; // Absolute lines where the user submitted a prompt (UserInput.line), for the green scrollbar marker
 	alias: string | null; // Human-friendly alias from Rust (e.g. "tc-1")
+	standby: boolean; // Session is SIGSTOP'd (auto-standby)
 }
 
 /** Fields auto-populated with defaults when creating a terminal — callers only provide the remaining fields. */
@@ -78,12 +90,17 @@ type TerminalCreateData = Omit<
 	| "unseen"
 	| "progress"
 	| "shellState"
+	| "shellStateRevision"
+	| "agentState"
+	| "backgroundWork"
 	| "nameIsCustom"
 	| "agentType"
+	| "agentLaunchCommand"
 	| "pendingResumeCommand"
 	| "pendingInitCommand"
 	| "usageLimit"
 	| "lastDataAt"
+	| "idleSince"
 	| "lastPrompt"
 	| "agentIntent"
 	| "currentTask"
@@ -96,9 +113,19 @@ type TerminalCreateData = Omit<
 	| "awaitingInputConfident"
 	| "commandBlocks"
 	| "activeBlock"
+	| "lastCommandExecAt"
 	| "foldedBlocks"
+	| "userPromptLines"
 	| "alias"
-> & { tuicSession?: string | null; isRemote?: boolean; agentType?: AgentType | null; agentSessionId?: string | null };
+	| "standby"
+> & {
+	tuicSession?: string | null;
+	isRemote?: boolean;
+	nameIsCustom?: boolean;
+	agentType?: AgentType | null;
+	agentSessionId?: string | null;
+	agentLaunchCommand?: string | null;
+};
 
 /** Terminal component ref interface */
 export interface TerminalRef {
@@ -124,6 +151,8 @@ export interface TerminalRef {
 	scrollPages: (pages: number) => void;
 	/** Read buffer lines between two absolute line indices (exclusive end) */
 	getBufferLines: (startLine: number, endLine: number) => string[] | Promise<string[]>;
+	/** Paste text into the terminal, applying bracketed paste wrapping based on terminal state */
+	paste: (text: string) => void;
 }
 
 /** Combined terminal state */
@@ -137,6 +166,8 @@ interface TerminalsStoreState {
 	activeId: string | null;
 	/** Last non-null activeId — survives tab switches so non-terminal UI can find the right terminal. */
 	lastActiveId: string | null;
+	/** The terminal that was active before the current one — powers "return to last terminal" toggle. */
+	previousActiveId: string | null;
 	counter: number;
 	/** Tabs currently detached to floating windows: tabId → window label */
 	detachedWindows: Record<string, string>;
@@ -147,12 +178,21 @@ interface TerminalsStoreState {
 /** Debounce hold time: how long isBusy() stays true after shellState goes idle */
 const BUSY_HOLD_MS = 2000;
 
+/** Once a confident question was last (re)detected this long ago while the
+ *  terminal is still busy (producing output), treat the prompt as answered and
+ *  clear the awaiting badge. Ink menus repaint and re-emit the question, which
+ *  refreshes this timer; a statically-waiting prompt leaves the terminal idle,
+ *  so it is never cleared. Backstops the user-input clear (Terminal.tsx) for
+ *  inputs that don't go through a real keystroke (channel/MCP prompts). */
+const SUSTAINED_BUSY_CLEAR_MS = 2500;
+
 /** Create the terminals store */
 function createTerminalsStore() {
 	const [state, setState] = createStore<TerminalsStoreState>({
 		terminals: {},
 		activeId: null,
 		lastActiveId: null,
+		previousActiveId: null,
 		counter: 0,
 		detachedWindows: {},
 		debouncedBusy: {},
@@ -167,12 +207,63 @@ function createTerminalsStore() {
 	const busySinceMap = new Map<string, number>();
 	const busyDurationMap = new Map<string, number>();
 	const cooldownTimers = new Map<string, ReturnType<typeof setTimeout>>();
+	// Per-terminal timer clearing a stale confident question — see SUSTAINED_BUSY_CLEAR_MS.
+	const staleQuestionTimers = new Map<string, ReturnType<typeof setTimeout>>();
+	function cancelStaleQuestionTimer(id: string): void {
+		const t = staleQuestionTimers.get(id);
+		if (t != null) {
+			clearTimeout(t);
+			staleQuestionTimers.delete(id);
+		}
+	}
 	const busyToIdleCallbacks: Array<(id: string, durationMs: number) => void> = [];
 	const idleToBusyCallbacks: Array<(id: string) => void> = [];
 	const onRemoveCallbacks: Array<(id: string) => void> = [];
+	const shellExitCallbacks: Array<(id: string) => void> = [];
 	// Tracks which terminals have completed their initial shell startup (reached idle at least once).
 	// Used to distinguish "busy from .zshrc startup" from "busy from a user-launched process".
 	const reachedIdleSet = new Set<string>();
+
+	// OSC133 block-completed batching: during burst replay (e.g. session restore),
+	// hundreds of D markers arrive in a single event loop tick. Buffer completed
+	// blocks and flush once per animation frame to avoid N separate setState calls.
+	const _osc133Pending = new Map<string, CommandBlock[]>();
+	const _osc133FlushTimers = new Map<string, number>();
+	const MAX_BLOCKS = 500;
+
+	function _scheduleOsc133Flush(id: string): void {
+		if (_osc133FlushTimers.has(id)) return;
+		_osc133FlushTimers.set(
+			id,
+			requestAnimationFrame(() => {
+				_osc133FlushTimers.delete(id);
+				const pending = _osc133Pending.get(id);
+				if (!pending?.length) return;
+				_osc133Pending.delete(id);
+				// Defence-in-depth: never write to a removed terminal — setState on a
+				// missing key would resurrect it as a ghost entry.
+				if (!(id in state.terminals)) return;
+				batch(() => {
+					setState("terminals", id, "commandBlocks", (prev) => {
+						const next = [...prev, ...pending];
+						if (next.length <= MAX_BLOCKS) return next;
+						const evicted = next.slice(0, next.length - MAX_BLOCKS);
+						const evictedLines = new Set(evicted.map((b) => b.promptLine));
+						setState("terminals", id, "foldedBlocks", (folds) => {
+							const cleaned = new Set(folds);
+							for (const line of evictedLines) cleaned.delete(line);
+							return cleaned;
+						});
+						return next.slice(-MAX_BLOCKS);
+					});
+				});
+				appLogger.debug(
+					"terminal",
+					`[OSC133] ${id} flushed ${pending.length} blocks, total=${state.terminals[id]?.commandBlocks.length ?? 0}`,
+				);
+			}) as unknown as number,
+		);
+	}
 
 	/** Guard: check terminal exists before mutating. SolidJS setState creates keys
 	 *  implicitly — calling setState("terminals", id, ...) on a removed terminal
@@ -195,6 +286,7 @@ function createTerminalsStore() {
 				appLogger.debug("terminal", `[ShellDebounce] ${id} cooldown cancelled (re-entered busy)`);
 			}
 			setState("debouncedBusy", id, true);
+			setState("terminals", id, "idleSince", null);
 			if (!hadCooldown) {
 				busySinceMap.set(id, Date.now());
 				for (const cb of idleToBusyCallbacks) cb(id);
@@ -202,16 +294,22 @@ function createTerminalsStore() {
 			busyDurationMap.delete(id);
 			// Error state is NOT cleared here: API errors are persistent and should only
 			// be cleared by explicit agent activity (status-line, user-input) or process exit.
-			// Question state IS cleared: idle→busy means the agent resumed work, so any
-			// pending question notification is stale. False-positive idle→busy oscillations
-			// from spinner ticks are suppressed upstream in Rust (spinner suppression).
-			if (prev === "idle" && state.terminals[id]?.awaitingInput) {
+			// Low-confidence question state IS cleared: idle→busy means the agent resumed
+			// work, so any pending (heuristic) question notification is stale.
+			// CONFIDENT questions are preserved (awaitingInputConfident): a confident prompt
+			// like an Ink "Enter to select" menu stays awaiting even while the TUI repaints
+			// (cursor blink, animation, scrollbar) — those repaints oscillate idle→busy and
+			// would otherwise wrongly clear a genuine interactive prompt. Confident questions
+			// instead clear on real user-input (Terminal.tsx), process exit (below), or
+			// sustained busy with no re-detection (setAwaitingInput / SUSTAINED_BUSY_CLEAR_MS).
+			if (prev === "idle" && state.terminals[id]?.awaitingInput && !state.terminals[id]?.awaitingInputConfident) {
 				setState("terminals", id, "awaitingInput", null);
 				setState("terminals", id, "awaitingInputConfident", false);
 			}
 		} else if (next === "idle" && prev !== "busy") {
 			// Direct null→idle (e.g. Rust sync on tab switch) — mark startup complete
 			reachedIdleSet.add(id);
+			if (!state.terminals[id]?.idleSince) setState("terminals", id, "idleSince", Date.now());
 		} else if (next === null && state.terminals[id]?.awaitingInput) {
 			// Process exit (shellState reset to null) — clear any stuck error/question
 			// badge so the next session doesn't inherit stale state from the last child.
@@ -220,11 +318,14 @@ function createTerminalsStore() {
 		} else if (next !== "busy" && prev === "busy") {
 			// First idle marks shell startup as complete
 			if (next === "idle") reachedIdleSet.add(id);
+			setState("terminals", id, "idleSince", Date.now());
 			// Leaving busy: freeze duration, start cooldown
 			const since = busySinceMap.get(id);
 			const duration = since != null ? Date.now() - since : 0;
 			busyDurationMap.set(id, duration);
-			appLogger.debug("terminal", `[ShellDebounce] ${id} busy→idle cooldown=${BUSY_HOLD_MS}ms dur=${duration}ms`);
+			if (isPerfDebug()) {
+				appLogger.debug("terminal", `[ShellDebounce] ${id} busy→idle cooldown=${BUSY_HOLD_MS}ms dur=${duration}ms`);
+			}
 
 			const timer = setTimeout(() => {
 				cooldownTimers.delete(id);
@@ -276,6 +377,7 @@ function createTerminalsStore() {
 		);
 		busySinceMap.delete(id);
 		busyDurationMap.delete(id);
+		cancelStaleQuestionTimer(id);
 	}
 
 	const actions = {
@@ -289,12 +391,17 @@ function createTerminalsStore() {
 				unseen: false,
 				progress: null,
 				shellState: null,
+				shellStateRevision: 0,
+				agentState: null,
+				backgroundWork: false,
 				nameIsCustom: false,
 				agentType: null,
+				agentLaunchCommand: null,
 				pendingResumeCommand: null,
 				pendingInitCommand: null,
 				usageLimit: null,
 				lastDataAt: null,
+				idleSince: null,
 				lastPrompt: null,
 				agentIntent: null,
 				currentTask: null,
@@ -307,8 +414,11 @@ function createTerminalsStore() {
 				awaitingInputConfident: false,
 				commandBlocks: [],
 				activeBlock: null,
+				lastCommandExecAt: null,
 				foldedBlocks: new Set<number>(),
+				userPromptLines: [],
 				alias: null,
+				standby: false,
 				...data,
 			});
 			if (data.sessionId) sessionToTerminal.set(data.sessionId, id);
@@ -323,12 +433,17 @@ function createTerminalsStore() {
 				unseen: false,
 				progress: null,
 				shellState: null,
+				shellStateRevision: 0,
+				agentState: null,
+				backgroundWork: false,
 				nameIsCustom: false,
 				agentType: null,
+				agentLaunchCommand: null,
 				pendingResumeCommand: null,
 				pendingInitCommand: null,
 				usageLimit: null,
 				lastDataAt: null,
+				idleSince: null,
 				lastPrompt: null,
 				agentIntent: null,
 				currentTask: null,
@@ -341,8 +456,11 @@ function createTerminalsStore() {
 				awaitingInputConfident: false,
 				commandBlocks: [],
 				activeBlock: null,
+				lastCommandExecAt: null,
 				foldedBlocks: new Set<number>(),
+				userPromptLines: [],
 				alias: null,
+				standby: false,
 				...data,
 			});
 			if (data.sessionId) sessionToTerminal.set(data.sessionId, id);
@@ -358,6 +476,12 @@ function createTerminalsStore() {
 			if (sessionId) sessionToTerminal.delete(sessionId);
 			cleanupBusyState(id);
 			lastDataAtMap.delete(id);
+			// Cancel any pending OSC 133 flush so its rAF callback can't fire after
+			// removal and resurrect a ghost terminal entry via setState("terminals", id, ...).
+			const osc133Raf = _osc133FlushTimers.get(id);
+			if (osc133Raf != null) cancelAnimationFrame(osc133Raf);
+			_osc133FlushTimers.delete(id);
+			_osc133Pending.delete(id);
 			for (const cb of onRemoveCallbacks) cb(id);
 			setState(
 				produce((s) => {
@@ -368,6 +492,9 @@ function createTerminalsStore() {
 					}
 					if (s.lastActiveId === id) {
 						s.lastActiveId = null;
+					}
+					if (s.previousActiveId === id) {
+						s.previousActiveId = null;
 					}
 				}),
 			);
@@ -387,6 +514,11 @@ function createTerminalsStore() {
 					setState("terminals", id, "activity", false);
 					setState("terminals", id, "unseen", false);
 					setState("lastActiveId", id);
+					// Remember the terminal we're leaving so "return to last terminal"
+					// can toggle back to it (and back again on the next press).
+					if (prevId && prevId !== id) {
+						setState("previousActiveId", prevId);
+					}
 				}
 				setState("activeId", id);
 			});
@@ -409,6 +541,22 @@ function createTerminalsStore() {
 					const prev = state.terminals[id]?.shellState ?? null;
 					const next = data.shellState ?? null;
 					if (prev !== next) handleShellStateChange(id, prev, next);
+					setState("terminals", id, "shellStateRevision", (revision) => revision + 1);
+				}
+				// Agent exited back to a plain shell (agentType set→null). Any pending
+				// question/error was the agent's — a shell can't be "awaiting input" on
+				// its behalf, and nothing else clears it: Ctrl+C emits no UserInput, the
+				// PTY shell never "exits" (so the shellState→null clear never fires), and
+				// confident questions deliberately survive idle→busy. A stale badge would
+				// otherwise stick forever and hijack repo-switch routing (useGitOperations
+				// prefers a tab with awaitingInput). Parallels the process-exit clear above.
+				if ("agentType" in data) {
+					const prevAgent = state.terminals[id]?.agentType ?? null;
+					const nextAgent = data.agentType ?? null;
+					if (prevAgent !== null && nextAgent === null && state.terminals[id]?.awaitingInput) {
+						setState("terminals", id, "awaitingInput", null);
+						setState("terminals", id, "awaitingInputConfident", false);
+					}
 				}
 				// Keep sessionToTerminal reverse map in sync: callers that pass sessionId
 				// via update() would otherwise desync the map and break plugin filtering
@@ -418,6 +566,13 @@ function createTerminalsStore() {
 					if (prev) sessionToTerminal.delete(prev);
 					const next = data.sessionId ?? null;
 					if (next) sessionToTerminal.set(next, id);
+					if (!next) {
+						// Lifecycle is scoped to a live backend session. Clearing it here
+						// prevents an exited agent tab from retaining a stale Working badge
+						// after it can no longer appear in the next session-list snapshot.
+						setState("terminals", id, "agentState", null);
+						setState("terminals", id, "backgroundWork", false);
+					}
 				}
 				setState("terminals", id, data);
 			});
@@ -472,7 +627,8 @@ function createTerminalsStore() {
 					// without a D marker (e.g. Ctrl+C), finalize it first.
 					if (term.activeBlock) {
 						const completed: CommandBlock = { ...term.activeBlock, endedAt: now };
-						setState("terminals", id, "commandBlocks", (prev) => [...prev, completed]);
+						_osc133Pending.get(id)?.push(completed) ?? _osc133Pending.set(id, [completed]);
+						_scheduleOsc133Flush(id);
 					}
 					setState("terminals", id, "activeBlock", {
 						promptLine: line,
@@ -495,6 +651,10 @@ function createTerminalsStore() {
 					if (term.activeBlock) {
 						setState("terminals", id, "activeBlock", { ...term.activeBlock, executionLine: line });
 					}
+					// Record that a real command executed (not a bare prompt redraw).
+					// Monotonic and never evicted, so onBusyToIdle can tell genuine work
+					// apart from sleep/wake / prompt-redraw false-busy.
+					setState("terminals", id, "lastCommandExecAt", now);
 					break;
 				}
 				case "D": {
@@ -505,30 +665,27 @@ function createTerminalsStore() {
 							exitCode: exitCode ?? null,
 							endedAt: now,
 						};
-						const MAX_BLOCKS = 500;
-						batch(() => {
-							setState("terminals", id, "commandBlocks", (prev) => {
-								const next = [...prev, completed];
-								if (next.length <= MAX_BLOCKS) return next;
-								const evicted = next.slice(0, next.length - MAX_BLOCKS);
-								const evictedLines = new Set(evicted.map((b) => b.promptLine));
-								setState("terminals", id, "foldedBlocks", (folds) => {
-									const cleaned = new Set(folds);
-									for (const line of evictedLines) cleaned.delete(line);
-									return cleaned;
-								});
-								return next.slice(-MAX_BLOCKS);
-							});
-							setState("terminals", id, "activeBlock", null);
-						});
-						appLogger.debug(
-							"terminal",
-							`[OSC133] ${id} block completed, exit=${exitCode ?? "?"}, blocks=${term.commandBlocks.length + 1}`,
-						);
+						_osc133Pending.get(id)?.push(completed) ?? _osc133Pending.set(id, [completed]);
+						_scheduleOsc133Flush(id);
+						setState("terminals", id, "activeBlock", null);
 					}
 					break;
 				}
 			}
+		},
+
+		/** Record an absolute line where the user submitted a prompt (UserInput.line
+		 *  from the OSC 7770 state=busy transition). Drives the green scrollbar marker.
+		 *  Ignores negative lines (keystroke-reconstructed UserInput has no grid row)
+		 *  and dedups consecutive repeats (a prompt redraw can re-fire busy on the same
+		 *  row). Capped at MAX_BLOCKS, mirroring commandBlocks eviction. */
+		addUserPromptLine(id: string, line: number): void {
+			if (!has(id) || line < 0) return;
+			setState("terminals", id, "userPromptLines", (prev) => {
+				if (prev[prev.length - 1] === line) return prev;
+				const next = [...prev, line];
+				return next.length > MAX_BLOCKS ? next.slice(-MAX_BLOCKS) : next;
+			});
 		},
 
 		toggleBlockFold(id: string, promptLine: number): void {
@@ -562,11 +719,32 @@ function createTerminalsStore() {
 				setState("terminals", id, "awaitingInput", type);
 				setState("terminals", id, "awaitingInputConfident", confident);
 			});
+			// Arm/refresh the sustained-busy clear for confident questions. Each fresh
+			// detection (e.g. an Ink menu repaint) refreshes the timer; if detections
+			// stop while the terminal keeps producing output, the prompt was answered
+			// and the badge would otherwise stay stuck — so clear it.
+			cancelStaleQuestionTimer(id);
+			if (type === "question" && confident) {
+				staleQuestionTimers.set(
+					id,
+					setTimeout(() => {
+						staleQuestionTimers.delete(id);
+						if (state.terminals[id]?.awaitingInputConfident && state.terminals[id]?.shellState === "busy") {
+							batch(() => {
+								setState("terminals", id, "awaitingInput", null);
+								setState("terminals", id, "awaitingInputConfident", false);
+							});
+							appLogger.debug("terminal", `[Awaiting] ${id} confident question cleared — sustained busy, no re-detect`);
+						}
+					}, SUSTAINED_BUSY_CLEAR_MS),
+				);
+			}
 		},
 
 		/** Clear terminal awaiting input state */
 		clearAwaitingInput(id: string): void {
 			if (!has(id)) return;
+			cancelStaleQuestionTimer(id);
 			batch(() => {
 				setState("terminals", id, "awaitingInput", null);
 				setState("terminals", id, "awaitingInputConfident", false);
@@ -605,6 +783,12 @@ function createTerminalsStore() {
 		/** Get active terminal */
 		getActive(): TerminalState | undefined {
 			return state.activeId ? state.terminals[state.activeId] : undefined;
+		},
+
+		/** The terminal that was active before the current one, if it still exists. */
+		getPreviousActiveId(): string | null {
+			const id = state.previousActiveId;
+			return id && state.terminals[id] ? id : null;
 		},
 
 		/** Find the best terminal with an active PTY session: active > lastActive > any. */
@@ -692,6 +876,24 @@ function createTerminalsStore() {
 			};
 		},
 
+		/** Register a callback fired when a plain interactive shell (no agent) exits.
+		 *  App wires this to close the tab — a dead shell shouldn't linger as a
+		 *  grey "exited" dot. Agent sessions are NOT routed here; they keep the tab. */
+		onShellExit(callback: (id: string) => void): () => void {
+			shellExitCallbacks.push(callback);
+			return () => {
+				const idx = shellExitCallbacks.indexOf(callback);
+				if (idx >= 0) shellExitCallbacks.splice(idx, 1);
+			};
+		},
+
+		/** Fire the shell-exit callbacks for a terminal whose plain shell ended.
+		 *  Called by Terminal.tsx's pty-exit handler (the single owner of local
+		 *  session-exit handling). */
+		notifyShellExit(id: string): void {
+			for (const cb of shellExitCallbacks) cb(id);
+		},
+
 		/** Mark a tab as detached to a floating window */
 		detach(tabId: string, windowLabel: string): void {
 			setState("detachedWindows", tabId, windowLabel);
@@ -725,6 +927,11 @@ function createTerminalsStore() {
 		/** Read last PTY output timestamp (non-reactive, for ActivityDashboard) */
 		getLastDataAt(id: string): number | null {
 			return lastDataAtMap.get(id) ?? state.terminals[id]?.lastDataAt ?? null;
+		},
+
+		/** Revision of the last shell-state event for snapshot freshness checks. */
+		getShellStateRevision(id: string): number | null {
+			return state.terminals[id]?.shellStateRevision ?? null;
 		},
 
 		/** Flush all pending lastDataAt values to the reactive store */

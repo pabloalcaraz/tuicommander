@@ -7,8 +7,19 @@
 use dashmap::DashMap;
 use serde::Serialize;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, mpsc};
+
+/// Process-global chat registry. Mirrors `conversation_engine::ACTIVE_CONVERSATIONS`
+/// so both the desktop Tauri commands and the browser WebSocket bridge reach the
+/// same instance (the axum side only has `Arc<AppState>`, not Tauri managed state).
+static CHAT_REGISTRY: LazyLock<ChatRegistry> = LazyLock::new(ChatRegistry::new);
+
+/// Accessor for the process-global chat registry.
+pub(crate) fn chat_registry() -> &'static ChatRegistry {
+    &CHAT_REGISTRY
+}
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -60,30 +71,47 @@ pub struct SubscribeResult {
 // Internal types
 // ---------------------------------------------------------------------------
 
-const MAX_MESSAGES: usize = 100;
+/// Capacity of a WebSocket subscriber's buffer. Chat streams burst at 20+
+/// events/sec; this absorbs short renderer stalls. If it ever fills, the sink
+/// is treated as dead and GC'd — non-blocking, mirroring the Tauri Channel.
+const WS_SINK_BUFFER: usize = 256;
 
-#[cfg(feature = "desktop")]
-struct Subscriber {
-    id: SubscriptionId,
-    channel: tauri::ipc::Channel<ChatEvent>,
-}
-
-struct ChatSlot {
-    state: ConversationState,
+/// A subscriber's delivery sink. Both variants are non-blocking and cheaply
+/// cloneable (so fan-out can send outside the slot lock); a failed send means
+/// the subscriber is gone (disconnected) and gets garbage-collected.
+#[derive(Clone)]
+#[allow(dead_code)] // WS fan-out scaffold: only reached via fan_out() (see note there).
+enum ChatSink {
+    /// Desktop in-process Tauri IPC channel.
     #[cfg(feature = "desktop")]
-    subscribers: Vec<Subscriber>,
+    Channel(tauri::ipc::Channel<ChatEvent>),
+    /// Browser/PWA WebSocket bridge (event-bridge plan Step 4).
+    Ws(mpsc::Sender<ChatEvent>),
 }
 
-#[cfg(not(feature = "desktop"))]
-impl ChatSlot {
-    fn new() -> Self {
-        Self {
-            state: ConversationState::default(),
+impl ChatSink {
+    /// Non-blocking send. Returns false if the subscriber has disconnected.
+    #[allow(dead_code)] // WS fan-out scaffold: only reached via fan_out() (see note there).
+    fn send(&self, event: ChatEvent) -> bool {
+        match self {
+            #[cfg(feature = "desktop")]
+            ChatSink::Channel(c) => c.send(event).is_ok(),
+            ChatSink::Ws(tx) => tx.try_send(event).is_ok(),
         }
     }
 }
 
-#[cfg(feature = "desktop")]
+struct Subscriber {
+    id: SubscriptionId,
+    #[allow(dead_code)] // Read only by ChatSink::send via fan_out() (WS scaffold).
+    sink: ChatSink,
+}
+
+struct ChatSlot {
+    state: ConversationState,
+    subscribers: Vec<Subscriber>,
+}
+
 impl ChatSlot {
     fn new() -> Self {
         Self {
@@ -142,45 +170,14 @@ impl ChatRegistry {
             .clone()
     }
 
-    /// Take a snapshot of the current conversation state.
-    #[allow(dead_code)]
-    pub async fn snapshot(&self, chat_id: &str) -> ConversationStateSnapshot {
-        let slot = self.get_or_create(chat_id);
-        let guard = slot.lock().await;
-        guard.state.snapshot()
-    }
-
-    /// Mutate conversation state via a closure and return the new snapshot.
-    #[allow(dead_code)]
-    pub async fn update<F>(&self, chat_id: &str, f: F) -> ConversationStateSnapshot
-    where
-        F: FnOnce(&mut ConversationState),
-    {
-        let slot = self.get_or_create(chat_id);
-        let mut guard = slot.lock().await;
-        f(&mut guard.state);
-        // Cap messages
-        if guard.state.messages.len() > MAX_MESSAGES {
-            let excess = guard.state.messages.len() - MAX_MESSAGES;
-            guard.state.messages.drain(..excess);
-        }
-        guard.state.snapshot()
-    }
-
-    #[cfg(feature = "desktop")]
-    /// Subscribe a Channel to receive events for a chat.
-    /// Returns the subscription ID and a snapshot of the current state
-    /// (taken under the same lock to prevent races).
-    pub async fn subscribe(
-        &self,
-        chat_id: &str,
-        channel: tauri::ipc::Channel<ChatEvent>,
-    ) -> SubscribeResult {
+    /// Register a sink as a subscriber, returning its ID and a snapshot of the
+    /// current state (taken under the same lock to prevent a snapshot/fan-out race).
+    async fn push_subscriber(&self, chat_id: &str, sink: ChatSink) -> SubscribeResult {
         let slot = self.get_or_create(chat_id);
         let mut guard = slot.lock().await;
         let id = self.next_sub_id.fetch_add(1, Ordering::Relaxed);
         let snapshot = guard.state.snapshot();
-        guard.subscribers.push(Subscriber { id, channel });
+        guard.subscribers.push(Subscriber { id, sink });
         SubscribeResult {
             subscription_id: id,
             snapshot,
@@ -188,6 +185,28 @@ impl ChatRegistry {
     }
 
     #[cfg(feature = "desktop")]
+    /// Subscribe a Tauri IPC Channel to receive events for a chat (desktop).
+    pub async fn subscribe(
+        &self,
+        chat_id: &str,
+        channel: tauri::ipc::Channel<ChatEvent>,
+    ) -> SubscribeResult {
+        self.push_subscriber(chat_id, ChatSink::Channel(channel))
+            .await
+    }
+
+    /// Subscribe a WebSocket sink (event-bridge plan Step 4). Returns the
+    /// subscribe result (id + snapshot) plus the receiver the WS bridge drains.
+    /// On WS close the bridge calls `unsubscribe(chat_id, subscription_id)`.
+    pub async fn subscribe_ws(
+        &self,
+        chat_id: &str,
+    ) -> (SubscribeResult, mpsc::Receiver<ChatEvent>) {
+        let (tx, rx) = mpsc::channel(WS_SINK_BUFFER);
+        let result = self.push_subscriber(chat_id, ChatSink::Ws(tx)).await;
+        (result, rx)
+    }
+
     /// Remove a subscriber by ID.
     pub async fn unsubscribe(&self, chat_id: &str, sub_id: SubscriptionId) {
         if let Some(slot) = self.chats.get(chat_id) {
@@ -198,11 +217,15 @@ impl ChatRegistry {
 
     /// Fan-out an event to all subscribers of a chat.
     ///
-    /// **Critical invariant:** `channel.send()` is called **outside** the slot
-    /// mutex. We clone the subscriber handles under the lock, drop it, then
-    /// send. Dead channels (send returns Err) are garbage-collected via a
-    /// short re-lock.
-    #[cfg(feature = "desktop")]
+    /// **Critical invariant:** the sink send is called **outside** the slot
+    /// mutex. We clone the (cheap) sink handles under the lock, drop it, then
+    /// send. Dead sinks (send returns false) are garbage-collected via a short
+    /// re-lock.
+    // DEFERRED (2026-07-07) — no production caller since the streaming push
+    // methods (append_streaming_chunk/clear) were removed as dead code. Kept as
+    // the WS fan-out primitive for the event-bridge streaming path; wire a
+    // producer or remove this scaffold once the streaming design lands.
+    #[allow(dead_code)]
     pub async fn fan_out(&self, chat_id: &str, event: ChatEvent) {
         let slot = match self.chats.get(chat_id) {
             Some(s) => s.clone(),
@@ -210,12 +233,12 @@ impl ChatRegistry {
         };
 
         // Step 1: clone subscriber handles under lock
-        let subs: Vec<(SubscriptionId, tauri::ipc::Channel<ChatEvent>)> = {
+        let subs: Vec<(SubscriptionId, ChatSink)> = {
             let guard = slot.lock().await;
             guard
                 .subscribers
                 .iter()
-                .map(|s| (s.id, s.channel.clone()))
+                .map(|s| (s.id, s.sink.clone()))
                 .collect()
         };
         // Lock is dropped here
@@ -226,8 +249,8 @@ impl ChatRegistry {
 
         // Step 2: send outside lock, collect dead IDs
         let mut dead_ids = Vec::new();
-        for (id, channel) in &subs {
-            if channel.send(event.clone()).is_err() {
+        for (id, sink) in &subs {
+            if !sink.send(event.clone()) {
                 dead_ids.push(*id);
             }
         }
@@ -238,82 +261,13 @@ impl ChatRegistry {
             guard.subscribers.retain(|s| !dead_ids.contains(&s.id));
         }
     }
-
-    /// No-op fan-out when desktop feature is disabled (no IPC subscribers).
-    #[cfg(not(feature = "desktop"))]
-    pub async fn fan_out(&self, _chat_id: &str, _event: ChatEvent) {}
-
-    /// Convenience: update state + fan_out a Snapshot event.
-    #[allow(dead_code)]
-    pub async fn update_and_notify<F>(&self, chat_id: &str, f: F)
-    where
-        F: FnOnce(&mut ConversationState),
-    {
-        let snap = self.update(chat_id, f).await;
-        self.fan_out(chat_id, ChatEvent::Snapshot(snap)).await;
-    }
-
-    /// Append a message to the chat.
-    #[allow(dead_code)]
-    pub async fn append_message(&self, chat_id: &str, msg: ChatMessage) {
-        self.update_and_notify(chat_id, |s| {
-            s.messages.push(msg);
-        })
-        .await;
-    }
-
-    /// Update streaming text (append delta) and fan-out a Chunk event.
-    #[allow(dead_code)]
-    pub async fn append_streaming_chunk(&self, chat_id: &str, delta: &str) {
-        {
-            let slot = self.get_or_create(chat_id);
-            let mut guard = slot.lock().await;
-            guard.state.streaming_text.push_str(delta);
-        }
-        self.fan_out(
-            chat_id,
-            ChatEvent::Chunk {
-                delta: delta.to_string(),
-            },
-        )
-        .await;
-    }
-
-    /// Clear conversation state and notify subscribers.
-    #[allow(dead_code)]
-    pub async fn clear(&self, chat_id: &str) {
-        self.update(chat_id, |s| {
-            s.messages.clear();
-            s.is_streaming = false;
-            s.streaming_text.clear();
-            s.error = None;
-        })
-        .await;
-        self.fan_out(chat_id, ChatEvent::Cleared).await;
-    }
-
-    /// Number of active chats (for testing/debug).
-    #[allow(dead_code)]
-    pub fn chat_count(&self) -> usize {
-        self.chats.len()
-    }
-
-    /// Number of subscribers for a chat (for testing/debug).
-    #[cfg(feature = "desktop")]
-    #[allow(dead_code)]
-    pub async fn subscriber_count(&self, chat_id: &str) -> usize {
-        match self.chats.get(chat_id) {
-            Some(slot) => slot.lock().await.subscribers.len(),
-            None => 0,
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
 // Tauri commands
 // ---------------------------------------------------------------------------
 
-fn validate_id(id: &str) -> Result<(), String> {
+pub(crate) fn validate_id(id: &str) -> Result<(), String> {
     if id.is_empty() || id.len() > 64 {
         return Err("ID must be 1-64 characters".to_string());
     }
@@ -329,23 +283,21 @@ fn validate_id(id: &str) -> Result<(), String> {
 #[cfg(feature = "desktop")]
 #[tauri::command]
 pub(crate) async fn chat_subscribe(
-    registry: tauri::State<'_, ChatRegistry>,
     chat_id: String,
     on_event: tauri::ipc::Channel<ChatEvent>,
 ) -> Result<SubscribeResult, String> {
     validate_id(&chat_id)?;
-    Ok(registry.subscribe(&chat_id, on_event).await)
+    Ok(chat_registry().subscribe(&chat_id, on_event).await)
 }
 
 #[cfg(feature = "desktop")]
 #[tauri::command]
 pub(crate) async fn chat_unsubscribe(
-    registry: tauri::State<'_, ChatRegistry>,
     chat_id: String,
     subscription_id: SubscriptionId,
 ) -> Result<(), String> {
     validate_id(&chat_id)?;
-    registry.unsubscribe(&chat_id, subscription_id).await;
+    chat_registry().unsubscribe(&chat_id, subscription_id).await;
     Ok(())
 }
 
@@ -370,18 +322,6 @@ impl ConversationState {
     pub fn push_message(&mut self, msg: ChatMessage) {
         self.messages.push(msg);
     }
-    #[allow(dead_code)]
-    pub fn messages(&self) -> &[ChatMessage] {
-        &self.messages
-    }
-    #[allow(dead_code)]
-    pub fn streaming_text(&self) -> &str {
-        &self.streaming_text
-    }
-    #[allow(dead_code)]
-    pub fn is_streaming(&self) -> bool {
-        self.is_streaming
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -391,119 +331,6 @@ impl ConversationState {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn make_msg(role: &str, content: &str) -> ChatMessage {
-        ChatMessage {
-            role: role.to_string(),
-            content: content.to_string(),
-            timestamp: 0,
-        }
-    }
-
-    #[tokio::test]
-    async fn test_get_or_create_returns_empty_state() {
-        let registry = ChatRegistry::new();
-        let snap = registry.snapshot("chat-1").await;
-        assert!(snap.messages.is_empty());
-        assert!(!snap.is_streaming);
-        assert!(snap.streaming_text.is_empty());
-        assert!(snap.error.is_none());
-        assert!(snap.attached_session_id.is_none());
-        assert!(!snap.pinned);
-    }
-
-    #[tokio::test]
-    async fn test_append_message_and_cap() {
-        let registry = ChatRegistry::new();
-        for i in 0..110 {
-            let snap = registry
-                .update("chat-1", |s| {
-                    s.push_message(make_msg("user", &format!("msg-{i}")));
-                })
-                .await;
-            if i < MAX_MESSAGES - 1 {
-                assert_eq!(snap.messages.len(), i + 1);
-            }
-        }
-        let snap = registry.snapshot("chat-1").await;
-        assert_eq!(snap.messages.len(), MAX_MESSAGES);
-        assert_eq!(snap.messages[0].content, "msg-10");
-        assert_eq!(snap.messages[MAX_MESSAGES - 1].content, "msg-109");
-    }
-
-    #[tokio::test]
-    async fn test_update_streaming_text_concurrent() {
-        let registry = Arc::new(ChatRegistry::new());
-        let mut handles = Vec::new();
-        for i in 0..10 {
-            let reg = registry.clone();
-            handles.push(tokio::spawn(async move {
-                reg.update("chat-1", |s| {
-                    s.streaming_text.push_str(&format!("chunk-{i}"));
-                })
-                .await;
-            }));
-        }
-        for h in handles {
-            h.await.unwrap();
-        }
-        let snap = registry.snapshot("chat-1").await;
-        // All 10 chunks should be present (order may vary)
-        for i in 0..10 {
-            assert!(
-                snap.streaming_text.contains(&format!("chunk-{i}")),
-                "Missing chunk-{i} in: {}",
-                snap.streaming_text
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn test_snapshot_serializable() {
-        let registry = ChatRegistry::new();
-        registry
-            .update("chat-1", |s| {
-                s.push_message(make_msg("user", "hello"));
-                s.is_streaming = true;
-                s.streaming_text = "partial".to_string();
-                s.pinned = true;
-            })
-            .await;
-        let snap = registry.snapshot("chat-1").await;
-        let json = serde_json::to_string(&snap).unwrap();
-        assert!(json.contains("\"isStreaming\":true"));
-        assert!(json.contains("\"pinned\":true"));
-        assert!(json.contains("\"role\":\"user\""));
-    }
-
-    #[tokio::test]
-    async fn test_clear_resets_state() {
-        let registry = ChatRegistry::new();
-        registry
-            .update("chat-1", |s| {
-                s.push_message(make_msg("user", "hello"));
-                s.is_streaming = true;
-                s.streaming_text = "partial".to_string();
-                s.error = Some("oops".to_string());
-            })
-            .await;
-        registry.clear("chat-1").await;
-        let snap = registry.snapshot("chat-1").await;
-        assert!(snap.messages.is_empty());
-        assert!(!snap.is_streaming);
-        assert!(snap.streaming_text.is_empty());
-        assert!(snap.error.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_chat_count() {
-        let registry = ChatRegistry::new();
-        assert_eq!(registry.chat_count(), 0);
-        registry.snapshot("a").await;
-        assert_eq!(registry.chat_count(), 1);
-        registry.snapshot("b").await;
-        assert_eq!(registry.chat_count(), 2);
-    }
 
     #[tokio::test]
     async fn test_chat_event_serialization() {
@@ -557,58 +384,23 @@ mod tests {
         assert_eq!(id2, id1 + 1);
     }
 
-    #[tokio::test]
-    async fn test_append_streaming_chunk() {
-        let registry = ChatRegistry::new();
-        // Prepare a chat in streaming mode
-        registry
-            .update("chat-1", |s| {
-                s.set_streaming(true);
-            })
-            .await;
-        registry.append_streaming_chunk("chat-1", "hello ").await;
-        registry.append_streaming_chunk("chat-1", "world").await;
-        let snap = registry.snapshot("chat-1").await;
-        assert_eq!(snap.streaming_text, "hello world");
+    #[test]
+    fn test_attach_detach_terminal() {
+        let mut state = ConversationState::default();
+        state.set_attached_session_id(Some("sess-42".to_string()));
+        assert_eq!(state.attached_session_id.as_deref(), Some("sess-42"));
+
+        state.set_attached_session_id(None);
+        assert!(state.attached_session_id.is_none());
     }
 
-    #[tokio::test]
-    async fn test_attach_detach_terminal() {
-        let registry = ChatRegistry::new();
-        registry
-            .update("chat-1", |s| {
-                s.set_attached_session_id(Some("sess-42".to_string()));
-            })
-            .await;
-        let snap = registry.snapshot("chat-1").await;
-        assert_eq!(snap.attached_session_id.as_deref(), Some("sess-42"));
+    #[test]
+    fn test_set_pinned() {
+        let mut state = ConversationState::default();
+        state.set_pinned(true);
+        assert!(state.pinned);
 
-        registry
-            .update("chat-1", |s| {
-                s.set_attached_session_id(None);
-            })
-            .await;
-        let snap = registry.snapshot("chat-1").await;
-        assert!(snap.attached_session_id.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_set_pinned() {
-        let registry = ChatRegistry::new();
-        registry
-            .update("chat-1", |s| {
-                s.set_pinned(true);
-            })
-            .await;
-        let snap = registry.snapshot("chat-1").await;
-        assert!(snap.pinned);
-
-        registry
-            .update("chat-1", |s| {
-                s.set_pinned(false);
-            })
-            .await;
-        let snap = registry.snapshot("chat-1").await;
-        assert!(!snap.pinned);
+        state.set_pinned(false);
+        assert!(!state.pinned);
     }
 }

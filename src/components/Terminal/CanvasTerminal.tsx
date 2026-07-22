@@ -1,33 +1,38 @@
 import { type Component, createEffect, createSignal, onCleanup, onMount } from "solid-js";
+import { lastMenuActionTime } from "../../menuDedup";
 import { isMacOS, isWindows } from "../../platform";
 import { pluginRegistry } from "../../plugins/pluginRegistry";
 import { appLogger } from "../../stores/appLogger";
 import { settingsStore } from "../../stores/settings";
 import { terminalsStore } from "../../stores/terminals";
 import { filterMatchesToBlock } from "../../utils/blockSearchFilter";
+import { writeClipboard } from "../../utils/clipboard";
 import { formatRelativeTime } from "../../utils/formatRelativeTime";
+import { ensureKeyboardViewportTracking, keyboardOcclusion } from "../../utils/keyboardViewport";
 import { handleOpenUrl } from "../../utils/openUrl";
+import { isPerfDebug } from "../../utils/perfDebug";
+import { markPerf, noteFrameRequest } from "../../utils/perfTrace";
+import { ContextMenu, createContextMenu } from "../ContextMenu/ContextMenu";
 import { installTouchHandlers } from "./canvasTerminalTouch";
 import { createTransport, type TerminalTransport } from "./canvasTerminalTransport";
 import {
-	ATTR_BOLD,
-	ATTR_DEFAULT_BG,
-	ATTR_DEFAULT_FG,
-	ATTR_DIM,
-	ATTR_INVERSE,
-	ATTR_ITALIC,
-	ATTR_STRIKEOUT,
-	ATTR_UNDERLINE,
 	type CellMetrics,
 	type CursorShape,
 	computeCursorRect,
 	type DecodedFrame,
+	type DecodedRow,
+	decideFrameGrid,
 	decodeBinaryFrame,
+	decodeStyledRange,
 	GUTTER_PX,
-	SCROLLBAR_PX,
+	gridDimsForBox,
+	reconcileDelay,
+	shouldFireReconcile,
 	snapLineHeight,
 } from "./canvasTerminalUtils";
+import { installFrameTimingDebugHook, isFrameTimingEnabled, recordFrameTiming, resetFrameTiming } from "./frameTiming";
 import { acquireCache, getSharedMetrics, invalidateGlyphCache, releaseCache } from "./glyphCache";
+import { createGridRenderer, type GridRenderer } from "./gridRenderer";
 import { kittySequenceForKey } from "./kittyKeyboard";
 import { filePathRegex, fileUrlRegex } from "./linkProvider";
 import { continuationRowsAfterSuggest, isSuggestBlock } from "./suggestOverlay";
@@ -45,6 +50,8 @@ export interface CanvasTerminalRef {
 	searchNext: () => { index: number; count: number };
 	searchPrev: () => { index: number; count: number };
 	searchClear: () => void;
+	/** Paste text with correct bracketed paste wrapping based on current terminal state */
+	paste: (text: string) => void;
 }
 
 export interface CanvasTerminalProps {
@@ -75,11 +82,37 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 	let scrollThumbRef!: HTMLDivElement;
 	let overlayRef!: HTMLDivElement;
 	let containerRef!: HTMLDivElement;
+	// Smooth-scroll stage: wraps base + overlay canvases and gets a transient
+	// translateY during a scroll gesture (snaps back to 0 on a line boundary).
+	let stageRef!: HTMLDivElement;
+	// Wraps the stage; gets a translateY to slide ONLY this terminal up so the
+	// cursor stays visible above the on-screen keyboard on touch devices. Clipped
+	// by containerRef's overflow:hidden; independent of the stage's scroll transform.
+	let kbLiftRef!: HTMLDivElement;
+	// Behind the base canvas: paints only the one row above and one below the
+	// viewport, revealed as the stage slides. Never used for hit-testing.
+	let overscanCanvasRef!: HTMLCanvasElement;
 	let ctx!: CanvasRenderingContext2D;
 	let octx!: CanvasRenderingContext2D;
+	let octxOverscan: CanvasRenderingContext2D | null = null;
+	let overscanRenderer: GridRenderer | null = null;
+	// Client-side styled-row cache for smooth scroll, keyed by the backend's
+	// eviction-stable absolute row index (`historyBase + grid-relative`, where
+	// historyBase counts lines already dropped from the history top). A physical line
+	// keeps its key for life — even once the scrollback cap rotates — so a cached row
+	// can never alias onto a different line and ghost/duplicate during a scroll.
+	// `requestedChunks` dedupes background range prefetches.
+	const rowCache = new Map<number, DecodedRow>();
+	const requestedChunks = new Set<number>();
+	const ROW_CACHE_CHUNK = 64;
+	const ROW_CACHE_MAX = 6000;
+	// Base-grid renderer (the canvas2d paint implementation). Created in onMount
+	// once ctx exists.
+	let gridRenderer!: GridRenderer;
 
 	const [metrics, setMetrics] = createSignal<CellMetrics | null>(null);
 	const [focused, setFocused] = createSignal(false);
+	const isTouchDevice = navigator.maxTouchPoints > 0 || "ontouchstart" in window;
 	let currentFrame: DecodedFrame | null = null;
 	let lastDisplayOffset = -1;
 	let lastScreenRows = -1;
@@ -88,14 +121,23 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 	let activeSearchIndex = -1;
 	let cursorBlinkOn = true;
 	let blinkInterval: ReturnType<typeof setInterval> | undefined;
+	let blinkResetAt = 0;
 	let unsubscribe: (() => void) | undefined;
 	let resizeObserver: ResizeObserver | undefined;
 	let visibilityObserver: IntersectionObserver | undefined;
 	let lastResizeCols = 0;
 	let lastResizeRows = 0;
+	// Scrollbar track height (= canvas logical height), cached at remeasure so the
+	// per-frame scroll path never reads scrollbarRef.clientHeight (a layout-forcing
+	// read — same class as the documented getBoundingClientRect-per-frame P1).
+	let scrollbarTrackHeight = 0;
 	let transport: TerminalTransport | undefined;
 	let invokeRef: ((cmd: string, args: Record<string, unknown>) => Promise<unknown>) | undefined;
 	let rafId: number | undefined;
+	// Render-scheduling stamp: when a repaint is first requested, the gap to the rAF
+	// callback is the "sched" metric — scheduling latency under CPU load (0 = no
+	// pending request). Gated by isFrameTimingEnabled().
+	let mainDirtySince = 0;
 	let resizeDebounce: ReturnType<typeof setTimeout> | undefined;
 	let dprMediaQuery: MediaQueryList | undefined;
 	let dprChangeHandler: (() => void) | undefined;
@@ -113,6 +155,12 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 	let cachedSelectionText = "";
 	let selectionScrollTimer: ReturnType<typeof setInterval> | null = null;
 	let selectionScrollDelta = 0;
+	// Selection-drag coalescing (#9b13): cache the canvas rect once per drag and
+	// collapse the repaint burst into one paint per frame via rAF — mirrors the
+	// scroll/resize coalescing so raw mousemoves don't force a gBCR + full paint each.
+	let selectionDragRect: DOMRect | null = null;
+	let selectionRafId: number | undefined;
+	let lastSelectionEvent: MouseEvent | null = null;
 
 	// Link detection
 	const linkCache = new Map<
@@ -129,14 +177,44 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 		spans?: { row: number; colStart: number; colEnd: number }[];
 	} | null = null;
 	const detectedLinks = new Map<number, { colStart: number; colEnd: number }[]>();
+	// Spans of links that span soft-wrapped rows (web + file://), keyed by row.
+	// scanRowForLinks() merges these each time it rebuilds a row's dashed-underline
+	// spans, so multi-row underlines survive the per-frame rebuild at line ~1367.
+	// Recomputed by verifyVisibleFileLinks(); cleared with detectedLinks so it
+	// can't paint stale rows after a scroll/resize.
+	const wrappedLinkSpans = new Map<number, { colStart: number; colEnd: number }[]>();
+	function clearDetectedLinks() {
+		detectedLinks.clear();
+		wrappedLinkSpans.clear();
+	}
+
+	// Link context menu: right-clicking a detected link offers Open / Copy link.
+	// TUIC is UI-first — opening a link (e.g. a markdown file) is a primary action,
+	// so plain left-click still opens; this menu adds a non-destructive way to copy
+	// the target without opening it.
+	type LinkTarget = { path: string; line?: number; col?: number };
+	const linkMenu = createContextMenu();
+	const [linkMenuTarget, setLinkMenuTarget] = createSignal<LinkTarget | null>(null);
+
+	const openLink = (link: LinkTarget) => {
+		if (link.path.startsWith("http://") || link.path.startsWith("https://")) {
+			handleOpenUrl(link.path);
+		} else {
+			const path = link.path.startsWith("file://") ? link.path.slice(7) : link.path;
+			props.onOpenFilePath?.(path, link.line, link.col);
+		}
+	};
+
+	const copyLink = (link: LinkTarget) => {
+		const text = link.path.startsWith("file://") ? link.path.slice(7) : link.path;
+		writeClipboard(text).catch(() => {});
+	};
 
 	// Cached CSS custom properties (re-read on remeasure, not every frame)
 	let cachedBgDefault = "#1e1e1e";
 	let cachedFgDefault = "#d4d4d4";
 
-	// Pixel scroll accumulator: shared by wheel + touch handlers.
-	// Accumulates raw pixel delta; when it crosses cellHeight, emits a line scroll to backend.
-	let scrollAccumPx = 0;
+	// Tracks cumulative gesture distance (px) to ramp the scroll acceleration factor.
 	let scrollGestureDistPx = 0;
 
 	// Row index → row data lookup (persistent, updated incrementally)
@@ -148,31 +226,6 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 	let hidden = false;
 	let lastHistorySize = -1;
 
-	// Memoized color strings: pack RGB into u32 key → "rgb(r,g,b)" string
-	const colorStringCache = new Map<number, string>();
-	function cachedRgbString(r: number, g: number, b: number): string {
-		const key = (r << 16) | (g << 8) | b;
-		let s = colorStringCache.get(key);
-		if (s === undefined) {
-			s = `rgb(${r},${g},${b})`;
-			colorStringCache.set(key, s);
-		}
-		return s;
-	}
-
-	// Memoized font style strings: pack attrs into a key → font string
-	const fontStyleCache = new Map<string, string>();
-	function cachedFontStyle(italic: boolean, bold: boolean, fontSize: number, fontFamily: string): string {
-		const weight = bold ? "bold" : settingsStore.state.fontWeight;
-		const key = `${italic ? "i" : ""}${weight}${fontSize}${fontFamily}`;
-		let s = fontStyleCache.get(key);
-		if (s === undefined) {
-			s = `${italic ? "italic " : ""}${weight} ${fontSize}px ${fontFamily}`;
-			fontStyleCache.set(key, s);
-		}
-		return s;
-	}
-
 	function writePtyNoScroll(data: string) {
 		invokeRef?.("write_pty", { sessionId: props.sessionId, data }).catch((e) => {
 			appLogger.warn("terminal", "PTY write failed", { sessionId: props.sessionId, error: e });
@@ -180,6 +233,9 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 	}
 
 	function writePty(data: string) {
+		// Typing jumps to the bottom — abandon any in-flight smooth scroll gesture so
+		// its transient transform/cache render doesn't fight the programmatic jump.
+		resetSmoothScroll();
 		if (currentFrame && currentFrame.displayOffset > 0) {
 			invokeRef?.("terminal_scroll", { sessionId: props.sessionId, delta: -currentFrame.displayOffset }).catch(
 				ipcErr("terminal_scroll"),
@@ -189,7 +245,20 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 	}
 
 	function scheduleRepaint() {
-		if (rafId !== undefined || hidden || !alive) return;
+		// A smooth-scroll gesture owns the base canvas (rendered locally from cache);
+		// don't let backend-frame repaints fight it until the gesture settles.
+		if (scrollPosF != null) {
+			return;
+		}
+		if (rafId !== undefined) return;
+		if (hidden) {
+			return;
+		}
+		if (!alive) return;
+		// Stamp the first repaint request of this cycle ("sched" — see decl).
+		if (mainDirtySince === 0 && isFrameTimingEnabled()) {
+			mainDirtySince = performance.now();
+		}
 		rafId = requestAnimationFrame(() => {
 			rafId = undefined;
 			if (!alive || hidden) return;
@@ -197,8 +266,17 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 			if (currentFrame && m) {
 				const dirty = pendingDirtyRows.size > 0 ? new Set(pendingDirtyRows) : undefined;
 				pendingDirtyRows.clear();
+				const timing = isFrameTimingEnabled();
+				// "sched": request->rAF-callback delay — scheduling latency / vsync rAF priority.
+				if (timing && mainDirtySince) {
+					recordFrameTiming(props.sessionId, "sched", performance.now() - mainDirtySince);
+				}
+				// "paint": the base grid paint cost.
+				const paintT0 = timing ? performance.now() : 0;
 				paintFrame(currentFrame, m, dirty);
+				if (timing) recordFrameTiming(props.sessionId, "paint", performance.now() - paintT0);
 			}
+			mainDirtySince = 0;
 		});
 	}
 
@@ -233,10 +311,10 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 		}
 	}
 
-	function canvasToGrid(e: MouseEvent): { col: number; row: number } {
+	function canvasToGrid(e: MouseEvent, cachedRect?: DOMRect): { col: number; row: number } {
 		const m = metrics();
 		if (!m) return { col: 0, row: 0 };
-		const rect = canvasRef.getBoundingClientRect();
+		const rect = cachedRect ?? canvasRef.getBoundingClientRect();
 		const x = e.clientX - rect.left - GUTTER_PX;
 		const y = e.clientY - rect.top;
 		const maxCol = Math.max(0, Math.floor((rect.width - GUTTER_PX) / m.cellWidth) - 1);
@@ -275,25 +353,61 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 		setMetrics(m);
 
 		cachedBgDefault = getComputedStyle(canvasRef).getPropertyValue("--bg-secondary").trim() || "#1e1e1e";
-		cachedFgDefault = getComputedStyle(canvasRef).getPropertyValue("--text-primary").trim() || "#d4d4d4";
+		cachedFgDefault = getComputedStyle(canvasRef).getPropertyValue("--fg-primary").trim() || "#d4d4d4";
+		gridRenderer.setTheme(cachedBgDefault, cachedFgDefault);
 
-		const cols = Math.floor((rect.width - GUTTER_PX - SCROLLBAR_PX) / m.cellWidth);
-		const rows = Math.floor(rect.height / m.cellHeight);
+		const { rows, cols } = gridDimsForBox(rect.width, rect.height, m.cellWidth, m.cellHeight);
 		if (cols <= 0 || rows <= 0) return;
+		// A resize invalidates the smooth-scroll geometry (cell metrics, overscan,
+		// row cache). Cancel any in-flight gesture so the new geometry takes over
+		// cleanly. Cheap no-op when no gesture is active (scrollPosF already null).
+		resetSmoothScroll();
 		const logicalW = cols * m.cellWidth + GUTTER_PX;
 		const logicalH = rows * m.cellHeight;
+		// Cache the scrollbar track height here (resize time) so the per-frame path
+		// uses this instead of reading scrollbarRef.clientHeight every frame.
+		scrollbarTrackHeight = logicalH;
 		canvasRef.width = logicalW * dpr;
 		canvasRef.height = logicalH * dpr;
-		canvasRef.style.width = `${logicalW}px`;
-		canvasRef.style.height = `${logicalH}px`;
 		ctx.scale(dpr, dpr);
 		ctx.translate(GUTTER_PX, 0);
+		canvasRef.style.width = `${logicalW}px`;
+		canvasRef.style.height = `${logicalH}px`;
 		overlayCanvasRef.width = logicalW * dpr;
 		overlayCanvasRef.height = logicalH * dpr;
 		overlayCanvasRef.style.width = `${logicalW}px`;
 		overlayCanvasRef.style.height = `${logicalH}px`;
 		octx.scale(dpr, dpr);
 		octx.translate(GUTTER_PX, 0);
+
+		// Overscan canvas (smooth scroll): one extra row above and below the viewport.
+		// Positioned -cellHeight so its drawing y=0 maps to the row just above the
+		// viewport; the row below is drawn at (rows+1)*cellHeight.
+		if (overscanCanvasRef) {
+			const overscanH = logicalH + 2 * m.cellHeight;
+			overscanCanvasRef.width = logicalW * dpr;
+			overscanCanvasRef.height = overscanH * dpr;
+			overscanCanvasRef.style.width = `${logicalW}px`;
+			overscanCanvasRef.style.height = `${overscanH}px`;
+			overscanCanvasRef.style.top = `${-m.cellHeight}px`;
+			if (!octxOverscan) {
+				octxOverscan = overscanCanvasRef.getContext("2d", { alpha: true });
+				if (octxOverscan) {
+					overscanRenderer = createGridRenderer(octxOverscan, {
+						fontWeight: () => settingsStore.state.fontWeight,
+						getFontFamily: () => settingsStore.getFontFamily(),
+					});
+				}
+			}
+			if (octxOverscan && overscanRenderer) {
+				octxOverscan.setTransform(1, 0, 0, 1, 0, 0);
+				octxOverscan.scale(dpr, dpr);
+				octxOverscan.translate(GUTTER_PX, 0);
+				overscanRenderer.setTheme(cachedBgDefault, cachedFgDefault);
+			}
+			rowCache.clear();
+			requestedChunks.clear();
+		}
 		if (
 			cols > 0 &&
 			rows > 0 &&
@@ -306,7 +420,7 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 			lastResizeRows = rows;
 
 			rowMap.clear();
-			detectedLinks.clear();
+			clearDetectedLinks();
 			fullRepaintNeeded = true;
 			lastDisplayOffset = -1;
 			invokeRef("resize_pty", { sessionId: props.sessionId, rows, cols }).catch(ipcErr("resize_pty"));
@@ -319,29 +433,10 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 	}
 
 	function paintFrame(frame: DecodedFrame, m: CellMetrics, dirtyIndices?: Set<number>) {
-		const w = canvasRef.width / m.dpr;
-		const fontFamily = settingsStore.getFontFamily();
+		gridRenderer.paintGrid(rowMap, m, { fullRepaint: fullRepaintNeeded, dirtyIndices });
+		fullRepaintNeeded = false;
 
-		if (fullRepaintNeeded || !dirtyIndices) {
-			// Full repaint: clear canvas + paint all rows (include gutter area)
-			const h = canvasRef.height / m.dpr;
-			ctx.fillStyle = cachedBgDefault;
-			ctx.fillRect(-GUTTER_PX, 0, w, h);
-			for (const [, row] of rowMap) {
-				paintRow(row, row.index * m.cellHeight, m, fontFamily);
-			}
-			fullRepaintNeeded = false;
-		} else {
-			// Incremental: repaint only dirty text rows (overlay handles cursor/selection/search)
-			for (const idx of dirtyIndices) {
-				const y = idx * m.cellHeight;
-				ctx.fillStyle = cachedBgDefault;
-				ctx.fillRect(-GUTTER_PX, y, w, m.cellHeight);
-				const row = rowMap.get(idx);
-				if (row) paintRow(row, y, m, fontFamily);
-			}
-		}
-
+		// Overlay (cursor/selection/search/links/scrollbar/suggest) always stays on main.
 		repaintOverlay(frame, m);
 
 		updateScrollbar(frame);
@@ -433,7 +528,10 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 
 	function absRowToViewport(absRow: number): number | null {
 		if (!currentFrame) return null;
-		const viewportTop = currentFrame.historySize - currentFrame.displayOffset;
+		// During a smooth-scroll gesture the base is cache-rendered at overlayScrollOffset
+		// (the backend frame lags), so map overlay rows against that same offset.
+		const offset = overlayScrollOffset ?? currentFrame.displayOffset;
+		const viewportTop = currentFrame.historySize - offset;
 		const viewportRow = absRow - viewportTop;
 		if (viewportRow < 0 || viewportRow >= (currentFrame.screenRows || lastResizeRows)) return null;
 		return viewportRow;
@@ -522,13 +620,16 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 		octx.font = `${fontSize}px ${fontFamily}`;
 		octx.fillStyle = "rgba(150,150,150,0.5)";
 		const canvasW = overlayCanvasRef.width / m.dpr;
+		let lastLabelBottom = -Infinity;
 		for (const block of all) {
 			const vpRow = absRowToViewport(block.promptLine);
 			if (vpRow === null) continue;
 			const y = vpRow * m.cellHeight;
+			if (y < lastLabelBottom) continue;
 			const label = formatRelativeTime(Date.now() - block.startedAt);
 			const tw = octx.measureText(label).width;
 			octx.fillText(label, canvasW - tw - 8, y + m.cellHeight * 0.75);
+			lastLabelBottom = y + m.cellHeight;
 		}
 	}
 
@@ -542,7 +643,12 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 		for (let absRi = absStartRow; absRi <= absEndRow; absRi++) {
 			const vpRow = absRowToViewport(absRi);
 			if (vpRow === null) continue;
-			const row = rowMap.get(vpRow);
+			// During a gesture rows come from the cache (keyed by the eviction-stable
+			// all-time index = historyBase + grid-relative abs); at rest from the live
+			// rowMap (keyed by viewport row). `absRi` is the grid-relative selection
+			// coordinate, so bridge it into the cache's space with historyBase.
+			const row =
+				overlayScrollOffset != null ? rowCache.get((currentFrame?.historyBase ?? 0) + absRi) : rowMap.get(vpRow);
 			if (!row) continue;
 			const y = vpRow * m.cellHeight;
 
@@ -619,28 +725,11 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 		return lines.join("\n");
 	}
 
-	function resolveFg(fgP: number, bgP: number, a: number, defaultColor: string): string {
-		if (a & ATTR_INVERSE) {
-			return a & ATTR_DEFAULT_BG ? defaultColor : cachedRgbString((bgP >> 16) & 0xff, (bgP >> 8) & 0xff, bgP & 0xff);
-		}
-		return a & ATTR_DEFAULT_FG ? defaultColor : cachedRgbString((fgP >> 16) & 0xff, (fgP >> 8) & 0xff, fgP & 0xff);
-	}
-
-	function resolveBg(fgP: number, bgP: number, a: number, defaultColor: string): string {
-		if (a & ATTR_INVERSE) {
-			return a & ATTR_DEFAULT_FG ? defaultColor : cachedRgbString((fgP >> 16) & 0xff, (fgP >> 8) & 0xff, fgP & 0xff);
-		}
-		return a & ATTR_DEFAULT_BG ? defaultColor : cachedRgbString((bgP >> 16) & 0xff, (bgP >> 8) & 0xff, bgP & 0xff);
-	}
-
-	function buildFontStyle(a: number, fontSize: number, fontFamily: string): string {
-		return cachedFontStyle((a & ATTR_ITALIC) !== 0, (a & ATTR_BOLD) !== 0, fontSize, fontFamily);
-	}
-
 	function paintCursor(frame: DecodedFrame, m: CellMetrics) {
 		if (frame.displayOffset > 0) return;
 		if (!frame.cursorVisible) return;
-		if (!cursorBlinkOn && focused()) return;
+		if (!focused()) return;
+		if (!cursorBlinkOn) return;
 
 		const settingShape: CursorShape =
 			settingsStore.state.cursorStyle === "block"
@@ -650,13 +739,6 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 					: "beam";
 		const shape: CursorShape = frame.cursorShape !== "block" ? frame.cursorShape : settingShape;
 		const rect = computeCursorRect(shape, frame.cursorRow, frame.cursorCol, m);
-
-		if (!focused()) {
-			octx.strokeStyle = cachedFgDefault;
-			octx.lineWidth = 1;
-			octx.strokeRect(rect.x + 0.5, rect.y + 0.5, rect.w - 1, rect.h - 1);
-			return;
-		}
 
 		octx.fillStyle = cachedFgDefault;
 		octx.fillRect(rect.x, rect.y, rect.w, rect.h);
@@ -668,12 +750,23 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 				const cp = row.codepoints[col];
 				if (cp !== 0 && cp !== 0x20) {
 					const fontFamily = settingsStore.getFontFamily();
-					octx.font = buildFontStyle(row.attrs[col], m.fontSize, fontFamily);
+					octx.font = gridRenderer.buildFontStyle(row.attrs[col], m.fontSize, fontFamily);
 					octx.fillStyle = cachedBgDefault;
 					octx.fillText(String.fromCodePoint(cp), rect.x, frame.cursorRow * m.cellHeight + m.baseline);
 				}
 			}
 		}
+
+		syncImePosition(frame.cursorRow, frame.cursorCol, m);
+	}
+
+	function syncImePosition(row: number, col: number, m: CellMetrics) {
+		const x = GUTTER_PX + col * m.cellWidth;
+		const y = row * m.cellHeight;
+		keyInputRef.style.left = `${x}px`;
+		keyInputRef.style.top = `${y}px`;
+		keyInputRef.style.height = `${m.cellHeight}px`;
+		keyInputRef.style.fontSize = `${m.fontSize}px`;
 	}
 
 	// --- Scrollbar ---
@@ -681,8 +774,9 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 	function updateScrollbar(frame: DecodedFrame) {
 		if (!scrollbarRef || !scrollThumbRef) return;
 		const total = frame.historySize + (frame.screenRows || lastResizeRows || 24);
-		const m = metrics();
-		const visible = m ? lastResizeRows || Math.floor(canvasRef.clientHeight / m.cellHeight) : (lastResizeRows || 24);
+		// visible rows = the authoritative resize row count — no per-frame
+		// canvasRef.clientHeight read (layout-forcing).
+		const visible = lastResizeRows || 24;
 
 		if (frame.historySize === 0) {
 			scrollbarRef.style.display = "none";
@@ -690,9 +784,11 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 		}
 		scrollbarRef.style.display = "block";
 
+		// Track height comes from the resize-time cache, not scrollbarRef.clientHeight.
+		const trackH = scrollbarTrackHeight;
 		const thumbRatio = Math.min(1, visible / total);
-		const thumbHeight = Math.max(20, scrollbarRef.clientHeight * thumbRatio);
-		const scrollRange = scrollbarRef.clientHeight - thumbHeight;
+		const thumbHeight = Math.max(20, trackH * thumbRatio);
+		const scrollRange = trackH - thumbHeight;
 		const scrollPos = frame.historySize > 0 ? (1 - frame.displayOffset / frame.historySize) * scrollRange : scrollRange;
 
 		scrollThumbRef.style.height = `${thumbHeight}px`;
@@ -715,16 +811,37 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 		const term = terminalsStore.get(props.terminalId);
 		if (!term) return;
 		const blocks = term.commandBlocks;
-		const key = `${blocks.length}:${totalRows}:${blocks[blocks.length - 1]?.exitCode ?? ""}`;
+		const promptLines = term.userPromptLines;
+		const searchCount = searchMatches.length;
+		const showBlocks = blockTimestampsVisible;
+		const key = `${showBlocks ? blocks.length : 0}:${showBlocks ? promptLines.length : 0}:${totalRows}:${showBlocks ? (blocks[blocks.length - 1]?.exitCode ?? "") : ""}:s${searchCount}:${searchCount > 0 ? searchMatches[0].row : ""}`;
 		if (key === lastScrollbarMarksKey) return;
 		lastScrollbarMarksKey = key;
 
-		const trackH = scrollbarRef.clientHeight;
+		const trackH = scrollbarTrackHeight;
 		let html = "";
-		for (const block of blocks) {
-			const ratio = block.promptLine / totalRows;
-			const color = block.exitCode !== null && block.exitCode !== 0 ? "#f85149" : "rgba(88,166,255,0.5)";
-			html += `<div style="position:absolute;right:0;width:100%;height:2px;top:${ratio * trackH}px;background:${color}"></div>`;
+		if (showBlocks) {
+			for (const block of blocks) {
+				const ratio = block.promptLine / totalRows;
+				const color = block.exitCode !== null && block.exitCode !== 0 ? "#f85149" : "rgba(88,166,255,0.5)";
+				html += `<div style="position:absolute;right:0;width:100%;height:2px;top:${ratio * trackH}px;background:${color}"></div>`;
+			}
+			// Dedicated GREEN tick at each line where the USER submitted a prompt
+			// (distinct from the blue/red agent tool-call block ticks above): few,
+			// one per turn. Drawn after the block ticks so it sits on top.
+			for (const line of promptLines) {
+				const ratio = line / totalRows;
+				html += `<div style="position:absolute;right:0;width:100%;height:2px;top:${ratio * trackH}px;background:#3fb950"></div>`;
+			}
+		}
+		if (searchCount > 0) {
+			const seen = new Set<number>();
+			for (const match of searchMatches) {
+				const rounded = Math.round((match.row / totalRows) * trackH);
+				if (seen.has(rounded)) continue;
+				seen.add(rounded);
+				html += `<div style="position:absolute;right:0;width:100%;height:2px;top:${rounded}px;background:#e8984c"></div>`;
+			}
 		}
 		scrollbarMarksContainer.innerHTML = html;
 	}
@@ -749,11 +866,17 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 	// Cached suggest/intent overlay state to avoid full DOM rebuild
 	let lastSuggestOverlayKey = "";
 
-	function updateSuggestOverlay(_frame: DecodedFrame, m: CellMetrics, dirtyIndices?: Set<number>) {
+	function updateSuggestOverlay(
+		_frame: DecodedFrame,
+		m: CellMetrics,
+		dirtyIndices?: Set<number>,
+		snapshotOverride?: (i: number) => { text: string; isWrapped: boolean } | null,
+	) {
 		if (!overlayRef) return;
 
 		// Skip full rescan if no dirty rows touch suggest/intent patterns
-		if (dirtyIndices && !fullRepaintNeeded) {
+		// (skipped entirely when rendering from the cache during a scroll gesture).
+		if (!snapshotOverride && dirtyIndices && !fullRepaintNeeded) {
 			let hasSuggestContent = false;
 			for (const idx of dirtyIndices) {
 				const row = rowMap.get(idx);
@@ -773,11 +896,13 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 		const bg = cachedBgDefault;
 		const numRows = lastResizeRows || 24;
 
-		const getRowSnapshot = (i: number) => {
-			const row = rowMap.get(i);
-			if (!row) return null;
-			return { text: rowToText(row), isWrapped: false };
-		};
+		const getRowSnapshot =
+			snapshotOverride ??
+			((i: number) => {
+				const row = rowMap.get(i);
+				if (!row) return null;
+				return { text: rowToText(row), isWrapped: false };
+			});
 
 		// Build new overlay key to detect changes
 		const parts: string[] = [];
@@ -813,17 +938,22 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 	}
 
 	function startBlink() {
-		stopBlink();
+		if (blinkInterval != null) return;
 		cursorBlinkOn = true;
+		blinkResetAt = performance.now();
 		blinkInterval = setInterval(() => {
-			cursorBlinkOn = !cursorBlinkOn;
-			if (rafId === undefined) {
-				rafId = requestAnimationFrame(() => {
-					rafId = undefined;
-					if (!alive || hidden) return;
-					const m = metrics();
-					if (currentFrame && m) repaintCursorOnly(currentFrame, m);
-				});
+			const elapsed = performance.now() - blinkResetAt;
+			const phase = Math.floor(elapsed / 700) % 2 === 0;
+			if (cursorBlinkOn !== phase) {
+				cursorBlinkOn = phase;
+				if (rafId === undefined) {
+					rafId = requestAnimationFrame(() => {
+						rafId = undefined;
+						if (!alive || hidden) return;
+						const m = metrics();
+						if (currentFrame && m) repaintCursorOnly(currentFrame, m);
+					});
+				}
 			}
 		}, 700);
 	}
@@ -837,1207 +967,8 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 
 	function resetBlink() {
 		cursorBlinkOn = true;
-		startBlink();
-	}
-
-	function drawBoxDrawingChar(cp: number, x: number, y: number, m: CellMetrics): boolean {
-		if (cp < 0x2500 || cp > 0x257f) return false;
-		const w = m.cellWidth;
-		const h = m.cellHeight;
-		const cx = x + Math.floor(w / 2);
-		const cy = y + Math.floor(h / 2);
-		const lw = Math.max(1, Math.round(w / 8));
-		const hlw = Math.max(1, Math.round(w / 4));
-
-		const line = (x1: number, y1: number, x2: number, y2: number, heavy = false) => {
-			ctx.lineWidth = heavy ? hlw : lw;
-			ctx.beginPath();
-			ctx.moveTo(x1 + 0.5, y1 + 0.5);
-			ctx.lineTo(x2 + 0.5, y2 + 0.5);
-			ctx.stroke();
-		};
-
-		const right = x + w;
-		const bottom = y + h;
-
-		const L = 1,
-			R = 2,
-			U = 4,
-			D = 8;
-		const HL = 16,
-			HR = 32,
-			HU = 64,
-			HD = 128;
-
-		let seg = 0;
-		switch (cp) {
-			case 0x2500:
-				seg = L | R;
-				break; // ─
-			case 0x2501:
-				seg = HL | HR;
-				break; // ━
-			case 0x2502:
-				seg = U | D;
-				break; // │
-			case 0x2503:
-				seg = HU | HD;
-				break; // ┃
-			case 0x250c:
-				seg = R | D;
-				break; // ┌
-			case 0x250d:
-				seg = HR | D;
-				break; // ┍
-			case 0x250e:
-				seg = R | HD;
-				break; // ┎
-			case 0x250f:
-				seg = HR | HD;
-				break; // ┏
-			case 0x2510:
-				seg = L | D;
-				break; // ┐
-			case 0x2511:
-				seg = HL | D;
-				break; // ┑
-			case 0x2512:
-				seg = L | HD;
-				break; // ┒
-			case 0x2513:
-				seg = HL | HD;
-				break; // ┓
-			case 0x2514:
-				seg = R | U;
-				break; // └
-			case 0x2515:
-				seg = HR | U;
-				break; // ┕
-			case 0x2516:
-				seg = R | HU;
-				break; // ┖
-			case 0x2517:
-				seg = HR | HU;
-				break; // ┗
-			case 0x2518:
-				seg = L | U;
-				break; // ┘
-			case 0x2519:
-				seg = HL | U;
-				break; // ┙
-			case 0x251a:
-				seg = L | HU;
-				break; // ┚
-			case 0x251b:
-				seg = HL | HU;
-				break; // ┛
-			case 0x251c:
-				seg = U | D | R;
-				break; // ├
-			case 0x251d:
-				seg = U | D | HR;
-				break; // ┝
-			case 0x251e:
-				seg = HU | D | R;
-				break; // ┞
-			case 0x251f:
-				seg = U | HD | R;
-				break; // ┟
-			case 0x2520:
-				seg = HU | HD | R;
-				break; // ┠
-			case 0x2521:
-				seg = HU | D | HR;
-				break; // ┡
-			case 0x2522:
-				seg = U | HD | HR;
-				break; // ┢
-			case 0x2523:
-				seg = HU | HD | HR;
-				break; // ┣
-			case 0x2524:
-				seg = U | D | L;
-				break; // ┤
-			case 0x2525:
-				seg = U | D | HL;
-				break; // ┥
-			case 0x2526:
-				seg = HU | D | L;
-				break; // ┦
-			case 0x2527:
-				seg = U | HD | L;
-				break; // ┧
-			case 0x2528:
-				seg = HU | HD | L;
-				break; // ┨
-			case 0x2529:
-				seg = HU | D | HL;
-				break; // ┩
-			case 0x252a:
-				seg = U | HD | HL;
-				break; // ┪
-			case 0x252b:
-				seg = HU | HD | HL;
-				break; // ┫
-			case 0x252c:
-				seg = L | R | D;
-				break; // ┬
-			case 0x252d:
-				seg = HL | R | D;
-				break; // ┭
-			case 0x252e:
-				seg = L | HR | D;
-				break; // ┮
-			case 0x252f:
-				seg = HL | HR | D;
-				break; // ┯
-			case 0x2530:
-				seg = L | R | HD;
-				break; // ┰
-			case 0x2531:
-				seg = HL | R | HD;
-				break; // ┱
-			case 0x2532:
-				seg = L | HR | HD;
-				break; // ┲
-			case 0x2533:
-				seg = HL | HR | HD;
-				break; // ┳
-			case 0x2534:
-				seg = L | R | U;
-				break; // ┴
-			case 0x2535:
-				seg = HL | R | U;
-				break; // ┵
-			case 0x2536:
-				seg = L | HR | U;
-				break; // ┶
-			case 0x2537:
-				seg = HL | HR | U;
-				break; // ┷
-			case 0x2538:
-				seg = L | R | HU;
-				break; // ┸
-			case 0x2539:
-				seg = HL | R | HU;
-				break; // ┹
-			case 0x253a:
-				seg = L | HR | HU;
-				break; // ┺
-			case 0x253b:
-				seg = HL | HR | HU;
-				break; // ┻
-			case 0x253c:
-				seg = L | R | U | D;
-				break; // ┼
-			case 0x253d:
-				seg = HL | R | U | D;
-				break; // ┽
-			case 0x253e:
-				seg = L | HR | U | D;
-				break; // ┾
-			case 0x253f:
-				seg = HL | HR | U | D;
-				break; // ┿
-			case 0x2540:
-				seg = L | R | HU | D;
-				break; // ╀
-			case 0x2541:
-				seg = L | R | U | HD;
-				break; // ╁
-			case 0x2542:
-				seg = L | R | HU | HD;
-				break; // ╂
-			case 0x2543:
-				seg = HL | R | HU | D;
-				break; // ╃
-			case 0x2544:
-				seg = L | HR | HU | D;
-				break; // ╄
-			case 0x2545:
-				seg = HL | R | U | HD;
-				break; // ╅
-			case 0x2546:
-				seg = L | HR | U | HD;
-				break; // ╆
-			case 0x2547:
-				seg = HL | HR | HU | D;
-				break; // ╇
-			case 0x2548:
-				seg = HL | HR | U | HD;
-				break; // ╈
-			case 0x2549:
-				seg = HL | R | HU | HD;
-				break; // ╉
-			case 0x254a:
-				seg = L | HR | HU | HD;
-				break; // ╊
-			case 0x254b:
-				seg = HL | HR | HU | HD;
-				break; // ╋
-			case 0x2574:
-				seg = L;
-				break; // ╴
-			case 0x2575:
-				seg = U;
-				break; // ╵
-			case 0x2576:
-				seg = R;
-				break; // ╶
-			case 0x2577:
-				seg = D;
-				break; // ╷
-			case 0x2578:
-				seg = HL;
-				break; // ╸
-			case 0x2579:
-				seg = HU;
-				break; // ╹
-			case 0x257a:
-				seg = HR;
-				break; // ╺
-			case 0x257b:
-				seg = HD;
-				break; // ╻
-			case 0x257c:
-				seg = L | HR;
-				break; // ╼
-			case 0x257d:
-				seg = U | HD;
-				break; // ╽
-			case 0x257e:
-				seg = HL | R;
-				break; // ╾
-			case 0x257f:
-				seg = HU | D;
-				break; // ╿
-			// Triple-dash: 3 dashes, 9 segments total, 2:1 dash:gap ratio
-			case 0x2504:
-			case 0x2505: {
-				ctx.lineWidth = cp === 0x2505 ? hlw : lw;
-				const seg = w / 9;
-				for (let i = 0; i < 3; i++) {
-					const sx = x + i * 3 * seg;
-					ctx.fillRect(sx, cy - ctx.lineWidth / 2, seg * 2, ctx.lineWidth);
-				}
-				return true;
-			}
-			case 0x2506:
-			case 0x2507: {
-				ctx.lineWidth = cp === 0x2507 ? hlw : lw;
-				const seg = h / 9;
-				for (let i = 0; i < 3; i++) {
-					const sy = y + i * 3 * seg;
-					ctx.fillRect(cx - ctx.lineWidth / 2, sy, ctx.lineWidth, seg * 2);
-				}
-				return true;
-			}
-			// Quadruple-dash: 4 dashes, 12 segments total, 2:1 dash:gap ratio
-			case 0x2508:
-			case 0x2509: {
-				ctx.lineWidth = cp === 0x2509 ? hlw : lw;
-				const seg = w / 12;
-				for (let i = 0; i < 4; i++) {
-					const sx = x + i * 3 * seg;
-					ctx.fillRect(sx, cy - ctx.lineWidth / 2, seg * 2, ctx.lineWidth);
-				}
-				return true;
-			}
-			case 0x250a:
-			case 0x250b: {
-				ctx.lineWidth = cp === 0x250b ? hlw : lw;
-				const seg = h / 12;
-				for (let i = 0; i < 4; i++) {
-					const sy = y + i * 3 * seg;
-					ctx.fillRect(cx - ctx.lineWidth / 2, sy, ctx.lineWidth, seg * 2);
-				}
-				return true;
-			}
-			// Rounded corners
-			case 0x256d:
-				seg = R | D;
-				break; // ╭
-			case 0x256e:
-				seg = L | D;
-				break; // ╮
-			case 0x256f:
-				seg = L | U;
-				break; // ╯
-			case 0x2570:
-				seg = R | U;
-				break; // ╰
-			// Double-dash: 2 dashes, 6 segments total, 2:1 dash:gap ratio
-			case 0x254c:
-			case 0x254d: {
-				ctx.lineWidth = cp === 0x254d ? hlw : lw;
-				const seg = w / 6;
-				for (let i = 0; i < 2; i++) {
-					const sx = x + i * 3 * seg;
-					ctx.fillRect(sx, cy - ctx.lineWidth / 2, seg * 2, ctx.lineWidth);
-				}
-				return true;
-			}
-			case 0x254e:
-			case 0x254f: {
-				ctx.lineWidth = cp === 0x254f ? hlw : lw;
-				const seg = h / 6;
-				for (let i = 0; i < 2; i++) {
-					const sy = y + i * 3 * seg;
-					ctx.fillRect(cx - ctx.lineWidth / 2, sy, ctx.lineWidth, seg * 2);
-				}
-				return true;
-			}
-			// Diagonals
-			case 0x2571: {
-				line(right, y, x, bottom);
-				return true;
-			}
-			case 0x2572: {
-				line(x, y, right, bottom);
-				return true;
-			}
-			case 0x2573: {
-				line(right, y, x, bottom);
-				line(x, y, right, bottom);
-				return true;
-			}
-			// Double-line box drawing: two parallel lines with gap
-			case 0x2550:
-			case 0x2551:
-			case 0x2552:
-			case 0x2553:
-			case 0x2554:
-			case 0x2555:
-			case 0x2556:
-			case 0x2557:
-			case 0x2558:
-			case 0x2559:
-			case 0x255a:
-			case 0x255b:
-			case 0x255c:
-			case 0x255d:
-			case 0x255e:
-			case 0x255f:
-			case 0x2560:
-			case 0x2561:
-			case 0x2562:
-			case 0x2563:
-			case 0x2564:
-			case 0x2565:
-			case 0x2566:
-			case 0x2567:
-			case 0x2568:
-			case 0x2569:
-			case 0x256a:
-			case 0x256b:
-			case 0x256c: {
-				const g = Math.max(1, Math.round(w / 6));
-				const dbl = (x1: number, y1: number, x2: number, y2: number, horiz: boolean) => {
-					const off = Math.floor(g / 2 + 0.5);
-					if (horiz) {
-						line(x1, y1 - off, x2, y2 - off);
-						line(x1, y1 + off, x2, y2 + off);
-					} else {
-						line(x1 - off, y1, x2 - off, y2);
-						line(x1 + off, y1, x2 + off, y2);
-					}
-				};
-				// Encode: which directions are single (s) vs double (d)
-				// Format: [sL, sR, sU, sD, dL, dR, dU, dD]
-				const t: Record<number, number[]> = {
-					9552: [0, 0, 0, 0, 1, 1, 0, 0], // ═
-					9553: [0, 0, 0, 0, 0, 0, 1, 1], // ║
-					9554: [0, 1, 0, 0, 0, 0, 0, 1], // ╒
-					9555: [0, 0, 0, 1, 0, 1, 0, 0], // ╓
-					9556: [0, 0, 0, 0, 0, 1, 0, 1], // ╔
-					9557: [1, 0, 0, 0, 0, 0, 0, 1], // ╕
-					9558: [0, 0, 0, 1, 1, 0, 0, 0], // ╖
-					9559: [0, 0, 0, 0, 1, 0, 0, 1], // ╗
-					9560: [0, 1, 0, 0, 0, 0, 1, 0], // ╘
-					9561: [0, 0, 1, 0, 0, 1, 0, 0], // ╙
-					9562: [0, 0, 0, 0, 0, 1, 1, 0], // ╚
-					9563: [1, 0, 0, 0, 0, 0, 1, 0], // ╛
-					9564: [0, 0, 1, 0, 1, 0, 0, 0], // ╜
-					9565: [0, 0, 0, 0, 1, 0, 1, 0], // ╝
-					9566: [0, 1, 0, 0, 0, 0, 1, 1], // ╞
-					9567: [0, 0, 1, 1, 0, 1, 0, 0], // ╟
-					9568: [0, 0, 0, 0, 0, 1, 1, 1], // ╠
-					9569: [1, 0, 0, 0, 0, 0, 1, 1], // ╡
-					9570: [0, 0, 1, 1, 1, 0, 0, 0], // ╢
-					9571: [0, 0, 0, 0, 1, 0, 1, 1], // ╣
-					9572: [0, 0, 0, 1, 1, 1, 0, 0], // ╤
-					9573: [1, 1, 0, 0, 0, 0, 0, 1], // ╥
-					9574: [0, 0, 0, 0, 1, 1, 0, 1], // ╦
-					9575: [0, 0, 1, 0, 1, 1, 0, 0], // ╧
-					9576: [1, 1, 0, 0, 0, 0, 1, 0], // ╨
-					9577: [0, 0, 0, 0, 1, 1, 1, 0], // ╩
-					9578: [0, 0, 1, 1, 1, 1, 0, 0], // ╪
-					9579: [1, 1, 0, 0, 0, 0, 1, 1], // ╫
-					9580: [0, 0, 0, 0, 1, 1, 1, 1], // ╬
-				};
-				const d = t[cp];
-				if (!d) return false;
-				if (d[0]) line(x, cy, cx, cy);
-				if (d[1]) line(cx, cy, right, cy);
-				if (d[2]) line(cx, y, cx, cy);
-				if (d[3]) line(cx, cy, cx, bottom);
-				if (d[4]) dbl(x, cy, cx, cy, true);
-				if (d[5]) dbl(cx, cy, right, cy, true);
-				if (d[6]) dbl(cx, y, cx, cy, false);
-				if (d[7]) dbl(cx, cy, cx, bottom, false);
-				return true;
-			}
-			default:
-				return false;
-		}
-
-		if (seg & L) line(x, cy, cx, cy);
-		if (seg & R) line(cx, cy, right, cy);
-		if (seg & U) line(cx, y, cx, cy);
-		if (seg & D) line(cx, cy, cx, bottom);
-		if (seg & HL) line(x, cy, cx, cy, true);
-		if (seg & HR) line(cx, cy, right, cy, true);
-		if (seg & HU) line(cx, y, cx, cy, true);
-		if (seg & HD) line(cx, cy, cx, bottom, true);
-		return true;
-	}
-
-	function drawBlockChar(cp: number, x: number, y: number, m: CellMetrics): boolean {
-		const w = m.cellWidth;
-		const h = m.cellHeight;
-		const hw = Math.ceil(w / 2);
-		const hh = Math.ceil(h / 2);
-		const hw2 = w - hw;
-		const hh2 = h - hh;
-		switch (cp) {
-			// Half blocks
-			case 0x2580:
-				ctx.fillRect(x, y, w, hh);
-				return true;
-			case 0x2584:
-				ctx.fillRect(x, y + hh, w, hh2);
-				return true;
-			case 0x2588:
-				ctx.fillRect(x, y, w, h);
-				return true;
-			case 0x258c:
-				ctx.fillRect(x, y, hw, h);
-				return true;
-			case 0x2590:
-				ctx.fillRect(x + hw, y, hw2, h);
-				return true;
-			// Shade blocks
-			case 0x2591: {
-				const a = ctx.globalAlpha;
-				ctx.globalAlpha = a * 0.25;
-				ctx.fillRect(x, y, w, h);
-				ctx.globalAlpha = a;
-				return true;
-			}
-			case 0x2592: {
-				const a = ctx.globalAlpha;
-				ctx.globalAlpha = a * 0.5;
-				ctx.fillRect(x, y, w, h);
-				ctx.globalAlpha = a;
-				return true;
-			}
-			case 0x2593: {
-				const a = ctx.globalAlpha;
-				ctx.globalAlpha = a * 0.75;
-				ctx.fillRect(x, y, w, h);
-				ctx.globalAlpha = a;
-				return true;
-			}
-			// Quadrant block elements
-			case 0x2596:
-				ctx.fillRect(x, y + hh, hw, hh2);
-				return true;
-			case 0x2597:
-				ctx.fillRect(x + hw, y + hh, hw2, hh2);
-				return true;
-			case 0x2598:
-				ctx.fillRect(x, y, hw, hh);
-				return true;
-			case 0x2599:
-				ctx.fillRect(x, y, hw, h);
-				ctx.fillRect(x + hw, y + hh, hw2, hh2);
-				return true;
-			case 0x259a:
-				ctx.fillRect(x, y, hw, hh);
-				ctx.fillRect(x + hw, y + hh, hw2, hh2);
-				return true;
-			case 0x259b:
-				ctx.fillRect(x, y, w, hh);
-				ctx.fillRect(x, y + hh, hw, hh2);
-				return true;
-			case 0x259c:
-				ctx.fillRect(x, y, w, hh);
-				ctx.fillRect(x + hw, y + hh, hw2, hh2);
-				return true;
-			case 0x259d:
-				ctx.fillRect(x + hw, y, hw2, hh);
-				return true;
-			case 0x259e:
-				ctx.fillRect(x + hw, y, hw2, hh);
-				ctx.fillRect(x, y + hh, hw, hh2);
-				return true;
-			case 0x259f:
-				ctx.fillRect(x + hw, y, hw2, h);
-				ctx.fillRect(x, y + hh, hw, hh2);
-				return true;
-			default:
-				return false;
-		}
-	}
-
-	function drawPowerlineChar(
-		cp: number,
-		x: number,
-		y: number,
-		m: CellMetrics,
-		fgP: number,
-		bgP: number,
-		a: number,
-	): boolean {
-		const w = m.cellWidth;
-		const h = m.cellHeight;
-		const fg = resolveFg(fgP, bgP, a, cachedFgDefault);
-		const bg = resolveBg(fgP, bgP, a, cachedBgDefault);
-
-		switch (cp) {
-			// Right-pointing triangle (filled)
-			case 0xe0b0: {
-				ctx.fillStyle = bg;
-				ctx.fillRect(x, y, w, h);
-				ctx.beginPath();
-				ctx.moveTo(x, y);
-				ctx.lineTo(x + w, y + h / 2);
-				ctx.lineTo(x, y + h);
-				ctx.closePath();
-				ctx.fillStyle = fg;
-				ctx.fill();
-				return true;
-			}
-			// Right-pointing triangle (line)
-			case 0xe0b1: {
-				ctx.beginPath();
-				ctx.moveTo(x, y);
-				ctx.lineTo(x + w, y + h / 2);
-				ctx.lineTo(x, y + h);
-				ctx.strokeStyle = fg;
-				ctx.lineWidth = 1;
-				ctx.stroke();
-				return true;
-			}
-			// Left-pointing triangle (filled)
-			case 0xe0b2: {
-				ctx.fillStyle = bg;
-				ctx.fillRect(x, y, w, h);
-				ctx.beginPath();
-				ctx.moveTo(x + w, y);
-				ctx.lineTo(x, y + h / 2);
-				ctx.lineTo(x + w, y + h);
-				ctx.closePath();
-				ctx.fillStyle = fg;
-				ctx.fill();
-				return true;
-			}
-			// Left-pointing triangle (line)
-			case 0xe0b3: {
-				ctx.beginPath();
-				ctx.moveTo(x + w, y);
-				ctx.lineTo(x, y + h / 2);
-				ctx.lineTo(x + w, y + h);
-				ctx.strokeStyle = fg;
-				ctx.lineWidth = 1;
-				ctx.stroke();
-				return true;
-			}
-			// Right semicircle (filled)
-			case 0xe0b4: {
-				ctx.fillStyle = bg;
-				ctx.fillRect(x, y, w, h);
-				ctx.beginPath();
-				ctx.moveTo(x, y);
-				ctx.quadraticCurveTo(x + w * 2, y + h / 2, x, y + h);
-				ctx.closePath();
-				ctx.fillStyle = fg;
-				ctx.fill();
-				return true;
-			}
-			// Right semicircle (line)
-			case 0xe0b5: {
-				ctx.beginPath();
-				ctx.moveTo(x, y);
-				ctx.quadraticCurveTo(x + w * 2, y + h / 2, x, y + h);
-				ctx.strokeStyle = fg;
-				ctx.lineWidth = 1;
-				ctx.stroke();
-				return true;
-			}
-			// Left semicircle (filled)
-			case 0xe0b6: {
-				ctx.fillStyle = bg;
-				ctx.fillRect(x, y, w, h);
-				ctx.beginPath();
-				ctx.moveTo(x + w, y);
-				ctx.quadraticCurveTo(x - w, y + h / 2, x + w, y + h);
-				ctx.closePath();
-				ctx.fillStyle = fg;
-				ctx.fill();
-				return true;
-			}
-			// Left semicircle (line)
-			case 0xe0b7: {
-				ctx.beginPath();
-				ctx.moveTo(x + w, y);
-				ctx.quadraticCurveTo(x - w, y + h / 2, x + w, y + h);
-				ctx.strokeStyle = fg;
-				ctx.lineWidth = 1;
-				ctx.stroke();
-				return true;
-			}
-			// Lower-left triangle (filled)
-			case 0xe0b8: {
-				ctx.fillStyle = bg;
-				ctx.fillRect(x, y, w, h);
-				ctx.beginPath();
-				ctx.moveTo(x, y + h);
-				ctx.lineTo(x + w, y);
-				ctx.lineTo(x + w, y + h);
-				ctx.closePath();
-				ctx.fillStyle = fg;
-				ctx.fill();
-				return true;
-			}
-			// Lower-left triangle (line)
-			case 0xe0b9: {
-				ctx.beginPath();
-				ctx.moveTo(x, y + h);
-				ctx.lineTo(x + w, y);
-				ctx.strokeStyle = fg;
-				ctx.lineWidth = 1;
-				ctx.stroke();
-				return true;
-			}
-			// Lower-right triangle (filled)
-			case 0xe0ba: {
-				ctx.fillStyle = bg;
-				ctx.fillRect(x, y, w, h);
-				ctx.beginPath();
-				ctx.moveTo(x, y);
-				ctx.lineTo(x + w, y + h);
-				ctx.lineTo(x, y + h);
-				ctx.closePath();
-				ctx.fillStyle = fg;
-				ctx.fill();
-				return true;
-			}
-			// Lower-right triangle (line)
-			case 0xe0bb: {
-				ctx.beginPath();
-				ctx.moveTo(x, y);
-				ctx.lineTo(x + w, y + h);
-				ctx.strokeStyle = fg;
-				ctx.lineWidth = 1;
-				ctx.stroke();
-				return true;
-			}
-			// Upper-left triangle (filled)
-			case 0xe0bc: {
-				ctx.fillStyle = bg;
-				ctx.fillRect(x, y, w, h);
-				ctx.beginPath();
-				ctx.moveTo(x, y);
-				ctx.lineTo(x + w, y);
-				ctx.lineTo(x + w, y + h);
-				ctx.closePath();
-				ctx.fillStyle = fg;
-				ctx.fill();
-				return true;
-			}
-			// Upper-left triangle (line)
-			case 0xe0bd: {
-				ctx.beginPath();
-				ctx.moveTo(x, y + h);
-				ctx.lineTo(x + w, y);
-				ctx.strokeStyle = fg;
-				ctx.lineWidth = 1;
-				ctx.stroke();
-				return true;
-			}
-			// Upper-right triangle (filled)
-			case 0xe0be: {
-				ctx.fillStyle = bg;
-				ctx.fillRect(x, y, w, h);
-				ctx.beginPath();
-				ctx.moveTo(x, y);
-				ctx.lineTo(x + w, y);
-				ctx.lineTo(x, y + h);
-				ctx.closePath();
-				ctx.fillStyle = fg;
-				ctx.fill();
-				return true;
-			}
-			// Upper-right triangle (line)
-			case 0xe0bf: {
-				ctx.beginPath();
-				ctx.moveTo(x + w, y + h);
-				ctx.lineTo(x, y);
-				ctx.strokeStyle = fg;
-				ctx.lineWidth = 1;
-				ctx.stroke();
-				return true;
-			}
-			default:
-				return false;
-		}
-	}
-
-	// Braille: 2 columns × 4 rows, bit layout per Unicode/ISO 11548
-	// bit0=dot1(r0c0) bit1=dot2(r1c0) bit2=dot3(r2c0) bit3=dot4(r0c1)
-	// bit4=dot5(r1c1) bit5=dot6(r2c1) bit6=dot7(r3c0) bit7=dot8(r3c1)
-	function drawBrailleChar(cp: number, x: number, y: number, m: CellMetrics): void {
-		const dots = cp - 0x2800;
-		if (dots === 0) return;
-		const w = m.cellWidth;
-		const h = m.cellHeight;
-		const r = Math.max(0.5, w / 8);
-		const areaW = w / 2;
-		const areaH = h / 4;
-		const map = [
-			[0, 0],
-			[0, 1],
-			[0, 2],
-			[1, 0],
-			[1, 1],
-			[1, 2],
-			[0, 3],
-			[1, 3],
-		];
-		for (let i = 0; i < 8; i++) {
-			if (dots & (1 << i)) {
-				const [col, row] = map[i];
-				const cx = x + col * areaW + areaW / 2;
-				const cy = y + row * areaH + areaH / 2;
-				ctx.beginPath();
-				ctx.arc(cx, cy, r, 0, Math.PI * 2);
-				ctx.fill();
-			}
-		}
-	}
-
-	// Sextant bit lookup: index → 6-bit mask
-	// bit0=TL bit1=TR bit2=ML bit3=MR bit4=BL bit5=BR
-	// Skips 0b000000 (empty), 0b010101 (left half = U+258C), 0b101010 (right half = U+2590), 0b111111 (full = U+2588)
-	const SEXTANT_MAP: number[] = (() => {
-		const t: number[] = [];
-		for (let bits = 1; bits < 63; bits++) {
-			if (bits === 0b010101 || bits === 0b101010) continue;
-			t.push(bits);
-		}
-		return t;
-	})();
-
-	function drawLegacyComputingChar(cp: number, x: number, y: number, m: CellMetrics): boolean {
-		const w = m.cellWidth;
-		const h = m.cellHeight;
-
-		// Sextant block elements (U+1FB00–U+1FB3B): 2×3 grid
-		if (cp >= 0x1fb00 && cp <= 0x1fb3b) {
-			const bits = SEXTANT_MAP[cp - 0x1fb00];
-			if (bits === undefined) return false;
-			const hw = Math.ceil(w / 2);
-			const th = Math.floor(h / 3);
-			const widths = [hw, w - hw];
-			const heights = [th, th, h - th * 2];
-			const cols = [0, hw];
-			const rows = [0, th, th * 2];
-			for (let bit = 0; bit < 6; bit++) {
-				if (bits & (1 << bit)) {
-					const col = bit & 1;
-					const row = bit >> 1;
-					ctx.fillRect(x + cols[col], y + rows[row], widths[col], heights[row]);
-				}
-			}
-			return true;
-		}
-
-		// Smooth mosaic wedge/triangle characters (U+1FB3C–U+1FB6F)
-		if (cp >= 0x1fb3c && cp <= 0x1fb6f) {
-			return drawWedgeChar(cp, x, y, w, h);
-		}
-
-		// Vertical 1/8 strips at positions 2–7 (U+1FB70–U+1FB75)
-		if (cp >= 0x1fb70 && cp <= 0x1fb75) {
-			const pos = cp - 0x1fb70 + 1; // positions 1–6 → columns 2–7
-			const x0 = Math.round((w * pos) / 8);
-			const x1 = Math.round((w * (pos + 1)) / 8);
-			ctx.fillRect(x + x0, y, x1 - x0, h);
-			return true;
-		}
-
-		// Horizontal 1/8 strips at positions 2–7 (U+1FB76–U+1FB7B)
-		if (cp >= 0x1fb76 && cp <= 0x1fb7b) {
-			const pos = cp - 0x1fb76 + 1;
-			const y0 = Math.round((h * pos) / 8);
-			const y1 = Math.round((h * (pos + 1)) / 8);
-			ctx.fillRect(x, y + y0, w, y1 - y0);
-			return true;
-		}
-
-		// Combined corner 1/8 blocks (U+1FB7C–U+1FB81)
-		if (cp >= 0x1fb7c && cp <= 0x1fb81) {
-			const ew = Math.round(w / 8);
-			const eh = Math.round(h / 8);
-			switch (cp) {
-				case 0x1fb7c: // left + lower
-					ctx.fillRect(x, y, ew, h);
-					ctx.fillRect(x, y + h - eh, w, eh);
-					return true;
-				case 0x1fb7d: // left + upper
-					ctx.fillRect(x, y, ew, h);
-					ctx.fillRect(x, y, w, eh);
-					return true;
-				case 0x1fb7e: // right + upper
-					ctx.fillRect(x + w - ew, y, ew, h);
-					ctx.fillRect(x, y, w, eh);
-					return true;
-				case 0x1fb7f: // right + lower
-					ctx.fillRect(x + w - ew, y, ew, h);
-					ctx.fillRect(x, y + h - eh, w, eh);
-					return true;
-				case 0x1fb80: // upper + lower
-					ctx.fillRect(x, y, w, eh);
-					ctx.fillRect(x, y + h - eh, w, eh);
-					return true;
-				case 0x1fb81: // rows 1,3,5,8
-					ctx.fillRect(x, y, w, eh);
-					ctx.fillRect(x, y + Math.round((h * 2) / 8), w, eh);
-					ctx.fillRect(x, y + Math.round((h * 4) / 8), w, eh);
-					ctx.fillRect(x, y + h - eh, w, eh);
-					return true;
-			}
-			return false;
-		}
-
-		// Upper block fractions (U+1FB82–U+1FB86): 2/8, 3/8, 5/8, 6/8, 7/8
-		if (cp >= 0x1fb82 && cp <= 0x1fb86) {
-			const eighths = [2, 3, 5, 6, 7][cp - 0x1fb82];
-			ctx.fillRect(x, y, w, Math.round((h * eighths) / 8));
-			return true;
-		}
-
-		// Right block fractions (U+1FB87–U+1FB8B): 2/8, 3/8, 5/8, 6/8, 7/8
-		if (cp >= 0x1fb87 && cp <= 0x1fb8b) {
-			const eighths = [2, 3, 5, 6, 7][cp - 0x1fb87];
-			const bw = Math.round((w * eighths) / 8);
-			ctx.fillRect(x + w - bw, y, bw, h);
-			return true;
-		}
-
-		return false;
-	}
-
-	function drawWedgeChar(cp: number, x: number, y: number, w: number, h: number): boolean {
-		// Polygon vertices in normalized coords → absolute
-		type Pt = [number, number];
-		const poly = (...pts: Pt[]) => {
-			ctx.beginPath();
-			ctx.moveTo(x + pts[0][0] * w, y + pts[0][1] * h);
-			for (let i = 1; i < pts.length; i++) ctx.lineTo(x + pts[i][0] * w, y + pts[i][1] * h);
-			ctx.closePath();
-			ctx.fill();
-		};
-		switch (cp) {
-			// Lower-left family
-			case 0x1fb3c:
-				poly([0, 2 / 3], [0, 1], [1 / 2, 1]);
-				return true;
-			case 0x1fb3d:
-				poly([0, 2 / 3], [0, 1], [1, 1]);
-				return true;
-			case 0x1fb3e:
-				poly([0, 1 / 3], [0, 1], [1 / 2, 1]);
-				return true;
-			case 0x1fb3f:
-				poly([0, 1 / 3], [0, 1], [1, 1]);
-				return true;
-			case 0x1fb40:
-				poly([0, 0], [0, 1], [1 / 2, 1]);
-				return true;
-			// Lower-right/large family
-			case 0x1fb41:
-				poly([1 / 2, 0], [1, 0], [1, 1], [0, 1], [0, 1 / 3]);
-				return true;
-			case 0x1fb42:
-				poly([1, 0], [1, 1], [0, 1], [0, 1 / 3]);
-				return true;
-			case 0x1fb43:
-				poly([1 / 2, 0], [1, 0], [1, 1], [0, 1], [0, 2 / 3]);
-				return true;
-			case 0x1fb44:
-				poly([1, 0], [1, 1], [0, 1], [0, 2 / 3]);
-				return true;
-			case 0x1fb45:
-				poly([1 / 2, 0], [1, 0], [1, 1], [0, 1]);
-				return true;
-			case 0x1fb46:
-				poly([0, 2 / 3], [1, 1 / 3], [1, 1], [0, 1]);
-				return true;
-			case 0x1fb47:
-				poly([1 / 2, 1], [1, 2 / 3], [1, 1]);
-				return true;
-			case 0x1fb48:
-				poly([0, 1], [1, 2 / 3], [1, 1]);
-				return true;
-			case 0x1fb49:
-				poly([1 / 2, 1], [1, 1 / 3], [1, 1]);
-				return true;
-			case 0x1fb4a:
-				poly([0, 1], [1, 1 / 3], [1, 1]);
-				return true;
-			case 0x1fb4b:
-				poly([1 / 2, 1], [1, 0], [1, 1]);
-				return true;
-			// Lower-left mirror family
-			case 0x1fb4c:
-				poly([0, 0], [1 / 2, 0], [1, 1 / 3], [1, 1], [0, 1]);
-				return true;
-			case 0x1fb4d:
-				poly([0, 0], [1, 1 / 3], [1, 1], [0, 1]);
-				return true;
-			case 0x1fb4e:
-				poly([0, 0], [1 / 2, 0], [1, 2 / 3], [1, 1], [0, 1]);
-				return true;
-			case 0x1fb4f:
-				poly([0, 0], [1, 2 / 3], [1, 1], [0, 1]);
-				return true;
-			case 0x1fb50:
-				poly([0, 0], [1 / 2, 0], [1, 1], [0, 1]);
-				return true;
-			case 0x1fb51:
-				poly([0, 1 / 3], [1, 2 / 3], [1, 1], [0, 1]);
-				return true;
-			// Upper-right diagonal family
-			case 0x1fb52:
-				poly([0, 0], [1, 0], [1, 1], [1 / 2, 1], [0, 2 / 3]);
-				return true;
-			case 0x1fb53:
-				poly([0, 0], [1, 0], [1, 1], [0, 2 / 3]);
-				return true;
-			case 0x1fb54:
-				poly([0, 0], [1, 0], [1, 1], [1 / 2, 1], [0, 1 / 3]);
-				return true;
-			case 0x1fb55:
-				poly([0, 0], [1, 0], [1, 1], [0, 1 / 3]);
-				return true;
-			case 0x1fb56:
-				poly([0, 0], [1, 0], [1, 1], [1 / 2, 1]);
-				return true;
-			// Upper-left family
-			case 0x1fb57:
-				poly([0, 0], [1 / 2, 0], [0, 1 / 3]);
-				return true;
-			case 0x1fb58:
-				poly([0, 0], [1, 0], [0, 1 / 3]);
-				return true;
-			case 0x1fb59:
-				poly([0, 0], [1 / 2, 0], [0, 2 / 3]);
-				return true;
-			case 0x1fb5a:
-				poly([0, 0], [1, 0], [0, 2 / 3]);
-				return true;
-			case 0x1fb5b:
-				poly([0, 0], [1 / 2, 0], [0, 1]);
-				return true;
-			case 0x1fb5c:
-				poly([0, 0], [1, 0], [1, 1 / 3], [0, 2 / 3]);
-				return true;
-			case 0x1fb5d:
-				poly([0, 0], [1, 0], [1, 2 / 3], [1 / 2, 1], [0, 1]);
-				return true;
-			case 0x1fb5e:
-				poly([0, 0], [1, 0], [1, 2 / 3], [0, 1]);
-				return true;
-			case 0x1fb5f:
-				poly([0, 0], [1, 0], [1, 1 / 3], [1 / 2, 1], [0, 1]);
-				return true;
-			case 0x1fb60:
-				poly([0, 0], [1, 0], [1, 1 / 3], [0, 1]);
-				return true;
-			case 0x1fb61:
-				poly([0, 0], [1, 0], [1 / 2, 1], [0, 1]);
-				return true;
-			// Upper-right corner family
-			case 0x1fb62:
-				poly([1 / 2, 0], [1, 0], [1, 1 / 3]);
-				return true;
-			case 0x1fb63:
-				poly([0, 0], [1, 0], [1, 1 / 3]);
-				return true;
-			case 0x1fb64:
-				poly([1 / 2, 0], [1, 0], [1, 2 / 3]);
-				return true;
-			case 0x1fb65:
-				poly([0, 0], [1, 0], [1, 2 / 3]);
-				return true;
-			case 0x1fb66:
-				poly([1 / 2, 0], [1, 0], [1, 1]);
-				return true;
-			case 0x1fb67:
-				poly([0, 0], [1, 0], [1, 2 / 3], [0, 1 / 3]);
-				return true;
-			// Three-quarter blocks (center at 1/2, 1/2 → 4 triangles, fill 3)
-			case 0x1fb68: // missing left
-				poly([0, 0], [1, 0], [1 / 2, 1 / 2]);
-				poly([1, 0], [1, 1], [1 / 2, 1 / 2]);
-				poly([0, 1], [1, 1], [1 / 2, 1 / 2]);
-				return true;
-			case 0x1fb69: // missing upper
-				poly([0, 0], [0, 1], [1 / 2, 1 / 2]);
-				poly([0, 1], [1, 1], [1 / 2, 1 / 2]);
-				poly([1, 0], [1, 1], [1 / 2, 1 / 2]);
-				return true;
-			case 0x1fb6a: // missing right
-				poly([0, 0], [1, 0], [1 / 2, 1 / 2]);
-				poly([0, 0], [0, 1], [1 / 2, 1 / 2]);
-				poly([0, 1], [1, 1], [1 / 2, 1 / 2]);
-				return true;
-			case 0x1fb6b: // missing lower
-				poly([0, 0], [1, 0], [1 / 2, 1 / 2]);
-				poly([0, 0], [0, 1], [1 / 2, 1 / 2]);
-				poly([1, 0], [1, 1], [1 / 2, 1 / 2]);
-				return true;
-			// One-quarter triangles
-			case 0x1fb6c:
-				poly([1 / 2, 1 / 2], [0, 0], [0, 1]);
-				return true;
-			case 0x1fb6d:
-				poly([1 / 2, 1 / 2], [0, 0], [1, 0]);
-				return true;
-			case 0x1fb6e:
-				poly([1 / 2, 1 / 2], [1, 0], [1, 1]);
-				return true;
-			case 0x1fb6f:
-				poly([1 / 2, 1 / 2], [0, 1], [1, 1]);
-				return true;
-			default:
-				return false;
-		}
-	}
-
-	function paintRow(row: DecodedFrame["rows"][0], y: number, m: CellMetrics, fontFamily?: string) {
-		fontFamily ??= settingsStore.getFontFamily();
-
-		let lastVisibleCol = -1;
-		for (let c = row.count - 1; c >= 0; c--) {
-			const cp = row.codepoints[c];
-			if (cp !== 0 && cp !== 0x20) {
-				lastVisibleCol = c;
-				break;
-			}
-		}
-
-		// Pass 1: backgrounds
-		for (let c = 0; c < row.count; c++) {
-			const cp = row.codepoints[c];
-			if (cp === 0 || (cp === 0x20 && c > lastVisibleCol)) continue;
-			const a = row.attrs[c];
-			if (!(a & ATTR_DEFAULT_BG) || a & ATTR_INVERSE) {
-				ctx.fillStyle = resolveBg(row.fg[c], row.bg[c], a, cachedBgDefault);
-				ctx.fillRect(c * m.cellWidth, y, m.cellWidth, m.cellHeight);
-			}
-		}
-
-		// Pass 2: text — render each glyph at its exact grid position to prevent
-		// cursor drift (cellWidth is Math.round'd, so batched fillText runs
-		// accumulate sub-pixel error over long lines).
-		let lastFont = "";
-		let lastFg = "";
-		let lastDim = false;
-
-		for (let c = 0; c < row.count; c++) {
-			const cp = row.codepoints[c];
-			if (cp === 0 || cp === 0x20) continue;
-
-			const a = row.attrs[c];
-			const fgP = row.fg[c];
-			const bgP = row.bg[c];
-			const x = c * m.cellWidth;
-
-			if (cp >= 0x2500 && cp <= 0x257f) {
-				ctx.fillStyle = resolveFg(fgP, bgP, a, cachedFgDefault);
-				ctx.strokeStyle = ctx.fillStyle;
-				if (!drawBoxDrawingChar(cp, x, y, m)) {
-					ctx.font = buildFontStyle(a, m.fontSize, fontFamily);
-					ctx.fillText(String.fromCodePoint(cp), x, y + m.baseline);
-				}
-				lastFg = "";
-				continue;
-			}
-			if ((cp >= 0x2580 && cp <= 0x2593) || (cp >= 0x2596 && cp <= 0x259f)) {
-				ctx.fillStyle = resolveFg(fgP, bgP, a, cachedFgDefault);
-				drawBlockChar(cp, x, y, m);
-				lastFg = "";
-				continue;
-			}
-			if (cp >= 0xe0b0 && cp <= 0xe0bf) {
-				if (drawPowerlineChar(cp, x, y, m, fgP, bgP, a)) {
-					lastFg = "";
-					continue;
-				}
-			}
-			if (cp >= 0x2800 && cp <= 0x28ff) {
-				ctx.fillStyle = resolveFg(fgP, bgP, a, cachedFgDefault);
-				drawBrailleChar(cp, x, y, m);
-				lastFg = "";
-				continue;
-			}
-			if (cp >= 0x1fb00 && cp <= 0x1fb8b) {
-				ctx.fillStyle = resolveFg(fgP, bgP, a, cachedFgDefault);
-				if (drawLegacyComputingChar(cp, x, y, m)) {
-					lastFg = "";
-					continue;
-				}
-			}
-
-			const font = buildFontStyle(a, m.fontSize, fontFamily);
-			const fg = resolveFg(fgP, bgP, a, cachedFgDefault);
-			const dim = (a & ATTR_DIM) !== 0;
-
-			if (font !== lastFont) {
-				ctx.font = font;
-				lastFont = font;
-			}
-			if (fg !== lastFg) {
-				ctx.fillStyle = fg;
-				lastFg = fg;
-			}
-			if (dim !== lastDim) {
-				ctx.globalAlpha = dim ? 0.5 : 1.0;
-				lastDim = dim;
-			}
-
-			ctx.fillText(String.fromCodePoint(cp), x, y + m.baseline);
-		}
-		if (lastDim) ctx.globalAlpha = 1.0;
-
-		// Pass 3: decorations
-		for (let c = 0; c < row.count; c++) {
-			const a = row.attrs[c];
-			if (!(a & (ATTR_UNDERLINE | ATTR_STRIKEOUT))) continue;
-			const x = c * m.cellWidth;
-			const fg = resolveFg(row.fg[c], row.bg[c], a, cachedFgDefault);
-			if (a & ATTR_UNDERLINE) {
-				ctx.fillStyle = fg;
-				ctx.fillRect(x, y + m.cellHeight - 1, m.cellWidth, 1);
-			}
-			if (a & ATTR_STRIKEOUT) {
-				ctx.fillStyle = fg;
-				ctx.fillRect(x, y + Math.floor(m.cellHeight / 2), m.cellWidth, 1);
-			}
-		}
+		blinkResetAt = performance.now();
+		if (blinkInterval == null) startBlink();
 	}
 
 	function repaintCursorOnly(frame: DecodedFrame, m: CellMetrics) {
@@ -2049,23 +980,390 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 		if (currentFrame && m) repaintCursorOnly(currentFrame, m);
 	}
 
+	// Coalesced scroll: handlers compute the next absolute display offset
+	// (latest-wins) and a single rAF flush sends it to the backend, with at most
+	// one IPC in flight. Decouples input rate from IPC and avoids delta desync.
+	let pendingScrollOffset: number | null = null;
+	let scrollRafId = 0;
+	let scrollInFlight = false;
+
+	function scheduleScrollFlush() {
+		if (!scrollRafId) scrollRafId = requestAnimationFrame(flushScroll);
+	}
+	function flushScroll() {
+		scrollRafId = 0;
+		if (pendingScrollOffset == null) return;
+		if (scrollInFlight) {
+			scheduleScrollFlush(); // retry next frame, keep pending
+			return;
+		}
+		const target = pendingScrollOffset;
+		pendingScrollOffset = null;
+		scrollInFlight = true;
+		invokeRef?.("terminal_scroll_to_offset", { sessionId: props.sessionId, offset: target })
+			.catch(ipcErr("terminal_scroll_to_offset"))
+			.finally(() => {
+				scrollInFlight = false;
+			});
+	}
+
+	// --- Smooth (sub-line) scroll, main renderer only ---
+	// `scrollPosF` is the desired fractional display offset (in lines). The
+	// integer part is committed to the backend (above); the fractional remainder
+	// is shown as a transient translateY of the stage, with the adjacent overscan
+	// row sliding into view. On gesture end it animates to the nearest line.
+	// At rest (scrollPosF === null) the transform is identity → geometry unchanged.
+	let scrollPosF: number | null = null;
+	let smoothRafId = 0;
+	let overlaysHiddenForScroll = false;
+	// When non-null, the overlay (selection/cursor/search) is painted against this
+	// integer display offset + the row cache instead of the live backend frame, so
+	// it stays aligned with the cache-rendered base during a smooth-scroll gesture.
+	let overlayScrollOffset: number | null = null;
+	// True only while a gesture is actively producing deltas; false at rest (incl.
+	// a fractional rest where scrollPosF stays non-integer — we never snap to a line).
+	let isScrolling = false;
+	// We only ever hand off to normal rendering at the bottom (offset 0). Until the
+	// backend frame reaches `settlePending` we keep cache-rendering it (no jump).
+	let settlePending: number | null = null;
+	let settleTimer = 0;
+
+	// Full-frame reconciliation: partial frames (only the rows alacritty marked
+	// dirty) merge into rowMap by index, so if the grid shifts content the canvas
+	// can strand stale rows (duplicate/triplicate or vanished blocks) while the grid
+	// itself stays correct. After an output burst settles, request one full frame so
+	// the next onFrame does a fullReplace and rebuilds rowMap from the grid — a
+	// self-heal that can't drift. Gated to at-rest, following-output (offset 0).
+	let reconcileTimer: ReturnType<typeof setTimeout> | undefined;
+	// First schedule of the current reschedule burst — bounds the total deferral
+	// (reconcileDelay caps the trailing debounce at RECONCILE_MAX_WAIT_MS, so
+	// sustained partial-frame output can't starve the self-heal forever).
+	let reconcileBurstStart: number | null = null;
+	// [dup] desync detector (perfDebug only): set when scheduleReconcile fires a
+	// forced full-frame request, consumed by the next full frame in onFrame to diff
+	// the partial-accumulated rowMap against the authoritative grid. See onFrame.
+	let reconcileHealPending = false;
+	function scheduleReconcile() {
+		const now = Date.now();
+		if (reconcileBurstStart == null) reconcileBurstStart = now;
+		if (reconcileTimer) clearTimeout(reconcileTimer);
+		reconcileTimer = setTimeout(
+			() => {
+				reconcileTimer = undefined;
+				reconcileBurstStart = null;
+				const off = currentFrame?.displayOffset ?? -1;
+				const fire = shouldFireReconcile({ alive, isScrolling, scrollPosF, displayOffset: off });
+				if (!fire) {
+					return;
+				}
+				// [dup] arm the desync detector: the frame this request pulls back is a
+				// full grid snapshot at rest, so the next full frame's diff against the
+				// partial-accumulated rowMap reveals any stranded stale rows.
+				if (isPerfDebug()) reconcileHealPending = true;
+				invokeRef?.("terminal_request_frame", { sessionId: props.sessionId }).catch(ipcErr("terminal_request_frame"));
+			},
+			reconcileDelay(now, reconcileBurstStart),
+		);
+	}
+
+	function finishSettle() {
+		settleTimer = 0;
+		// A settle timer can fire after unmount; the row cache is released by then,
+		// so endSmoothScroll must not run.
+		if (!alive || settlePending == null) return;
+		settlePending = null;
+		scrollPosF = null;
+		endSmoothScroll();
+	}
+	function clearSettlePending() {
+		if (settleTimer) {
+			clearTimeout(settleTimer);
+			settleTimer = 0;
+		}
+		settlePending = null;
+	}
+
+	function scheduleSmoothRender() {
+		if (!smoothRafId)
+			smoothRafId = requestAnimationFrame(() => {
+				smoothRafId = 0;
+				renderSmooth();
+			});
+	}
+
+	// Repaint the base canvas + the partial rows above/below locally from the row
+	// cache for integer display offset `intOffset` — no backend round-trip, so it
+	// keeps up at 60fps regardless of scroll speed.
+	function renderCachedBase(intOffset: number, m: CellMetrics, rows: number, hist: number) {
+		const cacheRow = (abs: number): DecodedRow | null => rowCache.get(abs) ?? null;
+		const tempMap = new Map<number, DecodedRow>();
+		for (let r = 0; r < rows; r++) {
+			const cached = cacheRow(hist - intOffset + r);
+			if (cached) tempMap.set(r, cached.index === r ? cached : { ...cached, index: r });
+		}
+		gridRenderer.paintGrid(tempMap, m, { fullRepaint: true });
+		if (octxOverscan && overscanRenderer) {
+			const ch = m.cellHeight;
+			const w = overscanCanvasRef.width / m.dpr;
+			octxOverscan.clearRect(-GUTTER_PX, 0, w, overscanCanvasRef.height / m.dpr);
+			const above = cacheRow(hist - intOffset - 1);
+			const below = cacheRow(hist - intOffset + rows);
+			if (above) {
+				octxOverscan.fillStyle = cachedBgDefault;
+				octxOverscan.fillRect(-GUTTER_PX, 0, w, ch);
+				overscanRenderer.paintRow(above, 0, m);
+			}
+			if (below) {
+				const y = (rows + 1) * ch;
+				octxOverscan.fillStyle = cachedBgDefault;
+				octxOverscan.fillRect(-GUTTER_PX, y, w, ch);
+				overscanRenderer.paintRow(below, y, m);
+			}
+		}
+		ensureCacheBand(intOffset, rows, hist);
+		// Rebuild suggest/intent masks from the cache at this offset so they track the
+		// scrolling content instead of the lagging backend frame (no flicker, and the
+		// raw suggest line stays masked).
+		if (currentFrame) {
+			updateSuggestOverlay(currentFrame, m, undefined, (i) => {
+				const cached = cacheRow(hist - intOffset + i);
+				if (!cached) return null;
+				return { text: rowToText(cached), isWrapped: false };
+			});
+		}
+	}
+
+	function renderSmooth() {
+		// A queued smooth-render RAF can fire after unmount; the row cache it reads
+		// is released by then, so bail before touching it.
+		if (!alive || scrollPosF == null || !currentFrame) return;
+		const m = metrics();
+		if (!m) return;
+		const ch = m.cellHeight;
+		const rows = lastResizeRows || 24;
+		// All-time top-of-history index: cache keys live in this eviction-stable space.
+		const hist = currentFrame.historyBase + currentFrame.historySize;
+		const intOffset = Math.floor(scrollPosF);
+		const frac = (scrollPosF - intOffset) * ch; // [0, ch): how far past the line
+		renderCachedBase(intOffset, m, rows, hist);
+		// Repaint the selection/cursor/search overlay aligned to the cached offset so the
+		// highlight tracks the content while scrolling (the overlay canvas is inside the
+		// stage, so the fractional translate below keeps it pixel-aligned with the base).
+		overlayScrollOffset = intOffset;
+		repaintOverlay(currentFrame, m);
+		overlayScrollOffset = null;
+		stageRef.style.transform = `translate3d(0, ${frac}px, 0)`;
+		// Track the scrollbar thumb live against the fractional position (paintFrame,
+		// which normally drives it, is suppressed during the gesture).
+		updateScrollbar({ ...currentFrame, displayOffset: scrollPosF });
+	}
+
+	// Background-fetch any missing 64-row chunks in a one-screen band around the
+	// viewport so fast scrolling always has cached rows ready to paint.
+	function ensureCacheBand(intOffset: number, rows: number, hist: number) {
+		if (!invokeRef) return;
+		const lo = Math.max(0, hist - intOffset - rows);
+		const hi = hist - intOffset + 2 * rows;
+		const firstChunk = Math.floor(lo / ROW_CACHE_CHUNK);
+		const lastChunk = Math.floor(hi / ROW_CACHE_CHUNK);
+		for (let chunk = firstChunk; chunk <= lastChunk; chunk++) {
+			if (chunk < 0 || requestedChunks.has(chunk)) continue;
+			requestedChunks.add(chunk);
+			void fetchChunk(chunk);
+		}
+	}
+
+	async function fetchChunk(chunk: number) {
+		if (!invokeRef) return;
+		const start = chunk * ROW_CACHE_CHUNK;
+		try {
+			const res = (await invokeRef("terminal_styled_rows", {
+				sessionId: props.sessionId,
+				start,
+				count: ROW_CACHE_CHUNK,
+			})) as number[] | undefined;
+			// Unmounted during the await: the row cache is released, so don't
+			// repopulate it or schedule a render against it.
+			if (!alive) return;
+			// Guard the shape, not just falsiness: a wrong-typed/object response
+			// would throw in the Uint8Array constructor if the command ever changes.
+			if (!Array.isArray(res)) return;
+			const decoded = decodeStyledRange(new Uint8Array(res).buffer);
+			if (!decoded) return;
+			for (const { abs, row } of decoded.rows) rowCache.set(abs, row);
+			if (rowCache.size > ROW_CACHE_MAX) {
+				rowCache.clear();
+				requestedChunks.clear();
+			}
+			if (scrollPosF != null) scheduleSmoothRender();
+		} catch (e) {
+			requestedChunks.delete(chunk);
+			ipcErr("terminal_styled_rows")(e);
+		}
+	}
+
+	// During a gesture the cursor/selection canvas is hidden (those are anchored to
+	// the backend frame and we're not selecting while scrolling). The suggest/intent
+	// masks (overlayRef) stay visible — they're rebuilt from the cache and scroll
+	// with the content, so they neither flicker nor uncover the raw suggest text.
+	function setScrollOverlaysHidden(hidden: boolean) {
+		if (overlaysHiddenForScroll === hidden) return;
+		overlaysHiddenForScroll = hidden;
+		if (overlayCanvasRef) overlayCanvasRef.style.visibility = hidden ? "hidden" : "";
+	}
+
+	// Wipe the overscan canvas. The above/below rows are only meaningful mid-gesture
+	// while the stage slides; at rest the (opaque) base canvas covers the viewport but
+	// the overscan's below-row strip peeks out beneath it. Leaving the last gesture's
+	// row there shows it as a ghost line below the viewport, so clear on every return
+	// to rest.
+	function clearOverscan() {
+		if (!octxOverscan || !overscanCanvasRef) return;
+		const dpr = metrics()?.dpr ?? window.devicePixelRatio ?? 1;
+		octxOverscan.clearRect(-GUTTER_PX, 0, overscanCanvasRef.width / dpr, overscanCanvasRef.height / dpr);
+	}
+
+	// Leave smooth-scroll mode: restore the overlays and repaint the base from the
+	// real backend frame at its committed offset.
+	function endSmoothScroll() {
+		setScrollOverlaysHidden(false);
+		if (stageRef) stageRef.style.transform = "";
+		clearOverscan();
+		const m = metrics();
+		if (currentFrame && m) {
+			fullRepaintNeeded = true;
+			paintFrame(currentFrame, m);
+		}
+	}
+
+	// Cancel an in-flight smooth gesture and restore the resting state. Self-contained:
+	// also cancels the wheel gesture-end timer so a late resetScrollGesture can't fire
+	// after we've handed control to another scroll path (scrollbar, programmatic jump).
+	function resetSmoothScroll() {
+		clearTimeout(scrollGestureEndTimer);
+		if (smoothRafId) {
+			cancelAnimationFrame(smoothRafId);
+			smoothRafId = 0;
+		}
+		isScrolling = false;
+		clearSettlePending();
+		if (scrollPosF != null) {
+			scrollPosF = null;
+			endSmoothScroll();
+		}
+	}
+
+	// Seed the cache with the current viewport's rows so the first frame of a gesture
+	// has content to paint immediately (the band prefetch fills the rest).
+	function seedCacheFromCurrentFrame() {
+		if (!currentFrame) return;
+		const base = currentFrame.historyBase + currentFrame.historySize - currentFrame.displayOffset;
+		for (const [r, row] of rowMap) rowCache.set(base + r, row);
+	}
+
+	function applySmoothScroll(deltaLines: number) {
+		if (scrollPosF == null) {
+			// Entering a gesture: rebuild the cache from the current era (drops rows
+			// staled by scrollback eviction). The overlay is NOT hidden — renderSmooth
+			// repaints it from the cache so the selection highlight survives the scroll.
+			rowCache.clear();
+			requestedChunks.clear();
+			seedCacheFromCurrentFrame();
+		}
+		clearSettlePending();
+		isScrolling = true;
+		const hist = currentFrame?.historySize ?? 0;
+		const baseF = scrollPosF ?? currentFrame?.displayOffset ?? 0;
+		scrollPosF = Math.max(0, Math.min(hist, baseF - deltaLines));
+		// Commit the integer floor so the backend display tracks the cache base.
+		pendingScrollOffset = Math.floor(scrollPosF);
+		scheduleScrollFlush();
+		// Reached the bottom — hand off to normal rendering (resume following output)
+		// once the backend frame arrives at offset 0. No motion: 0 has no fractional part.
+		if (scrollPosF === 0) {
+			settlePending = 0;
+			if (settleTimer) clearTimeout(settleTimer);
+			settleTimer = window.setTimeout(finishSettle, 400);
+		}
+		scheduleSmoothRender();
+	}
+
+	// Gesture ended. Snap to the nearest line and hand off to normal (backend-frame)
+	// rendering so the resting state always has scrollPosF === null. The old no-snap
+	// behavior left scrollPosF at a fractional rest indefinitely; scheduleRepaint()
+	// bails while scrollPosF != null, so the base canvas would never repaint again →
+	// BLACK on the next resize / repo-switch / split-move (only on terminals that had
+	// been scrolled, hence the history-size correlation). Snapping settles scrollPosF
+	// back to null so repaints resume by construction.
+	function resetScrollGesture() {
+		isScrolling = false;
+		scrollGestureDistPx = 0;
+		if (scrollPosF == null) return;
+		const target = Math.round(scrollPosF);
+		scrollPosF = target;
+		pendingScrollOffset = target;
+		scheduleScrollFlush();
+		if (currentFrame && currentFrame.displayOffset === target) {
+			// Backend already sits on the snapped line — no new frame will arrive to
+			// trigger the onFrame handoff, so commit to normal rendering right now.
+			clearSettlePending();
+			scrollPosF = null;
+			endSmoothScroll();
+			return;
+		}
+		// Otherwise keep cache-rendering the snapped line until the backend frame
+		// reaches `target` (onFrame settle handler), with a timer as the safety net.
+		settlePending = target;
+		if (settleTimer) clearTimeout(settleTimer);
+		settleTimer = window.setTimeout(finishSettle, 400);
+		scheduleSmoothRender();
+	}
+
+	// Apply one wheel/touch delta (raw pixels) with gesture acceleration → smooth
+	// sub-line scroll.
+	function handleScrollDelta(dy: number) {
+		const m = metrics();
+		const ch = m?.cellHeight ?? 20;
+		const screenPx = ch * (lastResizeRows || 24);
+		scrollGestureDistPx += Math.abs(dy);
+		const excess = Math.max(0, scrollGestureDistPx - screenPx);
+		const factor = 0.5 + 0.5 * (excess / screenPx);
+		applySmoothScroll((dy * factor) / ch);
+	}
+
 	function onFrame(data: ArrayBuffer | number[]) {
+		// Freeze-investigation: a frame storm starving the rAF loop breadcrumbs here.
+		markPerf("term.onFrame");
 		const buffer = data instanceof ArrayBuffer ? data : new Uint8Array(data).buffer;
+
+		// Frame receipt ordering: ack FIRST (the ack only clears the in-flight flag;
+		// the ticker sends the next frame on its own schedule, so ack must never wait
+		// on decode/paint), then decode (cheap) which keeps rowMap + currentFrame alive
+		// for the overlay (cursor/selection/links/search/scrollbar) and input semantics.
+		invokeRef?.("ack_terminal_frame", { sessionId: props.sessionId }).catch(ipcErr("ack_terminal_frame"));
+		const timing = isFrameTimingEnabled();
+		const decodeT0 = timing ? performance.now() : 0;
 		const frame = decodeBinaryFrame(buffer);
+		if (timing) recordFrameTiming(props.sessionId, "decode", performance.now() - decodeT0);
 		if (!frame) return;
 
 		if (frame.bell) props.onBell?.();
 
-		// When geometry changes, viewport is entirely different — must clear and repaint
-		const geomChanged = frame.screenRows !== lastScreenRows || frame.screenCols !== lastScreenCols;
-		const scrollChanged = frame.displayOffset !== lastDisplayOffset || frame.historySize !== lastHistorySize;
+		// Grid decision: geom/scroll/full-replace/scroll-wait for the rowMap.
+		const decision = decideFrameGrid(
+			{ lastScreenRows, lastScreenCols, lastDisplayOffset, lastHistorySize },
+			frame,
+			lastResizeRows,
+		);
+		const { geomChanged, scrollChanged } = decision;
 
+		// When geometry changes, viewport is entirely different — must clear and repaint
 		if (geomChanged) {
 			selectionStart = null;
 			selectionEnd = null;
 			cachedSelectionText = "";
 			rowMap.clear();
-			detectedLinks.clear();
+			clearDetectedLinks();
 			fullRepaintNeeded = true;
 		}
 
@@ -2080,19 +1378,35 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 			}
 		}
 
+		// [dup] desync detector (perfDebug): if this full frame is the one pulled by a
+		// reconcile at rest (no scroll/geom change), snapshot the partial-accumulated
+		// rowMap BEFORE it's replaced. Any viewport row that differs from the grid below
+		// was stale on the canvas — a stranded row the partial frames never carried
+		// (alacritty damage under-report on in-place TUI redraws). Logged after the merge.
+		let dupHealSnapshot: Map<number, string> | null = null;
+		if (reconcileHealPending && decision.fullReplace && !decision.geomChanged && !decision.scrollChanged) {
+			dupHealSnapshot = new Map();
+			for (const [idx, row] of rowMap) dupHealSnapshot.set(idx, rowToText(row));
+		}
+
 		// When backend sends all screen rows, replace rowMap to discard stale entries
-		const screenRowCount = frame.screenRows || lastResizeRows || 24;
-		if (frame.rows.length >= screenRowCount) {
+		if (decision.fullReplace) {
+			reconcileHealPending = false;
 			rowMap.clear();
-			detectedLinks.clear();
+			clearDetectedLinks();
 
 			fullRepaintNeeded = true;
-		} else if (scrollChanged && !geomChanged) {
-			// Scroll changed but only partial rows arrived — old row indices are stale.
-			// DON'T clear rowMap (would cause blank flash). Instead request a full frame;
-			// when it arrives, the >= screenRowCount branch above will replace rowMap.
+		} else if (decision.scrollWait) {
+			// Scroll changed but only partial rows arrived. Old rowMap entries are keyed
+			// to the previous viewportTop — rendering them with the new displayOffset maps
+			// them to wrong screen positions, producing ghost content.
+			// Clear immediately (brief blank < ~5ms) and request a full frame.
+			rowMap.clear();
+			clearDetectedLinks();
 			fullRepaintNeeded = true;
 			invokeRef?.("terminal_request_frame", { sessionId: props.sessionId }).catch(ipcErr("terminal_request_frame"));
+			currentFrame = frame;
+			return;
 		}
 		for (const row of frame.rows) {
 			rowMap.set(row.index, row);
@@ -2100,9 +1414,77 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 			scanRowForLinks(row.index);
 		}
 
+		// [dup] desync detector: diff the pre-heal snapshot against the now-authoritative
+		// rowMap. Diverging rows were stale on the canvas until this reconcile healed them.
+		if (dupHealSnapshot) {
+			const diverged: number[] = [];
+			for (const [idx, oldText] of dupHealSnapshot) {
+				const nr = rowMap.get(idx);
+				const newText = nr ? rowToText(nr) : "";
+				if (oldText !== newText) diverged.push(idx);
+			}
+			if (diverged.length > 0) {
+				const sample = diverged.slice(0, 5).map((i) => {
+					const nr = rowMap.get(i);
+					return `#${i}: "${(dupHealSnapshot?.get(i) ?? "").slice(0, 40)}" => "${(nr ? rowToText(nr) : "").slice(0, 40)}"`;
+				});
+				appLogger.warn("terminal", `[dup] canvas desync healed: ${diverged.length} stale viewport row(s)`, {
+					sessionId: props.sessionId,
+					divergedRows: diverged,
+					sample,
+				});
+			}
+		}
+
 		currentFrame = frame;
 
-		if (selectionStart && cachedSelectionText && frame.rows.length >= screenRowCount) {
+		// Re-anchor the soft-keyboard lift to the new cursor row (touch + keyboard
+		// open only; a cheap no-op otherwise). currentFrame is a plain ref, so the
+		// keyboard effect can't track cursor moves — this is the cursor-move trigger.
+		updateKeyboardLift();
+
+		// Partial frames merge by index and can strand stale rows (grid stays correct,
+		// canvas drifts → duplicate/vanished blocks). A full frame already rebuilt the
+		// rowMap, so only reconcile after partial frames; the debounce coalesces bursts.
+		if (!decision.fullReplace) scheduleReconcile();
+
+		// Smooth scroll: seed the client-side row cache from each frame's rows, keyed
+		// by the eviction-stable absolute index `historyBase + historySize -
+		// displayOffset + index`. `historyBase` (lines evicted from the history top)
+		// climbs by exactly what the grid-relative coordinate loses on eviction, so a
+		// physical line keeps its key for life — no stale row aliases onto a new one
+		// after the scrollback cap rotates. Also pump a live render if a gesture is active.
+		//
+		// During a fast gesture the backend frame trails the live scroll position by
+		// several lines, so its rows are keyed to a lagging displayOffset. Seeding them
+		// then would overwrite cache entries the smooth renderer is currently painting
+		// (brief flicker / wrong overscan). Only seed when at rest or when the backend
+		// has caught up to our integer offset.
+		if (scrollPosF == null || frame.displayOffset === Math.floor(scrollPosF)) {
+			for (const row of frame.rows) {
+				rowCache.set(frame.historyBase + frame.historySize - frame.displayOffset + row.index, row);
+			}
+		}
+		if (settlePending != null && frame.displayOffset === settlePending) {
+			// Backend reached the snapped line — hand off to normal rendering
+			// seamlessly (the cache render already shows this exact frame).
+			clearSettlePending();
+			scrollPosF = null;
+			endSmoothScroll();
+		} else if (isScrolling) {
+			// Active gesture: re-render against the freshly seeded cache.
+			scheduleSmoothRender();
+		} else if (scrollPosF == null && stageRef?.style.transform) {
+			// At rest on a line: clear any stray transform. (Gesture end always
+			// snaps to a line and settles scrollPosF → null, so there is no
+			// lingering fractional rest to keep a transform alive.)
+			stageRef.style.transform = "";
+			clearOverscan();
+		}
+
+		// Only compare content when the selection is fully on-screen — off-screen rows return empty
+		// strings from getLocalSelectionText() causing spurious mismatches that clear the selection.
+		if (selectionStart && cachedSelectionText && decision.fullReplace && !selectionSpansOffscreen()) {
 			const nowText = getLocalSelectionText();
 			if (nowText !== cachedSelectionText) {
 				selectionStart = null;
@@ -2111,12 +1493,9 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 			}
 		}
 
-		// Ack on receive, not after paint. Otherwise the backend is forced to wait
-		// until the frontend has displayed an intermediate PTY state (for example a
-		// newline carrying the previous SGR background before the CLI writes reset/text).
-		invokeRef?.("ack_terminal_frame", { sessionId: props.sessionId }).catch(ipcErr("ack_terminal_frame"));
-
-		if (hidden) return;
+		if (hidden) {
+			return;
+		}
 		scheduleRepaint();
 		scheduleFileLinkVerification();
 	}
@@ -2153,6 +1532,12 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 		if (cached?.spans) {
 			spans.push(...cached.spans);
 		}
+
+		// Spans from links that span soft-wrapped rows (web + file://) — invisible
+		// from this single row's text, so merged from the wrapped-link map that
+		// verifyVisibleFileLinks() builds via terminal_get_logical_line.
+		const wrapped = wrappedLinkSpans.get(rowIndex);
+		if (wrapped) spans.push(...wrapped);
 
 		if (spans.length > 0) detectedLinks.set(rowIndex, spans);
 		else detectedLinks.delete(rowIndex);
@@ -2207,18 +1592,21 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 		// Single-row verification
 		for (const item of toCheck) {
 			if (!alive) return;
-			const verified: { colStart: number; colEnd: number }[] = [];
-			for (const c of item.candidates) {
-				try {
-					const r = (await ref("resolve_terminal_path", { cwd, candidate: c.raw })) as {
-						absolute_path: string;
-						is_directory: boolean;
-					} | null;
-					if (r) verified.push({ colStart: c.colStart, colEnd: c.colEnd });
-				} catch (e) {
-					appLogger.debug("terminal", "resolve_terminal_path failed", { candidate: c.raw, error: e });
-				}
-			}
+			const resolved = await Promise.all(
+				item.candidates.map(async (c) => {
+					try {
+						const r = (await ref("resolve_terminal_path", { cwd, candidate: c.raw })) as {
+							absolute_path: string;
+							is_directory: boolean;
+						} | null;
+						return r ? { colStart: c.colStart, colEnd: c.colEnd } : null;
+					} catch (e) {
+						appLogger.debug("terminal", "resolve_terminal_path failed", { candidate: c.raw, error: e });
+						return null;
+					}
+				}),
+			);
+			const verified = resolved.filter((r): r is { colStart: number; colEnd: number } => r !== null);
 			if (fileLinkCache.size >= FILE_LINK_CACHE_MAX) {
 				const oldest = fileLinkCache.keys().next().value;
 				if (oldest !== undefined) fileLinkCache.delete(oldest);
@@ -2227,8 +1615,27 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 			if (verified.length > 0) anyFound = true;
 		}
 
-		// Multi-row pass: detect file:// URLs spanning soft-wrapped rows.
-		// Check each row that is full-width (likely wrapped) for partial file:// prefix.
+		// Multi-row pass: detect web (http/https) + file:// URLs spanning
+		// soft-wrapped rows. Each full-width row is a wrap candidate; the joined
+		// logical line is scanned and any match that crosses a row boundary has
+		// its per-row spans recorded in wrappedLinkSpans (merged by scanRowForLinks
+		// so they survive the per-frame rebuild). Rebuilt fresh each pass.
+		wrappedLinkSpans.clear();
+		// Record a match's per-row spans into wrappedLinkSpans.
+		const recordWrappedSpans = (startRow: number, matchIndex: number, matchEnd: number) => {
+			for (let offset = matchIndex; offset < matchEnd; ) {
+				const spanRow = startRow + Math.floor(offset / cols);
+				const spanColStart = offset % cols;
+				const remaining = matchEnd - offset;
+				const spanColEnd = Math.min(spanColStart + remaining, cols);
+				const existing = wrappedLinkSpans.get(spanRow) || [];
+				existing.push({ colStart: spanColStart, colEnd: spanColEnd });
+				wrappedLinkSpans.set(spanRow, existing);
+				offset += spanColEnd - spanColStart;
+			}
+		};
+		const spansMultipleRows = (matchIndex: number, matchEnd: number) =>
+			Math.floor(matchIndex / cols) !== Math.floor((matchEnd - 1) / cols);
 		const checkedLogicalStarts = new Set<number>();
 		for (let i = 0; i < maxRow; i++) {
 			if (!alive) return;
@@ -2236,7 +1643,9 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 			if (!row) continue;
 			const text = rowToText(row);
 			if (text.length < cols) continue; // not full-width, not wrapped
-			if (!text.includes("file://")) continue;
+			const hasFile = text.includes("file://");
+			const hasWeb = /https?:\/\//.test(text);
+			if (!hasFile && !hasWeb) continue;
 			if (checkedLogicalStarts.has(i)) continue;
 			try {
 				const [startRow, logicalText] = (await ref("terminal_get_logical_line", {
@@ -2245,30 +1654,32 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 				})) as [number, string];
 				if (!alive) return;
 				if (startRow === i && logicalText === text) continue; // single row
+				if (checkedLogicalStarts.has(startRow)) continue;
 				checkedLogicalStarts.add(startRow);
+
+				// Web URLs — no path resolution needed.
+				WEB_URL_RE.lastIndex = 0;
+				let wm: RegExpExecArray | null;
+				while ((wm = WEB_URL_RE.exec(logicalText)) !== null) {
+					const matchEnd = wm.index + wm[0].length;
+					if (!spansMultipleRows(wm.index, matchEnd)) continue;
+					recordWrappedSpans(startRow, wm.index, matchEnd);
+					anyFound = true;
+				}
+
+				// file:// URLs — underline only once resolved to a real path.
 				FILE_URL_RE.lastIndex = 0;
 				let m: RegExpExecArray | null;
 				while ((m = FILE_URL_RE.exec(logicalText)) !== null) {
 					const matchEnd = m.index + m[0].length;
-					// Only process if this match spans multiple rows
-					if (Math.floor(m.index / cols) === Math.floor((matchEnd - 1) / cols)) continue;
+					if (!spansMultipleRows(m.index, matchEnd)) continue;
 					try {
 						const r = (await ref("resolve_terminal_path", { cwd, candidate: m[1] })) as {
 							absolute_path: string;
 							is_directory: boolean;
 						} | null;
 						if (!r) continue;
-						// Add spans to detectedLinks for each row
-						for (let offset = m.index; offset < matchEnd; ) {
-							const spanRow = startRow + Math.floor(offset / cols);
-							const spanColStart = offset % cols;
-							const remaining = matchEnd - offset;
-							const spanColEnd = Math.min(spanColStart + remaining, cols);
-							const existing = detectedLinks.get(spanRow) || [];
-							existing.push({ colStart: spanColStart, colEnd: spanColEnd });
-							detectedLinks.set(spanRow, existing);
-							offset += spanColEnd - spanColStart;
-						}
+						recordWrappedSpans(startRow, m.index, matchEnd);
 						anyFound = true;
 					} catch {
 						/* resolve failed */
@@ -2353,9 +1764,14 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 			const urlMatches: { text: string; path: string; index: number }[] = [];
 			let match: RegExpExecArray | null;
 
-			// Web URLs (no resolution needed)
+			// Web URLs (no resolution needed). A URL that reaches the row's right
+			// edge may be soft-wrapped onto the next row — defer it to the
+			// logical-line pass below so the FULL url is captured, not the
+			// truncated single-row prefix (e.g. http://127.0.0.1:8090 wrapping to
+			// ".../8" + "090" must not open as http://127.0.0.1:8).
 			webUrlRe.lastIndex = 0;
 			while ((match = webUrlRe.exec(rowText)) !== null) {
+				if (match.index + match[0].length >= rowText.length) continue;
 				urlMatches.push({ text: match[0], path: match[0], index: match.index });
 			}
 
@@ -2433,6 +1849,21 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 			}
 		}
 
+		// A web URL that reaches the row's right edge was deferred above (it may be
+		// soft-wrapped); force the logical-line pass so it's re-detected on the
+		// joined line even when the row happens not to be wrapped.
+		let rowHasEdgeUrl = false;
+		{
+			WEB_URL_RE.lastIndex = 0;
+			let em: RegExpExecArray | null;
+			while ((em = WEB_URL_RE.exec(rowText)) !== null) {
+				if (em.index + em[0].length >= rowText.length) {
+					rowHasEdgeUrl = true;
+					break;
+				}
+			}
+		}
+
 		// If no single-row link found, try logical line (joins soft-wrapped rows)
 		if (!hoveredLink && ref) {
 			try {
@@ -2441,7 +1872,7 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 					row,
 				})) as [number, string];
 				if (!alive || gen !== linkCheckGeneration) return;
-				if (startRow !== row || logicalText !== rowText) {
+				if (startRow !== row || logicalText !== rowText || rowHasEdgeUrl) {
 					const cols = lastScreenCols > 0 ? lastScreenCols : currentFrame?.screenCols || 80;
 					const colOffset = (row - startRow) * cols;
 					const logicalCol = colOffset + col;
@@ -2518,14 +1949,24 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 	let scrollGestureEndTimer: ReturnType<typeof setTimeout> | undefined;
 
 	onMount(async () => {
-		const baseCtx = canvasRef.getContext("2d", { alpha: false });
 		const overlayCtx = overlayCanvasRef.getContext("2d");
-		if (!baseCtx || !overlayCtx) {
+		if (!overlayCtx) {
+			appLogger.error("terminal", "Failed to acquire overlay 2D context");
+			return;
+		}
+		octx = overlayCtx;
+
+		const baseCtx = canvasRef.getContext("2d", { alpha: false });
+		if (!baseCtx) {
 			appLogger.error("terminal", "Failed to acquire canvas 2D context");
 			return;
 		}
 		ctx = baseCtx;
-		octx = overlayCtx;
+		gridRenderer = createGridRenderer(ctx, {
+			fontWeight: () => settingsStore.state.fontWeight,
+			getFontFamily: () => settingsStore.getFontFamily(),
+		});
+		installFrameTimingDebugHook();
 		acquireCache();
 		const fontFamily = settingsStore.getFontFamily();
 		const fontSize = settingsStore.state.defaultFontSize;
@@ -2548,15 +1989,45 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 				const isVisible = entries[0]?.isIntersecting ?? false;
 				if (isVisible && hidden) {
 					hidden = false;
-					rowMap.clear();
-					detectedLinks.clear();
 					fullRepaintNeeded = true;
-					currentFrame = null;
 					lastDisplayOffset = -1;
+					// Freeze-investigation: hidden→visible is the repo-switch show path.
+					// Breadcrumb + burst note expose the un-staggered thundering herd.
+					markPerf("term.show", { sessionId: props.sessionId });
+					// Don't clear rowMap/currentFrame here — keep showing the
+					// last painted content until the fresh frame arrives.
+					// onFrame() replaces rowMap when a full frame arrives
+					// (rows.length >= screenRowCount), so stale data is
+					// naturally discarded without a blank flash.
 					remeasure();
-					invokeRef?.("terminal_request_frame", { sessionId: props.sessionId }).catch(ipcErr("terminal_request_frame"));
+					if (focused()) startBlink();
+					// If remeasure saw 0x0 (layout not yet computed after
+					// display:none → display:block), retry after a frame.
+					const rect = containerRef.getBoundingClientRect();
+					if (rect.width <= 0 || rect.height <= 0) {
+						requestAnimationFrame(() => {
+							remeasure();
+							noteFrameRequest();
+							invokeRef?.("terminal_request_frame", { sessionId: props.sessionId }).catch(
+								ipcErr("terminal_request_frame"),
+							);
+						});
+					} else {
+						noteFrameRequest();
+						invokeRef?.("terminal_request_frame", { sessionId: props.sessionId }).catch(
+							ipcErr("terminal_request_frame"),
+						);
+					}
 				} else if (!isVisible && !hidden) {
 					hidden = true;
+					stopBlink();
+					// Shrink to free the backing store while hidden.
+					canvasRef.width = 1;
+					canvasRef.height = 1;
+					overlayCanvasRef.width = 1;
+					overlayCanvasRef.height = 1;
+					rowMap.clear();
+					fileLinkCache.clear();
 				}
 			},
 			{ threshold: 0 },
@@ -2579,12 +2050,34 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 		// keys (quotes, accents, etc.) fail when keydown listeners live on the canvas.
 		// When the canvas gains focus, we redirect to keyInputRef.
 		canvasRef.addEventListener("focus", () => {
-			keyInputRef.focus();
+			keyInputRef.focus({ preventScroll: true });
 		});
+
+		// iOS/iPadOS soft keyboards stop auto-repeating Backspace once the focused
+		// field is empty, so holding Delete erased only a single character. Keep a
+		// small space buffer in the hidden input on touch devices so
+		// each key-repeat tick has something to delete and keeps firing
+		// deleteContent* events. Desktop keeps the field empty so macOS dead-key
+		// composition (which needs an empty input) is unaffected.
+		const INPUT_BUFFER = "   ";
+		const resetInputBuffer = () => {
+			if (isTouchDevice) {
+				keyInputRef.value = INPUT_BUFFER;
+				try {
+					keyInputRef.setSelectionRange(INPUT_BUFFER.length, INPUT_BUFFER.length);
+				} catch {
+					// setSelectionRange can throw on a hidden/detached input — harmless
+				}
+			} else {
+				keyInputRef.value = "";
+			}
+		};
+
 		keyInputRef.addEventListener("focus", () => {
 			setFocused(true);
 			startBlink();
 			props.onFocus?.();
+			resetInputBuffer();
 			if (currentFrame?.focusReporting) writePtyNoScroll("\x1b[I");
 		});
 		keyInputRef.addEventListener("blur", () => {
@@ -2594,27 +2087,58 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 			if (currentFrame?.focusReporting) writePtyNoScroll("\x1b[O");
 		});
 
-		// Clear stray text outside of composition. During composition the input
-		// must hold the in-progress text or compositionend will never resolve.
+		// Text from input methods that don't emit usable keydown events — iOS/
+		// iPadOS soft keyboard, dictation, and predictive/autocorrect — arrives
+		// only as `input` events (keydown fires with key "Unidentified", so
+		// keyToSequence returns null and never preventDefaults). On desktop,
+		// printable keys are handled in keydown with preventDefault(), so no
+		// `input` event fires for them; anything that reaches here is mobile-style
+		// text we must forward to the PTY ourselves. During composition the input
+		// must hold the in-progress text or compositionend will never resolve, so
+		// leave it untouched in that case.
+		// DEFERRED (2026-06-27) — verify iOS dictation interim/replacement edge
+		// cases on a real iPad: with autocorrect off the common path is
+		// incremental insertText, but some iOS versions emit insertReplacementText
+		// which could double-write. Needs device testing to confirm.
 		keyInputRef.addEventListener("input", (e) => {
-			if ((e as InputEvent).isComposing) return;
-			keyInputRef.value = "";
+			const ie = e as InputEvent;
+			if (ie.isComposing) return;
+			switch (ie.inputType) {
+				case "deleteContentBackward":
+					writePty("\x7f");
+					break;
+				case "deleteContentForward":
+					writePty("\x1b[3~");
+					break;
+				case "insertLineBreak":
+				case "insertParagraph":
+					writePty("\r");
+					break;
+				default:
+					// insertText, insertReplacementText, insertFromDictation, …
+					if (ie.data) writePty(ie.data);
+			}
+			resetInputBuffer();
 		});
 
 		// --- Keyboard ---
 		const composition = createCompositionState();
+		keyInputRef.addEventListener("compositionstart", () => {
+			const m = metrics();
+			if (currentFrame && m) syncImePosition(currentFrame.cursorRow, currentFrame.cursorCol, m);
+		});
 		keyInputRef.addEventListener("compositionend", (e) => {
 			const data = composition.onCompositionEnd(e.data);
 			if (data) writePty(data);
 			queueMicrotask(() => {
-				keyInputRef.value = "";
+				resetInputBuffer();
 			});
 		});
 
 		let leftOptionHeld = false;
 
 		keyInputRef.addEventListener("keydown", (e: KeyboardEvent) => {
-			if (composition.shouldSuppressKeydown(e.isComposing)) {
+			if (composition.shouldSuppressKeydown(e.isComposing, e.key)) {
 				e.preventDefault();
 				return;
 			}
@@ -2711,7 +2235,7 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 				e.preventDefault();
 
 				rowMap.clear();
-				detectedLinks.clear();
+				clearDetectedLinks();
 				fullRepaintNeeded = true;
 				currentFrame = null;
 				lastDisplayOffset = -1;
@@ -2739,6 +2263,11 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 					e.preventDefault();
 					props.onResume?.();
 				} else if (e.key.length === 1) {
+					// preventDefault stops the hidden key-input from also emitting an
+					// `input` event for this printable key — without it the char is
+					// written twice (keydown + input), e.g. "c" → "cc" (issue: resume
+					// banner double-echo). Mirrors the normal printable path below.
+					e.preventDefault();
 					props.onResumeDismiss?.();
 					// Let the keystroke pass through to PTY
 					// macOS Right Option: send composed char directly, skip ESC prefix
@@ -2760,10 +2289,19 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 				return;
 			}
 
-			// Ctrl/Cmd+C with selection → copy instead of interrupt
-			if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "c" && selectionStart && selectionEnd) {
+			// Copy selection with the platform copy modifier (Cmd on macOS, Ctrl on Win/Linux).
+			// On macOS Ctrl+C is the interrupt key — distinct from Cmd+C — so it must NOT be
+			// hijacked into copy here; it falls through to the Emacs Ctrl+letter path → \x03.
+			// Also fires when coords were cleared by mouseup (auto-copy) but cache is still warm.
+			const copyModifier = isMacOS() ? e.metaKey : e.ctrlKey;
+			if (copyModifier && e.key.toLowerCase() === "c" && ((selectionStart && selectionEnd) || cachedSelectionText)) {
 				e.preventDefault();
 				e.stopPropagation();
+				// Skip if the native Edit > Copy accelerator (menu.rs CmdOrCtrl+C) already fired for
+				// this same keypress — otherwise we writeText() twice in <200ms, which macOS DeepL
+				// reads as a double-Cmd+C and pops up its translation overlay. Same guard as
+				// useKeyboardShortcuts.ts. The menu path (copyFromTerminal) handles the copy.
+				if (Date.now() - lastMenuActionTime < 200) return;
 				copySelection();
 				return;
 			}
@@ -2786,9 +2324,18 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 				return;
 			}
 
-			// Any keypress clears selection — full repaint to remove ghost highlights
-			// Skip pure modifier keys so Cmd+C / Ctrl+C can fire as a chord
-			if (selectionStart && e.key !== "Meta" && e.key !== "Control" && e.key !== "Alt" && e.key !== "Shift") {
+			// Any keypress clears selection — full repaint to remove ghost highlights.
+			// Skip modifier keys and Cmd+C/V so the chord completes before selection is dropped.
+			// Include cachedSelectionText so a stale warm cache (coords already null) gets cleared
+			// too — otherwise it sticks until a resize and keeps swallowing Ctrl+C into copy.
+			if (
+				(selectionStart || cachedSelectionText) &&
+				e.key !== "Meta" &&
+				e.key !== "Control" &&
+				e.key !== "Alt" &&
+				e.key !== "Shift" &&
+				!((e.ctrlKey || e.metaKey) && (e.key.toLowerCase() === "c" || e.key.toLowerCase() === "v"))
+			) {
 				selectionStart = null;
 				selectionEnd = null;
 				cachedSelectionText = "";
@@ -2905,9 +2452,17 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 		let lastClickTime = 0;
 
 		canvasRef.addEventListener("mousedown", (e: MouseEvent) => {
-			keyInputRef.focus();
+			keyInputRef.focus({ preventScroll: true });
 			if (currentFrame && currentFrame.mouseMode > 0 && !e.shiftKey) {
 				const pos = canvasToGrid(e);
+				// Right-click on a detected link → let the contextmenu handler fire (Open /
+				// Copy link), even while an app has mouse reporting on. In WKWebView,
+				// preventDefault on a right-button mousedown suppresses the contextmenu event,
+				// so over a link we neither forward nor preventDefault: the app loses this one
+				// right-click, but the link menu works — UI-first (see #57).
+				if (e.button === 2 && detectedLinks.get(pos.row)?.some((sp) => pos.col >= sp.colStart && pos.col < sp.colEnd)) {
+					return;
+				}
 				if (currentFrame.sgrMouse) {
 					writePtyNoScroll(sgrMouseSequence(e.button, pos.col, pos.row, true, e));
 				}
@@ -3004,9 +2559,39 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 				selectionEnd = null;
 			}
 			selecting = true;
+			// Cache the canvas rect for the whole drag — its position doesn't move
+			// while selecting (auto-scroll shifts content offset, not the element).
+			selectionDragRect = canvasRef.getBoundingClientRect();
 			fullRepaintNeeded = true;
 			scheduleRepaint();
 		});
+
+		// Coalesced selection-drag processing: runs at most once per frame with the
+		// latest mouse position (#9b13). Uses the cached drag rect (no per-move gBCR).
+		const flushSelectionDrag = () => {
+			selectionRafId = undefined;
+			const e = lastSelectionEvent;
+			if (!e || !selecting || !selectionStart) return;
+			const rect = selectionDragRect ?? canvasRef.getBoundingClientRect();
+			const m = metrics();
+			if (m) {
+				const yAbove = rect.top - e.clientY;
+				const yBelow = e.clientY - rect.bottom;
+				if (yAbove > 0) {
+					startSelectionScroll(Math.ceil(yAbove / m.cellHeight));
+				} else if (yBelow > 0) {
+					startSelectionScroll(-Math.ceil(yBelow / m.cellHeight));
+				} else {
+					stopSelectionScroll();
+				}
+			}
+			const pos = canvasToGrid(e, rect);
+			const absRow = viewportRowToAbs(pos.row);
+			if (absRow === null) return;
+			selectionEnd = { col: pos.col, row: absRow };
+			const mRepaint = metrics();
+			if (currentFrame && mRepaint) paintFrame(currentFrame, mRepaint);
+		};
 
 		const onMouseMove = (e: MouseEvent) => {
 			if (currentFrame && currentFrame.mouseMode > 0 && !e.shiftKey) {
@@ -3021,28 +2606,12 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 				return;
 			}
 
+			// Selection drag: coalesce into one rAF/frame with the latest position.
 			if (selecting && selectionStart) {
-				const rect = canvasRef.getBoundingClientRect();
-				const m = metrics();
-				if (m) {
-					const yAbove = rect.top - e.clientY;
-					const yBelow = e.clientY - rect.bottom;
-					if (yAbove > 0) {
-						const rows = Math.ceil(yAbove / m.cellHeight);
-						startSelectionScroll(rows);
-					} else if (yBelow > 0) {
-						const rows = Math.ceil(yBelow / m.cellHeight);
-						startSelectionScroll(-rows);
-					} else {
-						stopSelectionScroll();
-					}
+				lastSelectionEvent = e;
+				if (selectionRafId === undefined) {
+					selectionRafId = requestAnimationFrame(flushSelectionDrag);
 				}
-				const pos = canvasToGrid(e);
-				const absRow = viewportRowToAbs(pos.row);
-				if (absRow === null) return;
-				selectionEnd = { col: pos.col, row: absRow };
-				const mRepaint = metrics();
-				if (currentFrame && mRepaint) paintFrame(currentFrame, mRepaint);
 			}
 
 			// Link detection (throttled)
@@ -3075,6 +2644,13 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 				}
 			}
 			selecting = false;
+			// End the coalesced drag: drop the cached rect + any pending frame.
+			selectionDragRect = null;
+			lastSelectionEvent = null;
+			if (selectionRafId !== undefined) {
+				cancelAnimationFrame(selectionRafId);
+				selectionRafId = undefined;
+			}
 		};
 
 		document.addEventListener("mousemove", onMouseMove);
@@ -3088,49 +2664,58 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 				selectionEnd &&
 				(selectionStart.row !== selectionEnd.row || selectionStart.col !== selectionEnd.col);
 			if (dragged) return;
-			if (hoveredLink.path.startsWith("http://") || hoveredLink.path.startsWith("https://")) {
-				handleOpenUrl(hoveredLink.path);
-			} else {
-				const path = hoveredLink.path.startsWith("file://") ? hoveredLink.path.slice(7) : hoveredLink.path;
-				props.onOpenFilePath?.(path, hoveredLink.line, hoveredLink.col);
-			}
+			openLink(hoveredLink);
+		});
+
+		// Right-click on a detected link → context menu (Open / Copy link).
+		// Only when the click lands on a link span; elsewhere the default is left alone.
+		canvasRef.addEventListener("contextmenu", async (e: MouseEvent) => {
+			const pos = canvasToGrid(e);
+			const onLink = detectedLinks.get(pos.row)?.some((sp) => pos.col >= sp.colStart && pos.col < sp.colEnd);
+			if (!onLink) return;
+			e.preventDefault();
+			// Stop the App-level terminal context menu (#terminal-panes onContextMenu)
+			// from also opening and covering our Open/Copy-link menu.
+			e.stopPropagation();
+			await checkLinksAtRow(pos.row, pos.col);
+			if (!hoveredLink) return;
+			setLinkMenuTarget({ path: hoveredLink.path, line: hoveredLink.line, col: hoveredLink.col });
+			linkMenu.openAt(e.clientX, e.clientY);
 		});
 
 		// --- Scroll ---
 
-		function resetScrollGesture() {
-			scrollAccumPx = 0;
-			scrollGestureDistPx = 0;
-		}
-
 		function handleWheel(e: WheelEvent) {
 			e.preventDefault();
 			e.stopPropagation();
-			if (currentFrame && currentFrame.mouseMode > 0) {
+			// While dragging the scrollbar thumb, ignore wheel input — otherwise it would
+			// re-enter smooth-scroll (scrollPosF != null) and re-freeze repaints mid-drag.
+			if (scrollDragging) return;
+			// Forward the wheel to the app whenever it has mouse reporting enabled —
+			// it owns the viewport and wants to drive its own scroll. This covers
+			// both the alternate screen (vim, lazygit, htop) AND inline fullscreen
+			// TUIs in the main buffer (e.g. `grok --no-alt-screen`, which scrolls its
+			// own conversation on SGR wheel events — verified against grok 0.2.67).
+			// We deliberately do NOT gate on historySize === 0: grok emits `\x1b[24S`
+			// at startup, creating scrollback, so that proxy left grok's wheel dead
+			// (TUIC scrolled its own history instead of forwarding to grok).
+			// Shift+wheel always scrolls the TUIC scrollback, never the app — the
+			// escape hatch matching the click/motion handlers' `!e.shiftKey` bypass.
+			if (currentFrame && currentFrame.mouseMode > 0 && !e.shiftKey) {
 				const pos = canvasToGrid(e as unknown as MouseEvent);
 				const btn = e.deltaY < 0 ? 64 : 65;
 				writePtyNoScroll(sgrMouseSequence(btn, pos.col, pos.row, true, e as unknown as MouseEvent));
 				return;
 			}
-			const m = metrics();
-			const ch = m?.cellHeight ?? 20;
-			const screenPx = ch * (lastResizeRows || 24);
-
 			const dy = e.deltaY;
-			const atBottom = currentFrame && currentFrame.displayOffset === 0;
-			const atTop = currentFrame && currentFrame.displayOffset >= currentFrame.historySize;
+			const atBottom = currentFrame && currentFrame.displayOffset === 0 && (scrollPosF == null || scrollPosF <= 0);
+			const atTop =
+				currentFrame &&
+				currentFrame.displayOffset >= currentFrame.historySize &&
+				(scrollPosF == null || scrollPosF >= currentFrame.historySize);
 			if ((atBottom && dy > 0) || (atTop && dy < 0)) return;
 
-			scrollGestureDistPx += Math.abs(dy);
-			const excess = Math.max(0, scrollGestureDistPx - screenPx);
-			const factor = 0.5 + 0.5 * (excess / screenPx);
-			scrollAccumPx += dy * factor;
-
-			const lines = Math.trunc(scrollAccumPx / ch);
-			if (lines !== 0) {
-				scrollAccumPx -= lines * ch;
-				invokeRef?.("terminal_scroll", { sessionId: props.sessionId, delta: -lines }).catch(ipcErr("terminal_scroll"));
-			}
+			handleScrollDelta(dy);
 
 			clearTimeout(scrollGestureEndTimer);
 			scrollGestureEndTimer = setTimeout(resetScrollGesture, 200);
@@ -3148,18 +2733,26 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 			if (e.target === scrollThumbRef) return; // thumb has its own handler
 			if (!currentFrame || currentFrame.historySize === 0) return;
 			e.preventDefault();
+			// Cancel any in-flight/settling smooth gesture (scrollPosF non-null
+			// suppresses normal repaints, and the wheel gesture-end timer would
+			// otherwise re-settle over this jump) so the terminal_scroll jump below
+			// actually repaints the view.
+			resetSmoothScroll();
 			const rect = scrollbarRef.getBoundingClientRect();
 			const clickRatio = (e.clientY - rect.top) / rect.height;
 			const targetOffset = Math.round((1 - clickRatio) * currentFrame.historySize);
-			const delta = targetOffset - currentFrame.displayOffset;
-			if (delta !== 0) {
-				invokeRef?.("terminal_scroll", { sessionId: props.sessionId, delta }).catch(ipcErr("terminal_scroll"));
-			}
+			// Coalesced absolute jump (latest-wins, back-pressured) — same path as wheel/touch.
+			pendingScrollOffset = Math.max(0, Math.min(currentFrame.historySize, targetOffset));
+			scheduleScrollFlush();
 		});
 
 		scrollThumbRef.addEventListener("mousedown", (e: MouseEvent) => {
 			e.preventDefault();
 			e.stopPropagation();
+			// Cancel any in-flight/settling smooth gesture first; otherwise scrollPosF
+			// stays non-null and scheduleRepaint bails, freezing the view while we drag
+			// the thumb. (resetSmoothScroll also cancels the wheel gesture-end timer.)
+			resetSmoothScroll();
 			scrollDragging = true;
 			scrollDragStartY = e.clientY;
 			scrollDragStartOffset = currentFrame?.displayOffset ?? 0;
@@ -3169,18 +2762,20 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 			if (!scrollDragging || !currentFrame) return;
 			const historySize = currentFrame.historySize;
 			if (historySize === 0) return;
-			const trackHeight = scrollbarRef.clientHeight;
+			// Use the cached track height (set in remeasure) instead of reading
+			// scrollbarRef.clientHeight — a layout-forcing read on every mousemove.
+			const trackHeight = scrollbarTrackHeight;
 			const thumbHeight = parseFloat(scrollThumbRef.style.height) || 20;
 			const scrollRange = trackHeight - thumbHeight;
 			if (scrollRange <= 0) return;
 
 			const dy = e.clientY - scrollDragStartY;
 			const offsetDelta = Math.round((dy / scrollRange) * historySize);
-			const newOffset = Math.max(0, Math.min(historySize, scrollDragStartOffset - offsetDelta));
-			const delta = newOffset - currentFrame.displayOffset;
-			if (delta !== 0) {
-				invokeRef?.("terminal_scroll", { sessionId: props.sessionId, delta }).catch(ipcErr("terminal_scroll"));
-			}
+			// Absolute target anchored to the drag start — NOT a delta vs the (async, often
+			// stale) currentFrame.displayOffset, which would overshoot on fast drags. Routed
+			// through the coalesced latest-wins flush so rapid mousemoves collapse to one IPC.
+			pendingScrollOffset = Math.max(0, Math.min(historySize, scrollDragStartOffset - offsetDelta));
+			scheduleScrollFlush();
 		};
 
 		const onScrollDragUp = () => {
@@ -3190,23 +2785,31 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 		document.addEventListener("mousemove", onScrollDragMove);
 		document.addEventListener("mouseup", onScrollDragUp);
 
+		// Assign the DOM-listener cleanup NOW, before the transport.subscribe() await
+		// below. If the component unmounts mid-await, onCleanup runs while `unsubscribe`
+		// would otherwise still be undefined — leaking all four document listeners for
+		// the page lifetime. The success path augments this with transport.unsubscribe().
+		const detachDomListeners = () => {
+			document.removeEventListener("mousemove", onMouseMove);
+			document.removeEventListener("mouseup", onMouseUp);
+			document.removeEventListener("mousemove", onScrollDragMove);
+			document.removeEventListener("mouseup", onScrollDragUp);
+			if (scrollRafId) cancelAnimationFrame(scrollRafId);
+			if (selectionRafId !== undefined) cancelAnimationFrame(selectionRafId);
+			resetSmoothScroll();
+			stopSelectionScroll();
+		};
+		unsubscribe = detachDomListeners;
+
 		// Touch input (mobile/tablet)
 		cleanupTouch = installTouchHandlers(canvasRef, touchTextareaRef, {
 			onScrollPixels: (dy) => {
-				const m = metrics();
-				const ch = m?.cellHeight ?? 20;
-				const screenPx = ch * (lastResizeRows || 24);
-				scrollGestureDistPx += Math.abs(dy);
-				const excess = Math.max(0, scrollGestureDistPx - screenPx);
-				const factor = 0.5 + 0.5 * (excess / screenPx);
-				scrollAccumPx += dy * factor;
-				const lines = Math.trunc(scrollAccumPx / ch);
-				if (lines !== 0) {
-					scrollAccumPx -= lines * ch;
-					invokeRef?.("terminal_scroll", { sessionId: props.sessionId, delta: -lines }).catch(
-						ipcErr("terminal_scroll"),
-					);
-				}
+				// Touch is direct manipulation: the content must follow the finger,
+				// the OPPOSITE of the wheel convention handleScrollDelta expects
+				// (positive dy = toward newer/bottom). Negate so swipe-up reveals
+				// newer lines and swipe-down reveals older scrollback, matching
+				// native iOS scrolling.
+				handleScrollDelta(-dy);
 			},
 			onScrollEnd: resetScrollGesture,
 			onInput: (data) => writePty(data),
@@ -3230,26 +2833,30 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 			transport = createTransport(props.sessionId);
 			invokeRef = (cmd, args) => transport!.invoke(cmd, args);
 			await transport.subscribe((data) => onFrame(data));
+			if (!alive) {
+				// Unmounted while subscribe() was in flight. onCleanup already ran and
+				// invoked the DOM-only unsubscribe assigned before the await — but the
+				// transport subscription is now live and would leak. Tear it down here.
+				transport.unsubscribe();
+				return;
+			}
 			unsubscribe = () => {
-				document.removeEventListener("mousemove", onMouseMove);
-				document.removeEventListener("mouseup", onMouseUp);
-				document.removeEventListener("mousemove", onScrollDragMove);
-				document.removeEventListener("mouseup", onScrollDragUp);
-				stopSelectionScroll();
+				detachDomListeners();
 				transport?.unsubscribe();
 			};
+			// Paint the current grid now. The browser-mode WS subscribe (unlike the
+			// Tauri event channel) does not replay the current frame, so an idle
+			// session with no pending output would render nothing and leave the
+			// canvas black until the first interaction. Forcing a full frame here is
+			// idempotent on desktop and fixes the black-on-load in browser mode.
+			noteFrameRequest();
+			invokeRef?.("terminal_request_frame", { sessionId: props.sessionId }).catch(ipcErr("terminal_request_frame"));
 		} catch (e) {
 			appLogger.error("terminal", "Failed to subscribe to terminal grid channel", {
 				sessionId: props.sessionId,
 				error: e,
 			});
-			unsubscribe = () => {
-				document.removeEventListener("mousemove", onMouseMove);
-				document.removeEventListener("mouseup", onMouseUp);
-				document.removeEventListener("mousemove", onScrollDragMove);
-				document.removeEventListener("mouseup", onScrollDragUp);
-				stopSelectionScroll();
-			};
+			// `unsubscribe` is already detachDomListeners (assigned before the await).
 		}
 
 		// Listen for session events via transport
@@ -3270,11 +2877,11 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 		}
 
 		props.onRef?.({
-			focus: () => keyInputRef.focus(),
+			focus: () => keyInputRef.focus({ preventScroll: true }),
 			getSelectionText: () => cachedSelectionText,
 			refresh: () => {
 				rowMap.clear();
-				detectedLinks.clear();
+				clearDetectedLinks();
 				fullRepaintNeeded = true;
 				currentFrame = null;
 				lastDisplayOffset = -1;
@@ -3340,8 +2947,55 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 				const m = metrics();
 				if (currentFrame && m) paintFrame(currentFrame, m);
 			},
+			paste: (text: string) => {
+				if (currentFrame?.bracketedPaste) {
+					writePty(`\x1b[200~${text}\x1b[201~`);
+				} else {
+					writePty(text);
+				}
+			},
 		});
 	});
+
+	// On-screen keyboard handling (touch only): slide THIS terminal up just enough
+	// to reveal the CURSOR ROW above the virtual keyboard, without resizing the app
+	// layout or the PTY (no reflow/SIGWINCH). The lift is anchored to the cursor —
+	// NOT the pane's bottom edge — so a freshly-started agent whose input sits near
+	// the TOP of the grid isn't shifted off-screen (the mirror of the original
+	// occlusion bug). It's a pure transform on kbLiftRef (wraps the stage), clipped
+	// by containerRef's overflow:hidden. Only the focused terminal lifts.
+	function updateKeyboardLift() {
+		const occ = keyboardOcclusion();
+		const isFocused = focused();
+		const m = metrics();
+		if (!isTouchDevice || !kbLiftRef) return;
+		const frame = currentFrame;
+		// Clear when unfocused, keyboard closed, no frame/metrics yet, or scrolled
+		// back into history (frame.displayOffset > 0 → cursor isn't on screen).
+		if (!isFocused || occ <= 0 || !frame || !m || frame.displayOffset > 0) {
+			kbLiftRef.style.transform = "";
+			return;
+		}
+		// containerRef doesn't move (only its child kbLiftRef is transformed), so its
+		// top is the stable viewport origin for the cursor's untransformed Y. Lift by
+		// how far the cursor row's bottom sits below the keyboard's top edge — zero
+		// when the cursor is already above the keyboard, so a top-anchored input never
+		// gets pushed up. Anchoring to the cursor bottom self-clamps: the cursor can't
+		// overshoot above containerRef.top.
+		const keyboardTop = window.innerHeight - occ;
+		const cursorBottomY = containerRef.getBoundingClientRect().top + (frame.cursorRow + 1) * m.cellHeight;
+		const lift = Math.max(0, Math.round(cursorBottomY - keyboardTop));
+		kbLiftRef.style.transform = lift > 0 ? `translateY(${-lift}px)` : "";
+	}
+	if (isTouchDevice) {
+		ensureKeyboardViewportTracking();
+		// React to keyboard open/close, focus, and metrics (font) changes. Cursor
+		// movement is driven separately from the frame-decode path, since currentFrame
+		// is a plain ref, not a signal.
+		createEffect(() => {
+			updateKeyboardLift();
+		});
+	}
 
 	createEffect(() => {
 		terminalsStore.state.terminals[props.terminalId]?.fontSize;
@@ -3351,8 +3005,7 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 		if (!alive) return;
 		settingsStore.state.theme;
 		invalidateGlyphCache();
-		fontStyleCache.clear();
-		colorStringCache.clear();
+		gridRenderer?.invalidateCaches();
 		fullRepaintNeeded = true;
 		remeasure();
 	});
@@ -3363,7 +3016,12 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 			| undefined;
 		try {
 			let text: string;
-			if (selectionSpansOffscreen() && invokeRef && selectionStart && selectionEnd) {
+			// Always prefer the Rust path: it unwraps soft-wrapped logical lines via the
+			// WRAPLINE flag (grid_get_selection_text), so copying a line the terminal merely
+			// wrapped for width doesn't insert a spurious newline. The JS fallback below has
+			// no wrap info (see getLocalSelectionText DEFERRED) and only runs when invoke or
+			// the selection coords are unavailable.
+			if (invokeRef && selectionStart && selectionEnd) {
 				text = (await invokeRef("terminal_get_selection_text", {
 					sessionId: props.sessionId,
 					startRow: selectionStart.row,
@@ -3371,12 +3029,16 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 					endRow: selectionEnd.row,
 					endCol: selectionEnd.col,
 				})) as string;
+				// Fall back to the local read if the IPC path yields nothing (transient error,
+				// grid not ready). Loses wrap-unwrapping, but a wrapped copy beats a silent
+				// no-op — the onscreen path could always satisfy a copy before this routing.
+				if (!text) text = getLocalSelectionText();
 			} else {
 				text = getLocalSelectionText();
 			}
 			if (text) {
 				cachedSelectionText = text;
-				await navigator.clipboard.writeText(text);
+				await writeClipboard(text);
 				setStatus?.("Copied to clipboard");
 			}
 		} catch (e) {
@@ -3392,6 +3054,14 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 			cancelAnimationFrame(rafId);
 			rafId = undefined;
 		}
+		// Smooth-scroll RAF + settle timer also outlive unmount and run against the
+		// released row cache — cancel both.
+		if (smoothRafId) {
+			cancelAnimationFrame(smoothRafId);
+			smoothRafId = 0;
+		}
+		clearSettlePending();
+		if (reconcileTimer) clearTimeout(reconcileTimer);
 		clearTimeout(resizeDebounce);
 		resizeObserver?.disconnect();
 		visibilityObserver?.disconnect();
@@ -3403,10 +3073,10 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 		clearTimeout(scrollGestureEndTimer);
 		linkCache.clear();
 		fileLinkCache.clear();
+		resetFrameTiming(props.sessionId);
 		rowMap.clear();
-		detectedLinks.clear();
-		colorStringCache.clear();
-		fontStyleCache.clear();
+		clearDetectedLinks();
+		gridRenderer?.invalidateCaches();
 		releaseCache();
 	});
 
@@ -3432,7 +3102,7 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 				e.preventDefault();
 				const quoted = `'${path.replace(/'/g, "'\\''")}' `;
 				writePty(quoted);
-				keyInputRef.focus();
+				keyInputRef.focus({ preventScroll: true });
 			}}
 		>
 			{/* Offscreen textarea for mobile virtual keyboard input */}
@@ -3462,18 +3132,20 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 				type="text"
 				aria-hidden="true"
 				style={{
-					position: "fixed",
-					top: "-9999px",
-					left: "-9999px",
-					width: "0",
-					height: "0",
+					position: "absolute",
+					top: "0",
+					left: "0",
+					width: "1px",
+					height: "1em",
 					opacity: "0",
 					border: "none",
 					outline: "none",
 					padding: "0",
 					margin: "0",
+					overflow: "hidden",
 					"pointer-events": "none",
 					"font-size": "1px",
+					"z-index": "-1",
 				}}
 				tabIndex={-1}
 				autocomplete="off"
@@ -3481,39 +3153,75 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 				autocapitalize="off"
 				spellcheck={false}
 			/>
-			<canvas
-				ref={canvasRef!}
-				style={{
-					display: "block",
-					outline: "none",
-					cursor: "text",
-				}}
-				tabIndex={0}
-			/>
-			{/* Overlay canvas: cursor, selection, search highlights — redrawn every frame without touching base canvas */}
-			<canvas
-				ref={overlayCanvasRef!}
-				style={{
-					position: "absolute",
-					top: "0",
-					left: "0",
-					"pointer-events": "none",
-				}}
-			/>
-			{/* Suggest/intent overlay */}
+			{/* Keyboard-lift wrapper: slides the whole stage up on touch devices so the
+			    cursor stays above the on-screen keyboard. Identity transform at rest;
+			    clipped by containerRef's overflow:hidden. */}
 			<div
-				ref={overlayRef!}
+				ref={kbLiftRef!}
 				style={{
 					position: "absolute",
-					top: "0",
-					left: "0",
-					right: "0",
-					bottom: "0",
-					"pointer-events": "none",
-					"z-index": "10",
-					overflow: "hidden",
+					inset: "0",
+					"will-change": "transform",
 				}}
-			/>
+			>
+				{/* Smooth-scroll stage: base + overlay translate together during a gesture.
+				    At rest transform is identity → geometry/coordinates are unchanged. */}
+				<div
+					ref={stageRef!}
+					style={{
+						position: "absolute",
+						top: "0",
+						left: "0",
+						"will-change": "transform",
+					}}
+				>
+					{/* Overscan: the row above/below the viewport, revealed as the stage slides.
+				    Sits behind the (opaque) base canvas; never hit-tested. */}
+					<canvas
+						ref={overscanCanvasRef!}
+						style={{
+							position: "absolute",
+							left: "0",
+							"pointer-events": "none",
+						}}
+					/>
+					<canvas
+						ref={canvasRef!}
+						style={{
+							position: "relative",
+							display: "block",
+							outline: "none",
+							cursor: "text",
+						}}
+						tabIndex={0}
+					/>
+					{/* Overlay canvas: cursor, selection, search highlights — redrawn every frame without touching base canvas */}
+					<canvas
+						ref={overlayCanvasRef!}
+						style={{
+							position: "absolute",
+							top: "0",
+							left: "0",
+							"pointer-events": "none",
+						}}
+					/>
+					{/* Suggest/intent overlay — inside the stage so it scrolls with the content
+				    (rebuilt from the row cache during a smooth-scroll gesture). */}
+					<div
+						ref={overlayRef!}
+						style={{
+							position: "absolute",
+							top: "0",
+							left: "0",
+							right: "0",
+							bottom: "0",
+							"pointer-events": "none",
+							"z-index": "10",
+							overflow: "hidden",
+						}}
+					/>
+				</div>
+			</div>
 			{/* Scrollbar */}
 			<div
 				ref={scrollbarRef!}
@@ -3529,19 +3237,50 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 			>
 				<div
 					ref={scrollThumbRef!}
+					onMouseEnter={(e) => {
+						// Darker, subtle hover like the old terminal scrollbar (#cccccc @0.3),
+						// not the bright --fg-muted.
+						e.currentTarget.style.background = "rgba(204, 204, 204, 0.3)";
+					}}
+					onMouseLeave={(e) => {
+						e.currentTarget.style.background = "var(--bg-highlight)";
+					}}
 					style={{
 						width: "10px",
 						"margin-left": "2px",
 						"border-radius": "5px",
-						background: "var(--text-primary, rgba(255,255,255,0.3))",
-						opacity: "var(--scrollbar-opacity, 0.3)",
+						// Harmonized with the editor scrollbar: same --bg-highlight resting
+						// color, --fg-muted on hover, and a hand pointer cursor.
+						background: "var(--bg-highlight)",
 						"min-height": "20px",
 						position: "absolute",
 						top: "0",
-						cursor: "grab",
+						cursor: "pointer",
 					}}
 				/>
 			</div>
+			<ContextMenu
+				items={[
+					{
+						label: "Open",
+						action: () => {
+							const t = linkMenuTarget();
+							if (t) openLink(t);
+						},
+					},
+					{
+						label: "Copy link",
+						action: () => {
+							const t = linkMenuTarget();
+							if (t) copyLink(t);
+						},
+					},
+				]}
+				x={linkMenu.position().x}
+				y={linkMenu.position().y}
+				visible={linkMenu.visible()}
+				onClose={() => linkMenu.close()}
+			/>
 		</div>
 	);
 };

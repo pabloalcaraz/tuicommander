@@ -1,5 +1,14 @@
-import { type Component, createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js";
-import { AGENT_DISPLAY, AGENT_TYPES, AGENTS, type AgentRunConfig, type AgentType, MCP_SUPPORT } from "../../../agents";
+import { type Component, createEffect, createMemo, createSignal, For, on, onCleanup, onMount, Show } from "solid-js";
+import {
+	AGENT_DISPLAY,
+	AGENT_TYPES,
+	AGENTS,
+	type AgentHookState,
+	type AgentRunConfig,
+	type AgentType,
+	HOOK_SUPPORT,
+	MCP_SUPPORT,
+} from "../../../agents";
 import {
 	CATEGORY_ORDER,
 	CC_ENV_FLAGS,
@@ -16,14 +25,17 @@ import { agentConfigsStore } from "../../../stores/agentConfigs";
 import { aiPromptsStore, DEFAULT_DIFF_TRIAGE_PROMPT } from "../../../stores/aiPrompts";
 import { appLogger } from "../../../stores/appLogger";
 import { editorTabsStore } from "../../../stores/editorTabs";
+import { remoteConnectionsStore } from "../../../stores/remoteConnections";
 import { repositoriesStore } from "../../../stores/repositories";
 import { settingsStore } from "../../../stores/settings";
 import { isTauri } from "../../../transport";
+import { onClickKeyDown } from "../../../utils/a11y";
 import { buildEnvFromEntries, findDuplicateEnvKeys } from "../../../utils/envVars";
 import { AgentIcon } from "../../ui/AgentIcon";
 import { SettingToggle } from "../SettingFields";
 import s from "../Settings.module.css";
 import a from "./AgentsTab.module.css";
+import { AgentConfigProvider, createRemoteAgentConfigStore, useAgentConfig } from "./agentConfigContext";
 
 const ALL_AGENT_TYPES = AGENT_TYPES.filter((t): t is AgentType => t !== "git" && t !== "api");
 
@@ -98,6 +110,7 @@ const AddConfigForm: Component<{
 	agentType: AgentType;
 	onClose: () => void;
 }> = (props) => {
+	const configStore = useAgentConfig();
 	const [name, setName] = createSignal("");
 	const [command, setCommand] = createSignal(AGENTS[props.agentType].binary);
 	const [args, setArgs] = createSignal("");
@@ -108,7 +121,7 @@ const AddConfigForm: Component<{
 	// config. A future rename UI will pass the row's current name so the user
 	// isn't flagged as duplicating themselves (story 1278-365e).
 	const allExistingNames = createMemo(() =>
-		collectRunConfigNames(ALL_AGENT_TYPES.map((t) => agentConfigsStore.getRunConfigs(t))),
+		collectRunConfigNames(ALL_AGENT_TYPES.map((t) => configStore.getRunConfigs(t))),
 	);
 	const isDuplicate = () => {
 		const n = name().trim().toLowerCase();
@@ -134,7 +147,7 @@ const AddConfigForm: Component<{
 			env: buildEnvFromEntries(envVars()),
 			is_default: false,
 		};
-		await agentConfigsStore.addRunConfig(props.agentType, config);
+		await configStore.addRunConfig(props.agentType, config);
 		props.onClose();
 	};
 
@@ -223,6 +236,7 @@ const RunConfigRow: Component<{
 	index: number;
 	agentType: AgentType;
 }> = (props) => {
+	const configStore = useAgentConfig();
 	const [editingEnv, setEditingEnv] = createSignal(false);
 	const [editingConfig, setEditingConfig] = createSignal(false);
 	const [menuOpen, setMenuOpen] = createSignal(false);
@@ -255,7 +269,7 @@ const RunConfigRow: Component<{
 
 	const allExistingNames = createMemo(() =>
 		collectRunConfigNames(
-			ALL_AGENT_TYPES.map((t) => agentConfigsStore.getRunConfigs(t)),
+			ALL_AGENT_TYPES.map((t) => configStore.getRunConfigs(t)),
 			props.config.name,
 		),
 	);
@@ -273,13 +287,13 @@ const RunConfigRow: Component<{
 			command: editCommand().trim() || props.config.command,
 			args: editArgs().trim() ? editArgs().trim().split(/\s+/) : [],
 		};
-		await agentConfigsStore.updateRunConfig(props.agentType, props.index, updated);
+		await configStore.updateRunConfig(props.agentType, props.index, updated);
 		setEditingConfig(false);
 	};
 
 	const handleDelete = () => {
 		setMenuOpen(false);
-		agentConfigsStore.removeRunConfig(props.agentType, props.index);
+		configStore.removeRunConfig(props.agentType, props.index);
 	};
 
 	const addEnvVar = () => setEnvVars([...envVars(), { key: "", value: "" }]);
@@ -293,7 +307,7 @@ const RunConfigRow: Component<{
 
 	const saveEnv = async () => {
 		if (duplicateEnvKeys().length > 0) return;
-		await agentConfigsStore.updateRunConfigEnv(props.agentType, props.index, envVars());
+		await configStore.updateRunConfigEnv(props.agentType, props.index, envVars());
 		setEditingEnv(false);
 	};
 
@@ -321,7 +335,7 @@ const RunConfigRow: Component<{
 					<Show when={!props.config.is_default}>
 						<button
 							class={a.smallBtn}
-							onClick={() => agentConfigsStore.setDefaultConfig(props.agentType, props.index)}
+							onClick={() => configStore.setDefaultConfig(props.agentType, props.index)}
 							title="Set as default"
 						>
 							Set Default
@@ -433,8 +447,9 @@ const RunConfigRow: Component<{
 
 /** Environment flags panel — categorized toggles/inputs for CC env vars */
 const EnvFlagsSection: Component<{ agentType: AgentType }> = (props) => {
+	const configStore = useAgentConfig();
 	const [expanded, setExpanded] = createSignal(false);
-	const flags = () => agentConfigsStore.getEnvFlags(props.agentType);
+	const flags = () => configStore.getEnvFlags(props.agentType);
 
 	const flagsByCategory = () => {
 		const grouped: Partial<Record<EnvFlagCategory, EnvFlagDef[]>> = {};
@@ -451,17 +466,17 @@ const EnvFlagsSection: Component<{ agentType: AgentType }> = (props) => {
 
 	const handleBoolToggle = (flag: EnvFlagDef) => {
 		if (isFlagEnabled(flag.key)) {
-			agentConfigsStore.setEnvFlag(props.agentType, flag.key, undefined);
+			configStore.setEnvFlag(props.agentType, flag.key, undefined);
 		} else {
-			agentConfigsStore.setEnvFlag(props.agentType, flag.key, flag.type === "boolean_inverted" ? "false" : "1");
+			configStore.setEnvFlag(props.agentType, flag.key, flag.type === "boolean_inverted" ? "false" : "1");
 		}
 	};
 
 	const handleValueChange = (key: string, value: string) => {
 		if (value) {
-			agentConfigsStore.setEnvFlag(props.agentType, key, value);
+			configStore.setEnvFlag(props.agentType, key, value);
 		} else {
-			agentConfigsStore.setEnvFlag(props.agentType, key, undefined);
+			configStore.setEnvFlag(props.agentType, key, undefined);
 		}
 	};
 
@@ -525,6 +540,15 @@ const EnvFlagsSection: Component<{ agentType: AgentType }> = (props) => {
 															onInput={(e) => handleValueChange(flag.key, e.currentTarget.value)}
 														/>
 													</Show>
+													<Show when={flag.type === "string"}>
+														<input
+															type="text"
+															class={a.envFlagInput}
+															value={getFlagValue(flag.key)}
+															placeholder={flag.defaultValue ?? ""}
+															onInput={(e) => handleValueChange(flag.key, e.currentTarget.value)}
+														/>
+													</Show>
 													<span class={a.envFlagKey}>{flag.key}</span>
 													<span class={a.envFlagDesc} title={flag.description}>
 														{flag.description}
@@ -581,15 +605,19 @@ const AgentRow: Component<{
 	detection: AgentAvailability | undefined;
 	onExpand?: (type: AgentType) => void;
 }> = (props) => {
+	const configStore = useAgentConfig();
 	const [expanded, setExpanded] = createSignal(false);
 	const [addingConfig, setAddingConfig] = createSignal(false);
 	const [mcpStatus, setMcpStatus] = createSignal<McpStatus | null>(null);
 	const [mcpLoading, setMcpLoading] = createSignal(false);
+	const [hookState, setHookState] = createSignal<AgentHookState | null>(null);
+	const [hookLoading, setHookLoading] = createSignal(false);
 
 	const agent = () => AGENTS[props.agentType];
 	const display = () => AGENT_DISPLAY[props.agentType];
-	const configs = () => agentConfigsStore.getRunConfigs(props.agentType);
+	const configs = () => configStore.getRunConfigs(props.agentType);
 	const supportsMcp = () => MCP_SUPPORT[props.agentType];
+	const supportsHooks = () => HOOK_SUPPORT[props.agentType];
 
 	const loadMcpStatus = async () => {
 		if (!supportsMcp() || !isTauri()) return;
@@ -601,11 +629,38 @@ const AgentRow: Component<{
 		}
 	};
 
+	const loadHookState = async () => {
+		if (!supportsHooks() || !isTauri()) return;
+		try {
+			const st = await invoke<AgentHookState>("get_agent_hook_state", { agentType: props.agentType });
+			setHookState(st);
+		} catch (err) {
+			appLogger.error("config", `Failed to get hook state for ${props.agentType}`, err);
+		}
+	};
+
+	const handleHookToggle = async () => {
+		if (hookLoading()) return;
+		setHookLoading(true);
+		try {
+			const next = !(configStore.getHookInstrumentation(props.agentType) ?? false);
+			// The command persists the flag AND installs/removes the hooks.
+			await invoke("set_agent_hook_instrumentation", { agentType: props.agentType, enabled: next });
+			configStore.syncHookInstrumentation(props.agentType, next);
+			await loadHookState();
+		} catch (err) {
+			appLogger.error("config", `Hook instrumentation toggle failed for ${props.agentType}`, err);
+		} finally {
+			setHookLoading(false);
+		}
+	};
+
 	const handleExpand = () => {
 		const newVal = !expanded();
 		setExpanded(newVal);
 		if (newVal) {
 			loadMcpStatus();
+			loadHookState();
 			props.onExpand?.(props.agentType);
 		}
 	};
@@ -644,7 +699,13 @@ const AgentRow: Component<{
 
 	return (
 		<div class={a.agentRow}>
-			<div class={a.agentHeader} onClick={handleExpand}>
+			<div
+				class={a.agentHeader}
+				role="button"
+				tabIndex={0}
+				onClick={handleExpand}
+				onKeyDown={onClickKeyDown(handleExpand)}
+			>
 				<div class={a.agentInfo}>
 					<div class={a.agentNameRow}>
 						<div class={a.agentIcon} style={{ background: display().color, opacity: isEnabled() ? 1 : 0.4 }}>
@@ -708,12 +769,9 @@ const AgentRow: Component<{
 						<label class={a.toggleRow} onClick={(e) => e.stopPropagation()}>
 							<input
 								type="checkbox"
-								checked={agentConfigsStore.isAutoRetryEnabled(props.agentType)}
+								checked={configStore.isAutoRetryEnabled(props.agentType)}
 								onChange={() =>
-									agentConfigsStore.setAutoRetry(
-										props.agentType,
-										!agentConfigsStore.isAutoRetryEnabled(props.agentType),
-									)
+									configStore.setAutoRetry(props.agentType, !configStore.isAutoRetryEnabled(props.agentType))
 								}
 							/>
 							<span>Auto-retry on server errors</span>
@@ -721,14 +779,38 @@ const AgentRow: Component<{
 						<p class={s.hint}>Inject "continue" on 5xx errors with backoff (5s, 15s, 30s)</p>
 					</div>
 
+					{/* Native-hook state instrumentation (Claude/Gemini) */}
+					<Show when={supportsHooks()}>
+						<div class={a.expandedSection}>
+							<label class={a.toggleRow} onClick={(e) => e.stopPropagation()}>
+								<input
+									type="checkbox"
+									checked={configStore.getHookInstrumentation(props.agentType) ?? false}
+									disabled={hookLoading()}
+									onChange={handleHookToggle}
+								/>
+								<span>Use native agent hooks for status</span>
+								<Show when={hookState() === "installed" || hookState() === "outdated"}>
+									<span class={a.badge} data-type={hookState() === "outdated" ? "notfound" : "mcp"}>
+										{hookState() === "outdated" ? "Hooks: re-enable" : "Hooks installed"}
+									</span>
+								</Show>
+							</label>
+							<p class={s.hint}>
+								Drive busy/idle/waiting from {agent().name}'s own hooks instead of output heuristics. TUIC installs and
+								removes the hooks cleanly and never touches your own. Applies on next launch.
+							</p>
+						</div>
+					</Show>
+
 					{/* Per-agent TUIC protocol markers — visible when MCP bridge is installed */}
 					<Show when={mcpStatus()?.installed}>
 						<div class={a.expandedSection}>
 							<label class={a.toggleRow} onClick={(e) => e.stopPropagation()}>
 								<input
 									type="checkbox"
-									checked={agentConfigsStore.getIntentTabTitle(props.agentType) ?? true}
-									onChange={(e) => agentConfigsStore.setIntentTabTitle(props.agentType, e.currentTarget.checked)}
+									checked={configStore.getIntentTabTitle(props.agentType) ?? true}
+									onChange={(e) => configStore.setIntentTabTitle(props.agentType, e.currentTarget.checked)}
 								/>
 								<span>Show intent as tab title</span>
 							</label>
@@ -742,10 +824,8 @@ const AgentRow: Component<{
 							<label class={a.toggleRow} onClick={(e) => e.stopPropagation()}>
 								<input
 									type="checkbox"
-									checked={
-										agentConfigsStore.getSuggestFollowups(props.agentType) ?? settingsStore.state.suggestFollowups
-									}
-									onChange={(e) => agentConfigsStore.setSuggestFollowups(props.agentType, e.currentTarget.checked)}
+									checked={configStore.getSuggestFollowups(props.agentType) ?? settingsStore.state.suggestFollowups}
+									onChange={(e) => configStore.setSuggestFollowups(props.agentType, e.currentTarget.checked)}
 								/>
 								<span>Show suggested follow-ups</span>
 							</label>
@@ -761,8 +841,8 @@ const AgentRow: Component<{
 						<input
 							class={`${a.formInput} ${a.mono}`}
 							placeholder={`${AGENTS[props.agentType].binary} -p "{prompt}" --no-input`}
-							value={agentConfigsStore.getHeadlessTemplate(props.agentType) ?? ""}
-							onInput={(e) => agentConfigsStore.setHeadlessTemplate(props.agentType, e.currentTarget.value)}
+							value={configStore.getHeadlessTemplate(props.agentType) ?? ""}
+							onInput={(e) => configStore.setHeadlessTemplate(props.agentType, e.currentTarget.value)}
 							onClick={(e) => e.stopPropagation()}
 						/>
 						<p class={s.hint}>
@@ -914,12 +994,34 @@ const AiPromptsSection: Component = () => {
 // Main tab
 // ---------------------------------------------------------------------------
 
-export const AgentsTab: Component = () => {
+interface AgentsTabProps {
+	connectionId?: string;
+}
+
+export const AgentsTab: Component<AgentsTabProps> = (props) => {
 	const detection = useAgentDetection();
+	const [remoteLoading, setRemoteLoading] = createSignal(false);
+	const [remoteError, setRemoteError] = createSignal<string | null>(null);
+	const [activeStore, setActiveStore] = createSignal(agentConfigsStore);
+
+	createEffect(
+		on(
+			() => props.connectionId,
+			(cid) => {
+				const store = cid ? createRemoteAgentConfigStore(cid) : agentConfigsStore;
+				setActiveStore(() => store);
+				setRemoteLoading(!!cid);
+				setRemoteError(null);
+				store
+					.hydrate()
+					.catch((e: Error) => setRemoteError(e.message ?? "Failed to load remote config"))
+					.finally(() => setRemoteLoading(false));
+			},
+		),
+	);
 
 	onMount(() => {
 		detection.detectAll();
-		agentConfigsStore.hydrate();
 	});
 
 	/** Agents sorted: available first, then not-found — each group alphabetically by display name */
@@ -932,35 +1034,55 @@ export const AgentsTab: Component = () => {
 	};
 
 	return (
-		<div class={s.section}>
-			<h3>Agents</h3>
-			<p class={s.hint} style={{ "margin-bottom": "12px" }}>
-				Configure AI coding agents, manage run configurations, and install MCP bridge integrations.
-			</p>
+		<AgentConfigProvider value={activeStore()}>
+			<div class={s.section}>
+				<Show when={props.connectionId}>
+					{(cid) => {
+						const conn = () => remoteConnectionsStore.getConnectionState(cid());
+						return (
+							<div class={a.remoteBanner}>
+								<span class={a.remoteBannerIcon}>&#x27D0;</span>
+								Configuring remote: <strong>{conn()?.connection.name ?? cid()}</strong>
+							</div>
+						);
+					}}
+				</Show>
+				<Show when={remoteLoading()}>
+					<div class={a.remoteLoading}>Loading remote configuration...</div>
+				</Show>
+				<Show when={remoteError()}>
+					<div class={a.remoteError}>Remote config unavailable: {remoteError()}</div>
+				</Show>
 
-			<SettingToggle
-				checked={settingsStore.state.intentTabTitle}
-				onChange={(v) => settingsStore.setIntentTabTitle(v)}
-				label="Show agent intent as tab title"
-				hint="When agents declare their current work phase, update the tab name with a short title"
-			/>
+				<h3>Agents</h3>
+				<p class={s.hint} style={{ "margin-bottom": "12px" }}>
+					Configure AI coding agents, manage run configurations, and install MCP bridge integrations.
+				</p>
 
-			<SettingToggle
-				checked={settingsStore.state.suggestFollowups}
-				onChange={(v) => settingsStore.setSuggestFollowups(v)}
-				label="Show suggested follow-up actions"
-				hint="Display actionable suggestions from agents after completing a task"
-			/>
+				<SettingToggle
+					checked={settingsStore.state.intentTabTitle}
+					onChange={(v) => settingsStore.setIntentTabTitle(v)}
+					label="Show agent intent as tab title"
+					hint="When agents declare their current work phase, update the tab name with a short title"
+				/>
 
-			<div class={a.agentList}>
-				<For each={sortedAgents()}>
-					{(type) => (
-						<AgentRow agentType={type} detection={detection.getDetection(type)} onExpand={detection.detectVersion} />
-					)}
-				</For>
+				<SettingToggle
+					checked={settingsStore.state.suggestFollowups}
+					onChange={(v) => settingsStore.setSuggestFollowups(v)}
+					label="Show suggested follow-up actions"
+					hint="Display actionable suggestions from agents after completing a task"
+				/>
+
+				<div class={a.agentList}>
+					<For each={sortedAgents()}>
+						{(type) => (
+							<AgentRow agentType={type} detection={detection.getDetection(type)} onExpand={detection.detectVersion} />
+						)}
+					</For>
+				</div>
+
+				<AiPromptsSection />
 			</div>
-
-			<AiPromptsSection />
-		</div>
+		</AgentConfigProvider>
 	);
 };

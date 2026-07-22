@@ -11,19 +11,19 @@
 
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import { listen as tauriListen } from "@tauri-apps/api/event";
-import { isTauri } from "./transport";
+import { appLogger } from "./stores/appLogger";
+import { isTauri, rpc } from "./transport";
 
 type InvokeFn = <T>(cmd: string, args?: Record<string, unknown>) => Promise<T>;
 
-// Browser mode: lazily resolved HTTP transport
+// Browser mode: lazily resolved HTTP transport. transport.ts is already a static
+// import (isTauri above), so rpc is wired statically — no dynamic import needed.
 let _httpInvoke: InvokeFn | undefined;
 
 function getHttpInvoke(): Promise<InvokeFn> {
 	if (_httpInvoke) return Promise.resolve(_httpInvoke);
-	return import("./transport").then(({ rpc }) => {
-		_httpInvoke = <T>(cmd: string, args?: Record<string, unknown>): Promise<T> => rpc<T>(cmd, args ?? {});
-		return _httpInvoke;
-	});
+	_httpInvoke = <T>(cmd: string, args?: Record<string, unknown>): Promise<T> => rpc<T>(cmd, args ?? {});
+	return Promise.resolve(_httpInvoke);
 }
 
 // ---------------------------------------------------------------------------
@@ -116,9 +116,7 @@ function ensureSse(): EventSource {
 
 	_sseSource.onerror = () => {
 		// EventSource auto-reconnects; just log
-		import("./stores/appLogger").then(({ appLogger }) =>
-			appLogger.debug("network", "SSE connection error — will auto-reconnect"),
-		);
+		appLogger.debug("network", "SSE connection error — will auto-reconnect");
 	};
 
 	// Re-attach listeners for all registered event types
@@ -135,12 +133,17 @@ function attachSseEventType(eventType: string) {
 	_sseSource.addEventListener(eventType, ((sseEvent: MessageEvent) => {
 		const listeners = _sseListeners.get(eventType);
 		if (!listeners) return;
+		let payload: unknown;
 		try {
-			const payload = JSON.parse(sseEvent.data);
-			for (const handler of listeners) handler(payload);
-		} catch {
-			// Ignore parse errors
+			payload = JSON.parse(sseEvent.data);
+		} catch (err) {
+			appLogger.warn("network", `SSE event '${eventType}' parse failed`, {
+				data: typeof sseEvent.data === "string" ? sseEvent.data.slice(0, 200) : sseEvent.data,
+				error: String(err),
+			});
+			return;
 		}
+		for (const handler of listeners) handler(payload);
 	}) as EventListener);
 }
 
@@ -152,10 +155,14 @@ export function listen<T>(event: string, handler: (event: { payload: T }) => voi
 				if (disposed) return;
 				disposed = true;
 				try {
-					unlisten();
+					// Tauri's UnlistenFn is `async () => _unlisten(...)`, so a double-unregister
+					// (listeners[eventId] is undefined) throws *inside* the async fn and surfaces
+					// as a rejected promise, not a sync throw — hence the wrap + .catch(). The
+					// outer try/catch covers the (defensive) sync-throw path. The listener is
+					// already gone either way; swallow.
+					void Promise.resolve(unlisten()).catch(() => {});
 				} catch {
-					// Tauri's internal listener registry crashes on double-unregister
-					// (listeners[eventId] is undefined). Swallow — the listener is already gone.
+					// listener already gone
 				}
 			};
 		});

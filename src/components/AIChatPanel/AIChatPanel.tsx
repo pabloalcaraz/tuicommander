@@ -4,6 +4,8 @@ import { appLogger } from "../../stores/appLogger";
 import { type ConversationMeta, conversationStore, type ToolCallEntry } from "../../stores/conversationStore";
 import { terminalsStore } from "../../stores/terminals";
 import { cx } from "../../utils";
+import { onClickKeyDown } from "../../utils/a11y";
+import { writeClipboard } from "../../utils/clipboard";
 import { getShellFamily, sendCommand } from "../../utils/sendCommand";
 import p from "../shared/panel.module.css";
 import { ContentRenderer } from "../ui/ContentRenderer";
@@ -35,7 +37,7 @@ export interface AIChatPanelProps {
 /** Copy text to clipboard, return true on success */
 async function copyToClipboard(text: string): Promise<boolean> {
 	try {
-		await navigator.clipboard.writeText(text);
+		await writeClipboard(text);
 		return true;
 	} catch {
 		return false;
@@ -145,7 +147,7 @@ const ToolCallCard: Component<{ entry: ToolCallEntry }> = (props) => {
 		outputExpanded() || !isLong() ? fullOutput() : fullOutput().slice(0, TOOL_OUTPUT_TRUNCATE) + "…";
 
 	const handleCopy = () => {
-		void navigator.clipboard.writeText(fullOutput()).then(() => {
+		void writeClipboard(fullOutput()).then(() => {
 			setCopied(true);
 			setTimeout(() => setCopied(false), 1500);
 		});
@@ -153,7 +155,13 @@ const ToolCallCard: Component<{ entry: ToolCallEntry }> = (props) => {
 
 	return (
 		<div class={s.toolCallCard}>
-			<div class={s.toolCallHeader} onClick={() => setExpanded(!expanded())}>
+			<div
+				class={s.toolCallHeader}
+				role="button"
+				tabIndex={0}
+				onClick={() => setExpanded(!expanded())}
+				onKeyDown={onClickKeyDown(() => setExpanded(!expanded()))}
+			>
 				<span class={cx(s.toolCallStatusDot, statusClass())} />
 				<span class={s.toolCallName}>{props.entry.toolName}</span>
 				<Show when={props.entry.status === "done" && doneEntry()}>
@@ -452,6 +460,7 @@ export const AIChatPanel: Component<AIChatPanelProps> = (props) => {
 							onChange={(e) => setModelOverride(e.currentTarget.value)}
 							title="Model override for this conversation"
 						>
+							<option value="">Default model</option>
 							<For each={availableModels()}>{(m) => <option value={m}>{m}</option>}</For>
 						</select>
 					</Show>
@@ -719,6 +728,17 @@ export const AIChatPanel: Component<AIChatPanelProps> = (props) => {
 							</Show>
 						)}
 					</For>
+
+					{/* Extended-thinking disclosure (Opus 4.7+): live reasoning, collapsible.
+					    Auto-opens while the model is thinking, stays available after. */}
+					<Show when={conversationStore.reasoningChunks()}>
+						<details class={s.reasoningDisclosure} open={conversationStore.isThinking()}>
+							<summary class={s.reasoningSummary}>Thinking</summary>
+							<div class={s.reasoningBody}>
+								<ContentRenderer content={conversationStore.reasoningChunks()} />
+							</div>
+						</details>
+					</Show>
 
 					{/* Streaming text: render as markdown so formatting is progressive */}
 					<Show when={conversationStore.isStreaming() && conversationStore.streamingText()}>

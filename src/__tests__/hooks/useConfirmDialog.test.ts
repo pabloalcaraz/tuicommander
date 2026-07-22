@@ -26,6 +26,7 @@ describe("useConfirmDialog", () => {
 				confirmLabel: "Yes",
 				cancelLabel: "No",
 				kind: "warning",
+				defaultButton: "confirm",
 			});
 
 			dialog.handleConfirm();
@@ -60,10 +61,90 @@ describe("useConfirmDialog", () => {
 				confirmLabel: "OK",
 				cancelLabel: "Cancel",
 				kind: "warning",
+				defaultButton: "confirm",
 			});
 
 			dialog.handleClose();
 			await promise;
+		});
+
+		it("threads autoCancelMs into dialogState when provided", async () => {
+			const promise = dialog.confirm({
+				title: "Switch to new worktree?",
+				message: "Switch now?",
+				cancelLabel: "Stay",
+				kind: "info",
+				autoCancelMs: 10_000,
+			});
+
+			expect(dialog.dialogState()?.autoCancelMs).toBe(10_000);
+
+			dialog.handleClose();
+			await promise;
+		});
+
+		it("leaves autoCancelMs undefined when not provided", async () => {
+			const promise = dialog.confirm({ title: "Confirm", message: "Proceed?" });
+
+			expect(dialog.dialogState()?.autoCancelMs).toBeUndefined();
+
+			dialog.handleClose();
+			await promise;
+		});
+	});
+
+	describe("concurrent confirm() calls", () => {
+		it("queues a second confirm and shows dialogs sequentially (FIFO)", async () => {
+			const first = dialog.confirm({ title: "First", message: "1?" });
+			const second = dialog.confirm({ title: "Second", message: "2?" });
+
+			// Only the first is shown; the second waits in the queue.
+			expect(dialog.dialogState()?.title).toBe("First");
+
+			dialog.handleConfirm();
+			expect(await first).toBe(true);
+
+			// Resolving the first advances to the queued second.
+			expect(dialog.dialogState()?.title).toBe("Second");
+
+			dialog.handleClose();
+			expect(await second).toBe(false);
+			expect(dialog.dialogState()).toBe(null);
+		});
+
+		it("does not orphan the first promise when a second confirm arrives", async () => {
+			// Regression: the old single-slot pendingResolve was overwritten by the
+			// second confirm(), so the first promise never settled. If that bug
+			// returns, `await first` below hangs and the test fails via timeout.
+			const first = dialog.confirm({ title: "First", message: "1?" });
+			const second = dialog.confirm({ title: "Second", message: "2?" });
+
+			dialog.handleConfirm(); // settle the head (first)
+			expect(await first).toBe(true);
+
+			// Drain the queued second so the test leaves no pending promise.
+			dialog.handleClose();
+			expect(await second).toBe(false);
+		});
+
+		it("resolves all three queued confirms in order", async () => {
+			const results: boolean[] = [];
+			const a = dialog.confirm({ title: "A", message: "?" }).then((v) => results.push(v));
+			const b = dialog.confirm({ title: "B", message: "?" }).then((v) => results.push(v));
+			const c = dialog.confirm({ title: "C", message: "?" }).then((v) => results.push(v));
+
+			expect(dialog.dialogState()?.title).toBe("A");
+			dialog.handleConfirm(); // A -> true
+			await a;
+			expect(dialog.dialogState()?.title).toBe("B");
+			dialog.handleClose(); // B -> false
+			await b;
+			expect(dialog.dialogState()?.title).toBe("C");
+			dialog.handleConfirm(); // C -> true
+			await c;
+
+			expect(results).toEqual([true, false, true]);
+			expect(dialog.dialogState()).toBe(null);
 		});
 	});
 
@@ -77,6 +158,7 @@ describe("useConfirmDialog", () => {
 				confirmLabel: "Remove",
 				cancelLabel: "Cancel",
 				kind: "warning",
+				defaultButton: "confirm",
 			});
 
 			dialog.handleConfirm();
@@ -100,6 +182,7 @@ describe("useConfirmDialog", () => {
 				confirmLabel: "Close",
 				cancelLabel: "Cancel",
 				kind: "warning",
+				defaultButton: "confirm",
 			});
 
 			dialog.handleConfirm();
@@ -123,6 +206,7 @@ describe("useConfirmDialog", () => {
 				confirmLabel: "Remove",
 				cancelLabel: "Cancel",
 				kind: "warning",
+				defaultButton: "confirm",
 			});
 
 			dialog.handleConfirm();
@@ -133,6 +217,42 @@ describe("useConfirmDialog", () => {
 			const promise = dialog.confirmRemoveRepo("other-repo");
 			dialog.handleClose();
 			expect(await promise).toBe(false);
+		});
+	});
+
+	describe("confirmSaveChanges()", () => {
+		it("offers Save / Don't Save / Cancel with Save as the Enter default", () => {
+			void dialog.confirmSaveChanges("notes.md");
+
+			expect(dialog.dialogState()).toEqual({
+				title: "Unsaved changes",
+				message: '"notes.md" has unsaved changes.\nDo you want to save your changes before closing?',
+				confirmLabel: "Save",
+				cancelLabel: "Cancel",
+				discardLabel: "Don't Save",
+				kind: "warning",
+				defaultButton: "confirm",
+			});
+
+			dialog.handleClose();
+		});
+
+		it("resolves 'confirm' when the user chooses Save", async () => {
+			const promise = dialog.confirmSaveChanges("a.ts");
+			dialog.handleConfirm();
+			expect(await promise).toBe("confirm");
+		});
+
+		it("resolves 'discard' when the user chooses Don't Save", async () => {
+			const promise = dialog.confirmSaveChanges("a.ts");
+			dialog.handleDiscard();
+			expect(await promise).toBe("discard");
+		});
+
+		it("resolves 'cancel' when the user cancels", async () => {
+			const promise = dialog.confirmSaveChanges("a.ts");
+			dialog.handleClose();
+			expect(await promise).toBe("cancel");
 		});
 	});
 });

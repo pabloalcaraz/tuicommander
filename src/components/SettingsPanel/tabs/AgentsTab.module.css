@@ -297,11 +297,11 @@
 }
 
 .formInput.inputError {
-  border-color: var(--danger, #e55);
+  border-color: var(--error);
 }
 
 .validationError {
-  color: var(--danger, #e55);
+  color: var(--error);
   font-size: 0.75rem;
   padding: 0 4px 4px;
 }
@@ -434,8 +434,8 @@
   letter-spacing: 0.04em;
   padding: 1px 6px;
   border-radius: var(--radius-sm);
-  background: rgba(230, 180, 60, 0.15);
-  color: var(--warning, #e0a040);
+  background: color-mix(in srgb, var(--warning) 15%, transparent);
+  color: var(--warning);
   flex-shrink: 0;
 }
 
@@ -582,4 +582,40 @@
 .envFlagSelect:focus {
   outline: none;
   border-color: var(--accent);
+}
+
+.remoteBanner {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 12px;
+  margin-bottom: 12px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-md);
+  font-size: 13px;
+  color: var(--fg-secondary);
+}
+
+.remoteBannerIcon {
+  color: var(--accent);
+  font-size: 14px;
+}
+
+.remoteLoading {
+  padding: 8px 12px;
+  margin-bottom: 12px;
+  color: var(--fg-muted);
+  font-size: 13px;
+  font-style: italic;
+}
+
+.remoteError {
+  padding: 8px 12px;
+  margin-bottom: 12px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--error);
+  border-radius: var(--radius-md);
+  color: var(--error);
+  font-size: 13px;
 }

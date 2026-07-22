@@ -11,8 +11,9 @@ import { repositoriesStore } from "../../stores/repositories";
 import { toastsStore } from "../../stores/toasts";
 import type { BranchPrStatus } from "../../types";
 import { cx } from "../../utils";
+import { onClickKeyDown } from "../../utils/a11y";
 import { handleOpenUrl } from "../../utils/openUrl";
-import { effectiveMergeMethod, mergeWithFallback } from "../../utils/prMerge";
+import { canApprovePr, effectiveMergeMethod, mergeWithFallback } from "../../utils/prMerge";
 import { prContextVariables } from "../../utils/promptContext";
 import { PrDetailContent } from "../PrDetailPopover/PrDetailContent";
 import { SmartButtonStrip } from "../SmartButtonStrip/SmartButtonStrip";
@@ -27,6 +28,8 @@ export interface PrSectionProps {
 	icon?: "pr" | "user";
 	onCheckout: (branchName: string) => void;
 	onCreateWorktree?: (branchName: string) => void;
+	onConflictAssist?: (prNumber: number) => void;
+	onPushBranch?: (worktreePath: string) => void;
 	onMerged: (branchName: string, baseBranch: string, hasDirtyFiles: boolean) => void;
 }
 
@@ -146,7 +149,13 @@ export const PrSection: Component<PrSectionProps> = (props) => {
 
 	return (
 		<div class={s.ghSection}>
-			<div class={s.ghSectionHeader} onClick={() => setCollapsed((v) => !v)}>
+			<div
+				class={s.ghSectionHeader}
+				role="button"
+				tabIndex={0}
+				onClick={() => setCollapsed((v) => !v)}
+				onKeyDown={onClickKeyDown(() => setCollapsed((v) => !v))}
+			>
 				<span class={cx(s.ghSectionChevron, !collapsed() && s.ghSectionChevronOpen)}>{"›"}</span>
 				<PrIcon />
 				<span>{props.title}</span>
@@ -199,7 +208,12 @@ export const PrSection: Component<PrSectionProps> = (props) => {
 											>
 												&times;
 											</button>
-											<PrDetailContent repoPath={props.repoPath} branch={pr.branch}>
+											<PrDetailContent
+												repoPath={props.repoPath}
+												branch={pr.branch}
+												onConflictAssist={props.onConflictAssist}
+												onPushBranch={props.onPushBranch}
+											>
 												<div class={s.ghItemActions}>
 													<button
 														class={s.ghActionBtn}
@@ -217,11 +231,7 @@ export const PrSection: Component<PrSectionProps> = (props) => {
 															{t("sidebar.worktree", "Worktree")}
 														</button>
 													</Show>
-													<Show
-														when={
-															pr.state?.toUpperCase() === "OPEN" && !pr.is_draft && pr.review_decision !== "APPROVED"
-														}
-													>
+													<Show when={canApprovePr(pr, githubStore.state.viewerLogin)}>
 														<button
 															class={cx(s.ghActionBtn, s.ghApproveBtn)}
 															onClick={() => handleApprove(pr)}

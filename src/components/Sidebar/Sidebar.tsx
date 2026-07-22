@@ -2,6 +2,7 @@ import { type Component, createEffect, createMemo, createSignal, For, Show } fro
 import { t } from "../../i18n";
 import { togglePanel } from "../../panelRouter";
 import { githubStore } from "../../stores/github";
+import { remoteConnectionsStore } from "../../stores/remoteConnections";
 import type { RepositoryState } from "../../stores/repositories";
 import { repositoriesStore } from "../../stores/repositories";
 import { settingsStore } from "../../stores/settings";
@@ -9,7 +10,7 @@ import { tunnelPanelStore } from "../../stores/tunnelPanel";
 import { tunnelsStore } from "../../stores/tunnels";
 import { uiStore } from "../../stores/ui";
 import { getRepoColor } from "../../utils/repoColor";
-import type { ContextMenuItem } from "../ContextMenu";
+import { ContextMenu, type ContextMenuItem, createContextMenu } from "../ContextMenu";
 import { PrDetailPopover } from "../PrDetailPopover/PrDetailPopover";
 import { PromptDialog } from "../PromptDialog";
 import { ColorPickerDialog } from "../shared/ColorPickerDialog";
@@ -23,15 +24,18 @@ import { useSidebarDragDrop } from "./useSidebarDragDrop";
 export interface SidebarProps {
 	quickSwitcherActive?: boolean;
 	creatingWorktreeRepos?: Set<string>;
+	removingBranches?: Set<string>;
 	onBranchSelect: (repoPath: string, branchName: string) => void;
 	onAddTerminal: (repoPath: string, branchName: string) => void;
 	onRemoveBranch: (repoPath: string, branchName: string) => void;
 	onRenameBranch: (repoPath: string, branchName: string) => void;
+	onCreateBranch?: (repoPath: string, fromBranch: string) => void;
 	buildAgentMenuItems?: (repoPath: string, branchName: string) => ContextMenuItem[];
 	onAddWorktree: (repoPath: string) => void;
 	onCreateWorktreeFromBranch?: (repoPath: string, branchName: string) => void;
 	onMergeAndArchive?: (repoPath: string, branchName: string) => void;
 	onAddRepo: () => void;
+	onAddRemoteRepo?: (connectionId: string) => void;
 	onRepoSettings: (repoPath: string) => void;
 	onRemoveRepo: (repoPath: string) => void;
 	onOpenSettings: () => void;
@@ -40,6 +44,8 @@ export interface SidebarProps {
 	runningGitOps?: Set<string>;
 	onRefreshBranchStats?: () => Promise<void>;
 	onCheckoutRemoteBranch?: (repoPath: string, branchName: string) => void;
+	onAutofixIssue?: (repoPath: string, issueNumber: number, prompt: string) => void;
+	onConflictAssist?: (repoPath: string, prNumber: number) => void;
 	onSwitchBranch?: (repoPath: string, branchName: string) => void;
 	switchBranchLists?: Record<string, string[]>;
 	currentBranches?: Record<string, string>;
@@ -54,10 +60,76 @@ const DRAG_CLASSES: Record<string, string> = {
 };
 
 export const Sidebar: Component<SidebarProps> = (props) => {
-	const repos = createMemo(() => repositoriesStore.getOrderedRepos());
 	const groupedLayout = createMemo(() => repositoriesStore.getGroupedLayout());
+	// Empty state must account for grouped repos too — a repo moved into a group
+	// leaves state.repoOrder, so checking ungrouped alone would falsely report
+	// "No repositories" when every repo is grouped. (#64)
+	const hasVisibleRepos = createMemo(() => {
+		const layout = groupedLayout();
+		return layout.ungrouped.length > 0 || layout.groups.some((g) => g.repos.length > 0);
+	});
+
+	// Repo filter lives in uiStore (session-only). When active, only repos with at
+	// least one open terminal are shown. The toggle is the toolbar filter icon next
+	// to the sidebar collapse button; here we only read + render the filtered list.
+	const repoIsActive = (repo: RepositoryState) => Object.values(repo.branches).some((b) => b.terminals.length > 0);
+
+	// Layout after applying the repo filter. In "active" mode, empty groups are
+	// dropped entirely so no orphaned group header is left behind.
+	const filteredLayout = createMemo(() => {
+		const layout = groupedLayout();
+		if (!uiStore.state.repoFilterActiveOnly) return layout;
+		const groups = layout.groups
+			.map((entry) => ({ ...entry, repos: entry.repos.filter(repoIsActive) }))
+			.filter((entry) => entry.repos.length > 0);
+		const ungrouped = layout.ungrouped.filter(repoIsActive);
+		return { groups, ungrouped };
+	});
+
+	// True when the filtered layout has at least one visible repo. Distinguishes
+	// "no repos at all" from "filter hides everything" for the empty state.
+	const hasFilteredRepos = createMemo(() => {
+		const layout = filteredLayout();
+		return layout.ungrouped.length > 0 || layout.groups.some((g) => g.repos.length > 0);
+	});
+
+	const countRepos = (layout: { groups: Array<{ repos: unknown[] }>; ungrouped: unknown[] }) =>
+		layout.ungrouped.length + layout.groups.reduce((n, g) => n + g.repos.length, 0);
+	const totalRepoCount = createMemo(() => countRepos(groupedLayout()));
+	const shownRepoCount = createMemo(() => countRepos(filteredLayout()));
 
 	const drag = useSidebarDragDrop();
+
+	// Add-repo context menu for local vs remote
+	const addRepoMenu = createContextMenu();
+
+	const connectedRemotes = createMemo(() => {
+		const all = remoteConnectionsStore.getConnections();
+		return Object.values(all).filter((c) => c.status === "connected");
+	});
+
+	const handleAddRepoClick = (e: MouseEvent) => {
+		const remotes = connectedRemotes();
+		if (remotes.length === 0 || !props.onAddRemoteRepo) {
+			props.onAddRepo();
+			return;
+		}
+		addRepoMenu.open(e);
+	};
+
+	const addRepoMenuItems = createMemo((): ContextMenuItem[] => {
+		const items: ContextMenuItem[] = [
+			{ label: t("sidebar.localRepository", "Local Repository"), action: () => props.onAddRepo() },
+		];
+		for (const conn of connectedRemotes()) {
+			const id = conn.connection.id;
+			items.push({
+				label: conn.connection.name,
+				action: () => props.onAddRemoteRepo?.(id),
+			});
+		}
+		return items;
+	});
 
 	// PR detail popover state
 	const [prDetailTarget, setPrDetailTarget] = createSignal<{ repoPath: string; branch: string } | null>(null);
@@ -155,7 +227,7 @@ export const Sidebar: Component<SidebarProps> = (props) => {
 	const repoShortcutStarts = createMemo(() => {
 		const starts: Record<string, number> = {};
 		let counter = 1;
-		const layout = groupedLayout();
+		const layout = filteredLayout();
 		// Groups first — skip collapsed groups and collapsed/non-expanded repos
 		for (const entry of layout.groups) {
 			if (entry.group.collapsed) continue;
@@ -197,6 +269,7 @@ export const Sidebar: Component<SidebarProps> = (props) => {
 				nameColor={nameColor()}
 				isDragging={drag.draggedRepoPath() === repo.path}
 				isCreatingWorktree={props.creatingWorktreeRepos?.has(repo.path)}
+				removingBranches={props.removingBranches}
 				dragOverClass={
 					drag.dragOverRepoPath() === repo.path && drag.draggedRepoPath() !== repo.path
 						? (DRAG_CLASSES[drag.dragOverSide() ?? ""] ?? undefined)
@@ -208,6 +281,7 @@ export const Sidebar: Component<SidebarProps> = (props) => {
 				onAddTerminal={(branch) => props.onAddTerminal(repo.path, branch)}
 				onRemoveBranch={(branch) => props.onRemoveBranch(repo.path, branch)}
 				onRenameBranch={(branch) => props.onRenameBranch(repo.path, branch)}
+				onCreateBranch={props.onCreateBranch ? (branch) => props.onCreateBranch!(repo.path, branch) : undefined}
 				onShowPrDetail={(branch) => {
 					setPrDetailIsManual(true);
 					setPrDetailTarget({ repoPath: repo.path, branch });
@@ -228,6 +302,17 @@ export const Sidebar: Component<SidebarProps> = (props) => {
 				onCheckoutRemoteBranch={
 					props.onCheckoutRemoteBranch ? (branch) => props.onCheckoutRemoteBranch!(repo.path, branch) : undefined
 				}
+				onAutofixIssue={
+					props.onAutofixIssue
+						? (issueNumber, prompt) => props.onAutofixIssue!(repo.path, issueNumber, prompt)
+						: undefined
+				}
+				onConflictAssist={
+					props.onConflictAssist ? (prNumber) => props.onConflictAssist!(repo.path, prNumber) : undefined
+				}
+				onPushBranch={
+					props.onBackgroundGit ? (worktreePath) => props.onBackgroundGit!(worktreePath, "push", ["push"]) : undefined
+				}
 				onSettings={() => props.onRepoSettings(repo.path)}
 				onRemove={() => props.onRemoveRepo(repo.path)}
 				onToggle={() => repositoriesStore.toggleExpanded(repo.path)}
@@ -244,11 +329,35 @@ export const Sidebar: Component<SidebarProps> = (props) => {
 		<aside id="sidebar" class={s.sidebar} data-testid="sidebar">
 			{/* Content */}
 			<div class={s.content}>
+				{/* Repo filter status — only rendered while the "active only" filter is
+				    engaged (toggled from the toolbar icon). Keeps it unmistakable that
+				    repos are hidden, so nobody panics, while taking zero space at rest. */}
+				<Show when={hasVisibleRepos() && uiStore.state.repoFilterActiveOnly}>
+					<button
+						class={s.filterStatus}
+						onClick={() => uiStore.setRepoFilterActiveOnly(false)}
+						title={t("sidebar.filterShowAll", "Show all")}
+					>
+						<svg width="11" height="11" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+							<path
+								d="M1.5 2.5h13l-5 6v5l-3 1.5v-6.5l-5-6Z"
+								stroke="currentColor"
+								stroke-width="1.3"
+								stroke-linejoin="round"
+							/>
+						</svg>
+						<span>
+							{t("sidebar.filterActiveOnly", "Active only")} · {shownRepoCount()}/{totalRepoCount()}
+						</span>
+						<span class={s.filterStatusClear}>{t("sidebar.filterShowAll", "Show all")}</span>
+					</button>
+				</Show>
+
 				{/* Repository Section */}
 				<div>
 					<div class={s.repoList} data-sidebar-list>
 						{/* Grouped repos */}
-						<For each={groupedLayout().groups}>
+						<For each={filteredLayout().groups}>
 							{(entry) => (
 								<GroupSection
 									group={entry.group}
@@ -269,11 +378,20 @@ export const Sidebar: Component<SidebarProps> = (props) => {
 							)}
 						</For>
 						{/* Ungrouped repos */}
-						<For each={groupedLayout().ungrouped}>{(repo) => renderRepoSection(repo)}</For>
-						<Show when={repos().length === 0}>
+						<For each={filteredLayout().ungrouped}>{(repo) => renderRepoSection(repo)}</For>
+						<Show when={!hasVisibleRepos()}>
 							<div class={s.empty}>
 								<p>{t("sidebar.noRepositories", "No repositories")}</p>
-								<button onClick={props.onAddRepo}>{t("sidebar.addRepository", "Add Repository")}</button>
+								<button onClick={handleAddRepoClick}>{t("sidebar.addRepository", "Add Repository")}</button>
+							</div>
+						</Show>
+						{/* Filter hides every repo — offer a way back to "all" */}
+						<Show when={hasVisibleRepos() && !hasFilteredRepos()}>
+							<div class={s.empty}>
+								<p>{t("sidebar.noActiveRepos", "No repositories with open terminals")}</p>
+								<button onClick={() => uiStore.setRepoFilterActiveOnly(false)}>
+									{t("sidebar.filterShowAll", "Show all")}
+								</button>
 							</div>
 						</Show>
 					</div>
@@ -423,7 +541,7 @@ export const Sidebar: Component<SidebarProps> = (props) => {
 
 			{/* Footer */}
 			<div class={s.footer}>
-				<button class={s.addRepo} onClick={props.onAddRepo} title={t("sidebar.addRepository", "Add Repository")}>
+				<button class={s.addRepo} onClick={handleAddRepoClick} title={t("sidebar.addRepository", "Add Repository")}>
 					<svg class={s.addRepoIcon} width="14" height="14" viewBox="0 0 16 16" fill="none">
 						<path
 							d="M1.5 2A1.5 1.5 0 0 1 3 .5h3.379a1.5 1.5 0 0 1 1.06.44l1.122 1.12H13A1.5 1.5 0 0 1 14.5 3.5v9a1.5 1.5 0 0 1-1.5 1.5H3A1.5 1.5 0 0 1 1.5 12.5V2Z"
@@ -556,6 +674,15 @@ export const Sidebar: Component<SidebarProps> = (props) => {
 
 			{/* Drag handle for resizing */}
 			<div class={s.resizeHandle} onMouseDown={handleResizeStart} />
+
+			{/* Add repo context menu (local vs remote) */}
+			<ContextMenu
+				items={addRepoMenuItems()}
+				x={addRepoMenu.position().x}
+				y={addRepoMenu.position().y}
+				visible={addRepoMenu.visible()}
+				onClose={addRepoMenu.close}
+			/>
 		</aside>
 	);
 };

@@ -39,7 +39,6 @@ App.tsx (central orchestrator)
 │   ├── NotesPanel/           # Ideas/notes panel with edit, send, delete
 │   ├── FileBrowserPanel/     # File tree browser with content search
 │   │   └── TreeNode          # Recursive tree node (lazy-loaded)
-│   ├── PlanPanel/            # Plan file browser (repo-scoped, from activity store)
 │   ├── PluginPanel/          # Plugin HTML panel (sandboxed iframe)
 │   ├── ClaudeUsageDashboard/ # Claude API usage dashboard (SolidJS)
 │   ├── ErrorLogPanel/        # Application error log viewer
@@ -74,7 +73,7 @@ App.tsx (central orchestrator)
 ├── RunCommandDialog/         # Configure terminal commands
 ├── WorktreeManager/          # Overlay panel for worktree management
 ├── MergePostActionDialog/    # Dialog for post-merge actions (keep/delete branch)
-├── ContextMenu/              # Right-click menu for terminals
+├── ContextMenu/              # Shared right-click menu (all panels). `separator:true` on an item = trailing divider AFTER it; empty-label item = standalone divider; a trailing separator on the LAST item is suppressed
 └── IdeLauncher/              # Open repository in IDE
 ```
 
@@ -248,7 +247,6 @@ Native SolidJS component (not a plugin) showing Claude API usage data. Displayed
 | Markdown Panel | `Cmd+Shift+M` | `uiStore.toggleMarkdownPanel()` |
 | Notes/Ideas Panel | `Cmd+Alt+N` | `uiStore.toggleNotesPanel()` |
 | File Browser | `Cmd+E` | `uiStore.toggleFileBrowserPanel()` |
-| Plan Panel | `Cmd+Shift+P` | `uiStore.togglePlanPanel()` |
 | Settings | `Cmd+,` | Local state in App.tsx |
 | Help | `Cmd+?` | Local state in App.tsx |
 | Prompt Library | `Cmd+Shift+K` | `promptLibraryStore.toggleDrawer()` |

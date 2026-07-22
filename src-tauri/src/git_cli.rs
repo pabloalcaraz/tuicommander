@@ -147,42 +147,77 @@ impl GitCmd {
 // Entry point
 // ---------------------------------------------------------------------------
 
-/// Remove stale `.git/index.lock` left behind by crashed external processes
-/// (e.g. Claude Code killed mid-`git status`). A lock is stale when the file
-/// is empty AND older than 5 seconds — real in-progress locks contain the
-/// serialised index, and the age guard avoids racing with a live git process
-/// that just created the file.
+/// Remove a stale `.git/index.lock` left behind by a crashed process so the
+/// next git invocation isn't blocked with `Unable to create '.git/index.lock':
+/// File exists` / `could not write index`.
+///
+/// Staleness is age-based, with two thresholds because the two crash modes
+/// produce locks of different sizes and we want a wide margin over any live
+/// git process:
+///
+/// - **Empty lock** (0 bytes): git created the lock but crashed before writing
+///   the new index. A real in-progress write fills the lock almost immediately,
+///   so a 0-byte lock older than [`EMPTY_LOCK_STALE_SECS`] is certainly orphaned.
+/// - **Non-empty lock**: git wrote the new index into the lock but died before
+///   renaming it over `.git/index` (e.g. Claude Code killed mid-`git stash`).
+///   A legitimate index write finishes in well under a second; we wait
+///   [`NONEMPTY_LOCK_STALE_SECS`] to stay safely clear of even large
+///   `stash`/`add` operations before reclaiming.
+///
+/// A 0-byte lock is reclaimed after this many seconds (early crash, no index written yet).
+const EMPTY_LOCK_STALE_SECS: u64 = 5;
+/// A non-empty lock (index written, rename never happened) is reclaimed after this
+/// many seconds — wide margin over even large `stash`/`add` index writes.
+const NONEMPTY_LOCK_STALE_SECS: u64 = 30;
+
+/// Pure staleness rule for an `index.lock` of the given byte size and age.
+/// Split out from [`remove_stale_index_lock`] so the thresholds are unit-testable
+/// without touching the filesystem clock.
+fn is_index_lock_stale(len: u64, age_secs: u64) -> bool {
+    let threshold = if len == 0 {
+        EMPTY_LOCK_STALE_SECS
+    } else {
+        NONEMPTY_LOCK_STALE_SECS
+    };
+    age_secs >= threshold
+}
+
 fn remove_stale_index_lock(cwd: &Path) {
     let lock = cwd.join(".git/index.lock");
-    match std::fs::metadata(&lock) {
-        Ok(meta) if meta.len() == 0 => {
-            let is_old = meta
-                .modified()
-                .ok()
-                .and_then(|t| t.elapsed().ok())
-                .map(|d| d.as_secs() >= 5)
-                .unwrap_or(false);
-            if !is_old {
-                return;
-            }
-            match std::fs::remove_file(&lock) {
-                Ok(()) => {
-                    tracing::info!(
-                        source = "git_cli",
-                        "Removed stale 0-byte index.lock in {}",
-                        cwd.display()
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        source = "git_cli",
-                        "Failed to remove stale index.lock in {}: {e}",
-                        cwd.display()
-                    );
-                }
-            }
+    let Ok(meta) = std::fs::metadata(&lock) else {
+        return;
+    };
+
+    // Without a reliable age we can't tell a stale lock from a live one — leave it.
+    let Some(age_secs) = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .map(|d| d.as_secs())
+    else {
+        return;
+    };
+
+    if !is_index_lock_stale(meta.len(), age_secs) {
+        return;
+    }
+
+    match std::fs::remove_file(&lock) {
+        Ok(()) => {
+            tracing::info!(
+                source = "git_cli",
+                "Removed stale index.lock ({} bytes, {age_secs}s old) in {}",
+                meta.len(),
+                cwd.display()
+            );
         }
-        _ => {}
+        Err(e) => {
+            tracing::warn!(
+                source = "git_cli",
+                "Failed to remove stale index.lock in {}: {e}",
+                cwd.display()
+            );
+        }
     }
 }
 
@@ -199,6 +234,80 @@ pub(crate) fn git_cmd(cwd: &Path) -> GitCmd {
         cmd,
         cwd: cwd.to_path_buf(),
     }
+}
+
+fn finish_failed_operation_after_abort_result(
+    operation: &str,
+    failure_summary: &str,
+    original_error: &str,
+    abort_result: Result<(), GitError>,
+) -> String {
+    match abort_result {
+        Ok(()) => format!("{failure_summary} (aborted): {original_error}"),
+        Err(abort_error) => {
+            tracing::error!(
+                source = "git_cli",
+                operation = %operation,
+                original_error = %original_error,
+                abort_error = %abort_error,
+                "git {operation} --abort failed after failed {operation}"
+            );
+            format!(
+                "{failure_summary}; repo left in a conflicted state, run git {operation} --abort manually: {abort_error}; original error: {original_error}"
+            )
+        }
+    }
+}
+
+/// Abort a failed merge/rebase and describe the final state.
+///
+/// Returns a message that claims `(aborted)` only when the abort command
+/// succeeds. If abort fails, the message tells the user the repository may still
+/// be conflicted and includes the manual recovery command.
+pub(crate) fn finish_failed_git_operation_after_abort(
+    repo_path: &Path,
+    operation: &str,
+    failure_summary: &str,
+    original_error: impl fmt::Display,
+) -> String {
+    let original_error = original_error.to_string();
+    let abort_result = git_cmd(repo_path)
+        .args([operation, "--abort"])
+        .run()
+        .map(|_| ());
+    finish_failed_operation_after_abort_result(
+        operation,
+        failure_summary,
+        &original_error,
+        abort_result,
+    )
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn parse_conflicted_files_porcelain(status: &str) -> Vec<String> {
+    status
+        .lines()
+        .filter_map(|line| {
+            if line.len() < 4 {
+                return None;
+            }
+            let code = &line[..2];
+            let conflicted = matches!(code, "DD" | "AU" | "UD" | "UA" | "DU" | "AA" | "UU");
+            conflicted.then(|| line[3..].trim().to_string())
+        })
+        .filter(|path| !path.is_empty())
+        .collect()
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn build_conflict_assist_prompt(pr_number: i64, base: &str, files: &[String]) -> String {
+    let mut prompt = format!(
+        "Resolve the merge conflicts for PR #{pr_number} after rebasing onto {base}. Do not push and do not merge. Edit only the conflicted files, run relevant checks, and stop for human review.\n\nConflicted files:"
+    );
+    for file in files {
+        prompt.push_str(&format!("\n- {file}"));
+    }
+    prompt
 }
 
 // ---------------------------------------------------------------------------
@@ -230,6 +339,81 @@ mod tests {
             .output()
             .expect("git config name");
         (dir, path)
+    }
+
+    #[test]
+    fn parse_conflicted_files_porcelain_extracts_unmerged_paths() {
+        let status = "\
+UU src/lib.rs
+AA src/new.rs
+ M src/clean.rs
+?? notes.txt
+DU src/deleted.rs
+";
+        assert_eq!(
+            parse_conflicted_files_porcelain(status),
+            vec!["src/lib.rs", "src/new.rs", "src/deleted.rs"]
+        );
+    }
+
+    #[test]
+    fn build_conflict_assist_prompt_lists_files_and_gates_push() {
+        let files = vec!["src/lib.rs".to_string(), "src/db.rs".to_string()];
+        let prompt = build_conflict_assist_prompt(42, "main", &files);
+        assert!(prompt.contains("PR #42"));
+        assert!(prompt.contains("rebasing onto main"));
+        assert!(prompt.contains("Do not push and do not merge"));
+        assert!(prompt.contains("- src/lib.rs"));
+        assert!(prompt.contains("- src/db.rs"));
+    }
+
+    #[test]
+    fn finish_failed_operation_claims_aborted_only_when_abort_succeeds() {
+        let msg = finish_failed_operation_after_abort_result(
+            "rebase",
+            "Rebase failed",
+            "conflicts",
+            Ok(()),
+        );
+
+        assert_eq!(msg, "Rebase failed (aborted): conflicts");
+    }
+
+    #[test]
+    fn finish_failed_operation_surfaces_abort_failure() {
+        let msg = finish_failed_operation_after_abort_result(
+            "merge",
+            "Merge failed",
+            "conflicts",
+            Err(GitError::NonZeroExit {
+                code: Some(128),
+                stderr: "fatal: There is no merge to abort".to_string(),
+            }),
+        );
+
+        assert!(!msg.contains("(aborted)"));
+        assert!(msg.contains("repo left in a conflicted state"));
+        assert!(msg.contains("run git merge --abort manually"));
+        assert!(msg.contains("original error: conflicts"));
+    }
+
+    #[test]
+    fn test_empty_lock_kept_while_fresh_removed_when_old() {
+        // 0-byte lock: kept under 5s, reclaimed at/after 5s.
+        assert!(!is_index_lock_stale(0, 0));
+        assert!(!is_index_lock_stale(0, 4));
+        assert!(is_index_lock_stale(0, 5));
+        assert!(is_index_lock_stale(0, 60));
+    }
+
+    #[test]
+    fn test_nonempty_lock_kept_until_30s() {
+        // Non-empty lock (index written, rename never happened): kept under 30s
+        // so we never nuke a live large stash/add, reclaimed at/after 30s.
+        assert!(!is_index_lock_stale(4096, 0));
+        assert!(!is_index_lock_stale(4096, 29));
+        assert!(is_index_lock_stale(4096, 30));
+        assert!(is_index_lock_stale(4096, 120));
     }
 
     #[test]

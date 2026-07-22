@@ -4,17 +4,25 @@
 )]
 
 pub(crate) mod agent;
+pub(crate) mod agent_hook;
+pub(crate) mod agent_hook_codex;
+pub(crate) mod agent_hook_commands;
+pub(crate) mod agent_hook_installer;
+pub(crate) mod agent_hook_opencode;
 pub(crate) mod agent_mcp;
 pub(crate) mod agent_session;
 pub(crate) mod ai_agent;
 pub(crate) mod ai_chat;
 pub(crate) mod ai_chat_registry;
 pub(crate) mod app_logger;
+pub(crate) mod changelog;
 pub(crate) mod chrome;
 pub(crate) mod claude_usage;
 pub(crate) mod cli;
 pub(crate) mod config;
+pub(crate) mod conflict_assist;
 pub(crate) mod content_index;
+pub(crate) mod cpu_watchdog;
 pub(crate) mod credentials;
 #[cfg(feature = "desktop")]
 mod dictation;
@@ -26,12 +34,17 @@ pub(crate) mod generators;
 pub(crate) mod git;
 pub(crate) mod git_cli;
 pub(crate) mod git_graph;
+pub(crate) mod git_reads;
 pub(crate) mod github;
+pub(crate) mod github_account;
 pub(crate) mod github_auth;
+#[cfg(test)]
+mod github_compat_tests;
 pub(crate) mod github_debug;
 pub(crate) mod github_poller;
 #[cfg(feature = "desktop")]
 mod global_hotkey;
+pub(crate) mod improvement_scan;
 mod input_line_buffer;
 pub(crate) mod llm_api;
 pub(crate) mod mcp_http;
@@ -60,6 +73,8 @@ pub(crate) mod plugin_fs;
 pub(crate) mod plugin_http;
 pub(crate) mod plugin_pty;
 pub(crate) mod plugins;
+#[cfg(feature = "desktop")]
+mod press_and_hold;
 pub(crate) mod process_env;
 pub(crate) mod prompt;
 pub(crate) mod provider_registry;
@@ -230,6 +245,8 @@ fn load_config(state: State<'_, Arc<AppState>>) -> config::AppConfig {
 #[tauri::command]
 fn save_config(state: State<'_, Arc<AppState>>, config: config::AppConfig) -> Result<(), String> {
     let old = state.config.read().clone();
+    let mut config = config;
+    config::preserve_redacted_app_config_secrets(&mut config, &old);
     let server_changed = old.services.server.enabled != config.services.server.enabled
         || old.services.server.port != config.services.server.port
         || old.services.auth.username != config.services.auth.username
@@ -247,7 +264,7 @@ fn save_config(state: State<'_, Arc<AppState>>, config: config::AppConfig) -> Re
     }
 
     if server_changed {
-        restart_server(state.inner());
+        restart_server(state.inner(), "remote-access configuration changed");
     }
 
     Ok(())
@@ -577,8 +594,51 @@ fn list_markdown_files(path: String) -> Result<Vec<MarkdownFileEntry>, String> {
     list_markdown_files_impl(path)
 }
 
-/// Read file content (shared logic)
-pub(crate) fn read_file_impl(path: String, file: String) -> Result<String, String> {
+/// Max file size for the generic readers used by the markdown/html-preview/plugin
+/// panels. Those panels render the whole payload eagerly (markdown → HTML, etc.),
+/// so a large file would freeze them — guarded at the source via `metadata().len()`
+/// before reading. (AI-agent reads have their own limit in ai_agent/tools.rs.)
+pub(crate) const MAX_EDITOR_FILE_SIZE: u64 = 10 * 1024 * 1024;
+
+/// Larger cap for the CodeMirror code editor specifically (`read_editor_file*`).
+/// The editor keeps the doc in a CM6 rope and renders only the viewport, so it
+/// tolerates far larger files than the eager panels above.
+///
+/// Hard ceiling for the editor: files above this are refused before reading so a
+/// huge payload can't freeze the webview crossing IPC as one string. The 100 MB
+/// Tier-1 measurement (`plans/large-file-editor.md` T1.4) showed sub-100 ms JS cost
+/// with heap ~1.2× the file; 250 MB trades some headroom for opening bigger files,
+/// with the frontend showing a non-blocking "may be slow" warning past 100 MB.
+pub(crate) const MAX_EDITOR_LARGE_FILE_SIZE: u64 = 250 * 1024 * 1024;
+
+/// Read a UTF-8 text file, refusing files over `limit` before reading so a huge
+/// file can't freeze the webview. The "too large" message is matched by the editor
+/// frontend (regex /too large/i) to show a friendly blocking notice, so keep that
+/// phrase stable.
+fn read_text_file_guarded_with_limit(path: &std::path::Path, limit: u64) -> Result<String, String> {
+    if let Ok(meta) = std::fs::metadata(path)
+        && meta.len() > limit
+    {
+        return Err(format!(
+            "File too large to open in editor: {:.1} MB (limit {} MB)",
+            meta.len() as f64 / (1024.0 * 1024.0),
+            limit / (1024 * 1024)
+        ));
+    }
+    std::fs::read_to_string(path).map_err(|e| format!("Failed to read file: {e}"))
+}
+
+/// Guarded read at the generic [`MAX_EDITOR_FILE_SIZE`] cap (markdown/html/plugin panels).
+fn read_text_file_guarded(path: &std::path::Path) -> Result<String, String> {
+    read_text_file_guarded_with_limit(path, MAX_EDITOR_FILE_SIZE)
+}
+
+/// Read file content within a repo (shared logic), guarded at `limit`.
+pub(crate) fn read_file_impl_with_limit(
+    path: String,
+    file: String,
+    limit: u64,
+) -> Result<String, String> {
     let repo_path = PathBuf::from(&path);
     let file_path = repo_path.join(&file);
 
@@ -595,12 +655,24 @@ pub(crate) fn read_file_impl(path: String, file: String) -> Result<String, Strin
         return Err("Access denied: file is outside repository".to_string());
     }
 
-    std::fs::read_to_string(&file_path).map_err(|e| format!("Failed to read file: {e}"))
+    read_text_file_guarded_with_limit(&file_path, limit)
+}
+
+/// Read file content (shared logic) at the generic [`MAX_EDITOR_FILE_SIZE`] cap.
+pub(crate) fn read_file_impl(path: String, file: String) -> Result<String, String> {
+    read_file_impl_with_limit(path, file, MAX_EDITOR_FILE_SIZE)
 }
 
 #[cfg_attr(feature = "desktop", tauri::command)]
 fn read_file(path: String, file: String) -> Result<String, String> {
     read_file_impl(path, file)
+}
+
+/// Read a repo file for the CodeMirror editor, at the larger
+/// [`MAX_EDITOR_LARGE_FILE_SIZE`] cap. Same repo-containment check as `read_file`.
+#[cfg_attr(feature = "desktop", tauri::command)]
+fn read_editor_file(repo_path: String, file: String) -> Result<String, String> {
+    read_file_impl_with_limit(repo_path, file, MAX_EDITOR_LARGE_FILE_SIZE)
 }
 
 /// Read a file by absolute path (read-only, no repo constraint).
@@ -615,7 +687,24 @@ fn read_external_file(path: String) -> Result<String, String> {
     if !p.is_absolute() {
         return Err("read_external_file requires an absolute path".to_string());
     }
-    std::fs::read_to_string(p).map_err(|e| format!("Failed to read file: {e}"))
+    read_text_file_guarded(p)
+}
+
+/// Read an absolute-path file (read-only) guarded at `limit`. Shared by the
+/// `read_editor_file_external` command and its HTTP route.
+pub(crate) fn read_external_file_with_limit(path: &str, limit: u64) -> Result<String, String> {
+    let p = std::path::Path::new(path);
+    if !p.is_absolute() {
+        return Err("read_editor_file_external requires an absolute path".to_string());
+    }
+    read_text_file_guarded_with_limit(p, limit)
+}
+
+/// Read an absolute-path file for the CodeMirror editor, at the larger
+/// [`MAX_EDITOR_LARGE_FILE_SIZE`] cap. The HTTP endpoint has its own repo-root check.
+#[cfg_attr(feature = "desktop", tauri::command)]
+fn read_editor_file_external(path: String) -> Result<String, String> {
+    read_external_file_with_limit(&path, MAX_EDITOR_LARGE_FILE_SIZE)
 }
 
 /// Write a file at an absolute path (used by the UI for files outside any registered repo,
@@ -629,7 +718,7 @@ fn write_external_file(path: String, content: String) -> Result<(), String> {
     let home =
         dirs::home_dir().ok_or_else(|| "Could not resolve user home directory".to_string())?;
     fs::validate_external_write_path(p, &home)?;
-    std::fs::write(p, content).map_err(|e| format!("Failed to write file: {e}"))
+    fs::atomic_write(p, content.as_bytes()).map_err(|e| format!("Failed to write file: {e}"))
 }
 
 /// Get MCP server status (running, port, active sessions).
@@ -712,6 +801,19 @@ async fn deep_link_mcp_call(
         serde_json::Value::Object(map) => map,
         _ => serde_json::Map::new(),
     };
+    // Defense-in-depth backstop: deep-link-handler.ts is the enforcement boundary
+    // (default-deny + confirm dialog), but mirror its hard BLOCKED set here so these
+    // can never run via a tuic:// URL even if the frontend allowlist regresses.
+    // config/save mutates app config; debug/invoke_js is arbitrary JS execution.
+    if matches!(
+        (tool.as_str(), action.as_str()),
+        ("config", "save") | ("debug", "invoke_js")
+    ) {
+        return Ok(serde_json::json!({
+            "error": "This command is not permitted via deep link"
+        }));
+    }
+
     args.insert("action".to_string(), serde_json::Value::String(action));
 
     let addr: std::net::SocketAddr = ([127, 0, 0, 1], 0).into();
@@ -736,6 +838,7 @@ fn regenerate_session_token(state: State<'_, Arc<AppState>>) {
     // Persist so the new token survives restarts
     let mut cfg = state.config.read().clone();
     cfg.services.auth.session_token = new_token;
+    cfg.services.auth.session_token_exists = true;
     if let Err(e) = config::save_app_config(cfg) {
         tracing::error!(
             source = "auth",
@@ -744,8 +847,9 @@ fn regenerate_session_token(state: State<'_, Arc<AppState>>) {
     }
 }
 
-/// Build a QR-code connect URL server-side so the raw session token
-/// never reaches JS (where a malicious plugin could steal it).
+/// Build a QR-code connect URL server-side, selecting scheme/host from the
+/// current Tailscale + TLS state. The returned URL embeds the raw session
+/// token as a `?token=` query param, so the token IS exposed to the JS caller.
 /// Uses HTTPS + Tailscale FQDN when TLS is active on a Tailscale IP.
 #[cfg(feature = "desktop")]
 #[tauri::command]
@@ -805,10 +909,22 @@ async fn provision_tls_config(
 
 #[cfg(feature = "desktop")]
 /// Restart the HTTP/MCP server with fresh TLS config (reuses the shutdown/spawn pattern from save_config).
-fn restart_server(state: &Arc<AppState>) {
+fn restart_server(state: &Arc<AppState>, reason: &'static str) {
+    tracing::info!(
+        source = "mcp_http",
+        reason,
+        remote_enabled = state.config.read().services.server.enabled,
+        "HTTP server reconfiguration requested; local MCP IPC remains active"
+    );
     // Shutdown existing server
-    if let Some(tx) = state.server_shutdown.lock().take() {
-        let _ = tx.send(());
+    if let Some(tx) = state.server_shutdown.lock().take()
+        && tx.send(()).is_err()
+    {
+        tracing::warn!(
+            source = "mcp_http",
+            reason,
+            "Previous TCP server lifecycle had already stopped"
+        );
     }
     let remote_enabled = state.config.read().services.server.enabled;
     let state_arc = state.clone();
@@ -820,6 +936,17 @@ fn restart_server(state: &Arc<AppState>) {
             mcp_http::start_server(state_arc, true, remote_enabled, tls_config).await;
         });
     });
+}
+
+/// Run the initial server future without letting its owning Tokio runtime die
+/// after a TCP restart. Always-on IPC/background tasks are children of that
+/// runtime and must live for the process lifetime.
+async fn keep_server_owner_runtime_alive<F>(server: F)
+where
+    F: std::future::Future,
+{
+    let _ = server.await;
+    std::future::pending::<()>().await;
 }
 
 /// Re-detect Tailscale daemon status and restart server if HTTPS availability changed.
@@ -858,7 +985,7 @@ async fn recheck_tailscale_status(
             new_https,
             "HTTPS state changed, restarting server"
         );
-        restart_server(&state);
+        restart_server(&state, "Tailscale HTTPS availability changed");
     }
 
     Ok(new_state)
@@ -881,6 +1008,50 @@ fn get_relay_status(state: State<'_, Arc<AppState>>) -> serde_json::Value {
     })
 }
 
+/// Raise the open-file descriptor soft limit toward the hard limit.
+///
+/// No-op when the current soft limit already meets the target (e.g. launched
+/// from a terminal that inherited a high ulimit). On non-Unix this does nothing.
+#[cfg(unix)]
+fn raise_fd_limit() {
+    // macOS caps per-process descriptors at kern.maxfilesperproc (≈138k here);
+    // 64k is comfortably below that and far above our steady state (~95) plus
+    // any realistic git fan-out.
+    const DESIRED: libc::rlim_t = 65_536;
+    let mut lim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0 {
+        tracing::warn!(
+            source = "boot",
+            "getrlimit(RLIMIT_NOFILE) failed; leaving FD limit unchanged"
+        );
+        return;
+    }
+    let target = if lim.rlim_max == libc::RLIM_INFINITY {
+        DESIRED
+    } else {
+        DESIRED.min(lim.rlim_max)
+    };
+    if lim.rlim_cur >= target {
+        return;
+    }
+    let old = lim.rlim_cur;
+    lim.rlim_cur = target;
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lim) } == 0 {
+        tracing::info!(source = "boot", "Raised FD soft limit {old} → {target}");
+    } else {
+        tracing::warn!(
+            source = "boot",
+            "setrlimit(RLIMIT_NOFILE) {old} → {target} failed"
+        );
+    }
+}
+
+#[cfg(not(unix))]
+fn raise_fd_limit() {}
+
 #[cfg(feature = "desktop")]
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -899,6 +1070,14 @@ pub fn run() {
     )));
     app_logger::init_tracing(log_buffer.clone());
 
+    // Raise the open-file descriptor soft limit before any watcher or subprocess
+    // fan-out starts. macOS GUI apps launched via launchd inherit a soft
+    // RLIMIT_NOFILE of just 256 (`launchctl limit maxfiles`). TUIC spawns many
+    // subprocesses (git, agents, PTYs) and watches many repos; a repo-change
+    // burst can fan out enough concurrent git pipes to cross 256 → EMFILE
+    // ("Too many open files"). Best-effort: logs and continues on failure.
+    raise_fd_limit();
+
     // Default worktrees directory: <config_dir>/worktrees
     let worktrees_dir = config::config_dir().join("worktrees");
 
@@ -911,6 +1090,7 @@ pub fn run() {
             Ok((private, public)) => {
                 tracing::info!(source = "push", "Generated VAPID key pair");
                 config.services.push.vapid_private_key = private;
+                config.services.push.vapid_private_key_exists = true;
                 config.services.push.vapid_public_key = public;
                 config_dirty = true;
             }
@@ -921,6 +1101,7 @@ pub fn run() {
     }
     if config.services.auth.session_token.is_empty() {
         config.services.auth.session_token = uuid::Uuid::new_v4().to_string();
+        config.services.auth.session_token_exists = true;
         tracing::info!(source = "auth", "Generated persistent session token");
         config_dirty = true;
     }
@@ -972,15 +1153,45 @@ pub fn run() {
                     None
                 };
 
-                // Bind the IPC socket BEFORE upstream auto-connect so the MCP
-                // bridge is reachable as soon as possible. Upstream connections
-                // can be slow (network timeouts, OAuth) and must not delay socket
-                // availability — that causes "MCP disconnected" in Claude Code.
-                let srv_state = server_state.clone();
-                mcp_http::start_server(srv_state, true, remote_enabled, tls_config).await;
+                // `start_server` binds the IPC socket and then parks on the
+                // shutdown signal — it only returns on save_config/restart, so
+                // it must be the call that owns this boot thread's runtime for
+                // the process lifetime. Auto-connect therefore CANNOT run after
+                // it (that line would be dead code, leaving every upstream
+                // unconnected until the user touches the UI). Spawn auto-connect
+                // to run concurrently: it registers upstreams + spawns their
+                // async init (it does not await slow network/OAuth), so it never
+                // delays socket binding — keeping the MCP bridge reachable for
+                // Claude Code while still connecting saved upstreams at boot.
+                let auto_state = server_state.clone();
+                let settle_guard = auto_state.clone();
+                let auto_handle = tokio::spawn(async move {
+                    crate::mcp_upstream_config::auto_connect_saved_upstreams(&auto_state).await;
+                });
+                // If the auto-connect task panics it would never call
+                // mark_initial_connect_complete(), leaving every tools/list to
+                // block for the full settle timeout with no log. Watch the handle
+                // and recover the latch on failure.
+                tokio::spawn(async move {
+                    if let Err(e) = auto_handle.await {
+                        tracing::error!(
+                            source = "mcp_upstream",
+                            "auto_connect_saved_upstreams task failed: {e}"
+                        );
+                        settle_guard
+                            .mcp_upstream_registry
+                            .mark_initial_connect_complete();
+                    }
+                });
 
-                // Auto-connect saved upstream MCP servers (after socket is live)
-                crate::mcp_upstream_config::auto_connect_saved_upstreams(&server_state).await;
+                let srv_state = server_state.clone();
+                keep_server_owner_runtime_alive(mcp_http::start_server(
+                    srv_state,
+                    true,
+                    remote_enabled,
+                    tls_config,
+                ))
+                .await;
             });
         });
     }
@@ -1079,7 +1290,6 @@ pub fn run() {
                 .build(),
         )
         .manage(state)
-        .manage(ai_chat_registry::ChatRegistry::new())
         .manage(crate::fs::ContentSearchCancel(std::sync::Mutex::new(None)))
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_clipboard_manager::init())
@@ -1119,6 +1329,29 @@ pub fn run() {
             let app_state: &Arc<AppState> = app.state::<Arc<AppState>>().inner();
             *app_state.app_handle.write() = Some(app.handle().clone());
 
+            // Ensure main window exists — if tauri.conf.json windows[] is
+            // empty (accidental edit, merge conflict), create it programmatically
+            // so the app doesn't start as a headless dock icon.
+            if app.get_webview_window("main").is_none() {
+                tracing::warn!("Main window missing from config — creating programmatically");
+                let builder = tauri::WebviewWindowBuilder::new(
+                    app,
+                    "main",
+                    tauri::WebviewUrl::App("index.html".into()),
+                )
+                .title("TUICommander")
+                .inner_size(1200.0, 800.0)
+                .min_inner_size(800.0, 600.0)
+                .decorations(true)
+                .resizable(true);
+                // hidden_title / title_bar_style are macOS-only builder methods.
+                #[cfg(target_os = "macos")]
+                let builder = builder
+                    .hidden_title(true)
+                    .title_bar_style(tauri::TitleBarStyle::Overlay);
+                builder.build()?;
+            }
+
             // Track desktop window focus so push notifications can be
             // suppressed while the user is at their machine.
             if let Some(window) = app.get_webview_window("main") {
@@ -1146,6 +1379,10 @@ pub fn run() {
 
                 // Install Ctrl+Tab monitor (macOS swallows it before JS/WKWebView)
                 tab_shortcut::install(app.handle().clone());
+
+                // Disable macOS press-and-hold accent popup so held keys repeat
+                // in the terminal's hidden input (vim j/l/i — issue #79)
+                press_and_hold::disable();
             }
 
             // Seed built-in themes on first run, then start hot-reload watcher
@@ -1160,7 +1397,9 @@ pub fn run() {
 
             // Auto-start repo watchers for known repositories.
             // Uses raw notify::RecommendedWatcher — registration is instant on
-            // macOS (FSEvents) and Windows (ReadDirectoryChangesW), no walkdir scan.
+            // macOS (FSEvents) and Windows (ReadDirectoryChangesW). On Linux
+            // (inotify) notify emulates recursion with a per-directory walk, so
+            // registration is not free there (see issue #82 / repo_watcher.rs).
             let repos_json = config::load_repositories();
             let mut known_repo_paths: Vec<String> = Vec::new();
             if let Some(repos) = repos_json.get("repos").and_then(|r| r.as_object()) {
@@ -1179,28 +1418,58 @@ pub fn run() {
 
             // Auto-update CLI binary if installed
             #[cfg(feature = "desktop")]
-            tuic_cli::auto_update_cli(app.handle());
+            tuic_cli::auto_update_cli();
 
-            // Pre-warm content indices for known repos: one at a time, after a
-            // short delay, so boot UI stays responsive and the cooperative
-            // throttle in `ContentIndex::build_with_throttle` keeps CPU gentle.
+            // Pre-warm content indices based on index_strategy setting:
+            // - "active_only": only the active repo at boot
+            // - "active_and_switch": active repo at boot, others on repo switch (default)
+            // - "all_sequential": all repos sequentially
+            // Global semaphore in AppState (capacity 1) serialises concurrent builds.
             if !known_repo_paths.is_empty() {
-                let state_for_prewarm = Arc::clone(app_state);
-                tauri::async_runtime::spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                    for repo in known_repo_paths {
-                        // `ensure_index` is sync + spawns its own blocking task.
-                        // Awaiting JoinHandle here would require threading; instead
-                        // we serialize by waiting until the index flips to ready.
-                        let index_arc =
-                            crate::content_index::ensure_index(&state_for_prewarm, &repo);
-                        // Poll until this repo's build completes before starting the next.
-                        while !index_arc.read().is_ready() {
-                            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                let active_repo = repos_json
+                    .get("activeRepoPath")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_owned());
+
+                let strategy = config::load_app_config().index_strategy;
+
+                let repos_to_warm = match strategy.as_str() {
+                    "all_sequential" => {
+                        if let Some(ref active) = active_repo
+                            && let Some(pos) = known_repo_paths.iter().position(|p| p == active)
+                        {
+                            known_repo_paths.swap(0, pos);
+                        }
+                        known_repo_paths
+                    }
+                    _ => {
+                        // active_only and active_and_switch: only pre-warm the active repo
+                        if let Some(active) = active_repo {
+                            if known_repo_paths.contains(&active) {
+                                vec![active]
+                            } else {
+                                Vec::new()
+                            }
+                        } else {
+                            Vec::new()
                         }
                     }
-                    tracing::info!("content index pre-warm complete");
-                });
+                };
+
+                if !repos_to_warm.is_empty() {
+                    let state_for_prewarm = Arc::clone(app_state);
+                    tauri::async_runtime::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        for repo in repos_to_warm {
+                            let index_arc =
+                                crate::content_index::ensure_index(&state_for_prewarm, &repo);
+                            while !index_arc.read().is_ready() {
+                                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                            }
+                        }
+                        tracing::info!("content index pre-warm complete");
+                    });
+                }
             }
 
             Ok(())
@@ -1232,15 +1501,20 @@ pub fn run() {
             pty::close_pty,
             worktree::get_worktrees_dir,
             git::get_repo_info,
+            git::get_remote_url,
             git::get_git_diff,
             git::get_diff_stats,
             git::get_changed_files,
             git::get_file_diff,
+            git::get_gutter_changes,
             diff_triage::run_diff_triage,
+            diff_triage::run_pr_review,
             git::get_recent_commits,
             list_markdown_files,
             read_file,
+            read_editor_file,
             read_external_file,
+            read_editor_file_external,
             write_external_file,
             github::get_github_status,
             pty::get_orchestrator_stats,
@@ -1255,6 +1529,8 @@ pub fn run() {
             pty::ack_terminal_frame,
             pty::terminal_exit_alt_screen,
             pty::terminal_scroll,
+            pty::terminal_scroll_to_offset,
+            pty::terminal_styled_rows,
             pty::terminal_scroll_to,
             pty::terminal_get_block_rows,
             pty::terminal_scroll_info,
@@ -1286,6 +1562,7 @@ pub fn run() {
             mdkb_commands::uninstall_mdkb,
             hash_password,
             agent::open_in_app,
+            agent::open_in_custom,
             agent::detect_claude_binary,
             agent::detect_agent_binary,
             agent::detect_all_agent_binaries,
@@ -1336,8 +1613,17 @@ pub fn run() {
             github::merge_pr_via_github,
             github::get_pr_diff,
             github::approve_pr,
+            github::create_pr,
+            github::create_issue,
+            github::post_pr_review,
+            github::get_merged_prs,
+            changelog::generate_changelog,
+            conflict_assist::start_conflict_assist,
+            improvement_scan::run_improvement_scan,
+            improvement_scan::create_issue_from_proposal,
             github::fetch_ci_failure_logs,
             github::get_all_issues,
+            github::get_issue_detail,
             github::close_issue,
             github::reopen_issue,
             github_poller::github_start_polling,
@@ -1349,10 +1635,19 @@ pub fn run() {
             github_poller::github_set_pr_hide_drafts,
             github_auth::github_start_login,
             github_auth::github_poll_login,
+            github_auth::github_poll_add_account,
             github_auth::github_logout,
             github_auth::github_disconnect,
             github_auth::github_diagnostics,
             github_auth::github_auth_status,
+            github_account::github_add_account,
+            github_account::github_remove_account,
+            github_account::github_bind_repo,
+            github_account::github_unbind_repo,
+            github_account::github_resolve_repo,
+            github_account::github_resolve_repos,
+            github_account::github_list_accounts,
+            github_account::github_list_bindings,
             worktree::generate_worktree_name_cmd,
             worktree::generate_clone_branch_name_cmd,
             worktree::merge_and_archive_worktree,
@@ -1402,6 +1697,7 @@ pub fn run() {
             config::save_repo_settings,
             config::set_branch_label,
             config::load_repo_local_config,
+            config::save_repo_local_config,
             mcp_upstream_config::load_mcp_upstreams,
             mcp_upstream_config::save_mcp_upstreams,
             mcp_upstream_config::set_project_mcp_upstreams,
@@ -1435,6 +1731,8 @@ pub fn run() {
             config::save_keybindings,
             config::load_agents_config,
             config::save_agents_config,
+            agent_hook_commands::set_agent_hook_instrumentation,
+            agent_hook_commands::get_agent_hook_state,
             agent_mcp::get_agent_mcp_status,
             agent_mcp::install_agent_mcp,
             agent_mcp::remove_agent_mcp,
@@ -1486,6 +1784,7 @@ pub fn run() {
             ai_agent::commands::watcher_update,
             repo_watcher::start_repo_watcher,
             repo_watcher::stop_repo_watcher,
+            repo_watcher::set_hot_repos,
             dir_watcher::start_dir_watcher,
             dir_watcher::stop_dir_watcher,
             sleep_prevention::block_sleep,
@@ -1494,13 +1793,17 @@ pub fn run() {
             fs::list_directory,
             fs::stat_path,
             fs::search_files,
+            fs::warm_content_index,
             fs::search_content,
+            fs::search_content_all,
             fs::fs_read_file,
             fs::write_file,
             fs::create_directory,
             fs::delete_path,
             fs::rename_path,
             fs::copy_path,
+            fs::copy_path_abs,
+            fs::move_path_abs,
             fs::fs_transfer_paths,
             fs::add_to_gitignore,
             plugins::list_user_plugins,
@@ -1515,12 +1818,15 @@ pub fn run() {
             plugins::register_loaded_plugin,
             plugins::unregister_loaded_plugin,
             plugin_fs::plugin_read_file,
+            plugin_fs::plugin_read_file_base64,
             plugin_fs::plugin_list_directory,
             plugin_fs::plugin_read_file_tail,
             plugin_fs::plugin_write_file,
             plugin_fs::plugin_rename_path,
             plugin_fs::plugin_watch_path,
             plugin_fs::plugin_unwatch,
+            plugin_fs::scan_build_artifacts,
+            plugin_fs::delete_build_artifact,
             plugin_http::plugin_http_fetch,
             plugin_pty::plugin_read_session_output,
             plugin_exec::plugin_exec_cli,
@@ -1564,6 +1870,18 @@ pub fn run() {
                 tauri::RunEvent::Ready => {
                     if let Some(window) = app_handle.get_webview_window("main") {
                         ensure_window_visible(&window);
+                    }
+                }
+                // Dock-icon click (applicationShouldHandleReopen). macOS suppresses
+                // the default un-minimize when ANY window is visible — and a detached
+                // panel counts as visible, so the minimized main window would stay
+                // hidden. Explicitly restore main on every reopen.
+                #[cfg(target_os = "macos")]
+                tauri::RunEvent::Reopen { .. } => {
+                    if let Some(window) = app_handle.get_webview_window("main") {
+                        let _ = window.unminimize();
+                        let _ = window.show();
+                        let _ = window.set_focus();
                     }
                 }
                 // Forward file-open events (macOS file associations) to the frontend
@@ -1621,9 +1939,11 @@ fn build_connect_url(scheme: &str, host: &str, port: u16, token: &str) -> String
 /// Spawn background tasks shared by both desktop and headless modes.
 fn spawn_background_tasks(state: &Arc<AppState>) {
     AppState::spawn_session_state_accumulator(state.clone());
+    drop(state.oauth_flow_manager.spawn_cleanup_task());
     mcp_http::mcp_transport::spawn_tool_search_index_updater(state.clone());
     pty::spawn_tombstone_sweeper(state.clone());
     content_index::spawn_content_index_updater(state.clone());
+    cpu_watchdog::spawn(state.clone());
     ai_agent::knowledge::spawn_persist_task(state.clone());
     {
         let sched_state = state.clone();
@@ -1719,6 +2039,7 @@ pub async fn run_headless(port: u16) -> anyhow::Result<()> {
     }
     if app_config.services.auth.session_token.is_empty() {
         app_config.services.auth.session_token = uuid::Uuid::new_v4().to_string();
+        app_config.services.auth.session_token_exists = true;
     }
 
     let data_dir = config::config_dir();
@@ -1768,6 +2089,29 @@ pub async fn run_headless(port: u16) -> anyhow::Result<()> {
         "Starting tuic-remote"
     );
 
+    // Auto-connect saved upstream MCP servers. Spawned (not awaited) for the
+    // same reason as the desktop boot path: `start_server` below parks on the
+    // shutdown signal and never returns, so any auto-connect after it would be
+    // dead code. Registration is fast (async init is spawned), so it does not
+    // delay socket binding.
+    let auto_state = state.clone();
+    let settle_guard = auto_state.clone();
+    let auto_handle = tokio::spawn(async move {
+        crate::mcp_upstream_config::auto_connect_saved_upstreams(&auto_state).await;
+    });
+    // Recover the settle latch if the auto-connect task panics (see desktop path).
+    tokio::spawn(async move {
+        if let Err(e) = auto_handle.await {
+            tracing::error!(
+                source = "mcp_upstream",
+                "auto_connect_saved_upstreams task failed: {e}"
+            );
+            settle_guard
+                .mcp_upstream_registry
+                .mark_initial_connect_complete();
+        }
+    });
+
     // Run server until SIGINT/SIGTERM, then shut down gracefully.
     tokio::select! {
         tcp_bound = mcp_http::start_server(state.clone(), true, true, tls_config) => {
@@ -1796,6 +2140,10 @@ pub async fn run_headless(port: u16) -> anyhow::Result<()> {
 /// - Binds TCP directly without spawning an IPC socket.
 #[cfg(not(feature = "desktop"))]
 pub async fn run_remote(port: u16) -> anyhow::Result<()> {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .map_err(|_| anyhow::anyhow!("Failed to install rustls CryptoProvider"))?;
+
     let log_buffer = Arc::new(parking_lot::Mutex::new(app_logger::LogRingBuffer::new(
         app_logger::LOG_RING_CAPACITY,
     )));
@@ -1821,6 +2169,7 @@ pub async fn run_remote(port: u16) -> anyhow::Result<()> {
     }
     if app_config.services.auth.session_token.is_empty() {
         app_config.services.auth.session_token = uuid::Uuid::new_v4().to_string();
+        app_config.services.auth.session_token_exists = true;
     }
 
     let data_dir = config::config_dir();
@@ -1900,6 +2249,22 @@ pub async fn run_remote(port: u16) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn initial_server_runtime_stays_alive_after_tcp_shutdown() {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let owner = tokio::spawn(keep_server_owner_runtime_alive(async move {
+            let _ = shutdown_rx.await;
+        }));
+
+        shutdown_tx.send(()).unwrap();
+        tokio::task::yield_now().await;
+        assert!(
+            !owner.is_finished(),
+            "the runtime owner must remain parked after start_server returns"
+        );
+        owner.abort();
+    }
+
     #[test]
     fn build_connect_url_ipv4() {
         assert_eq!(
@@ -1913,6 +2278,68 @@ mod tests {
         assert_eq!(
             build_connect_url("http", "fe80::1", 9443, "tok"),
             "http://[fe80::1]:9443/?token=tok"
+        );
+    }
+
+    #[test]
+    fn read_text_file_guarded_reads_small_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("small.txt");
+        std::fs::write(&f, "hello world").unwrap();
+        assert_eq!(read_text_file_guarded(&f).unwrap(), "hello world");
+    }
+
+    #[test]
+    fn read_text_file_guarded_refuses_oversized_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("huge.txt");
+        // One byte over the limit must be refused BEFORE reading, with a stable
+        // "too large" phrase the editor frontend matches.
+        std::fs::write(&f, vec![b'a'; (MAX_EDITOR_FILE_SIZE + 1) as usize]).unwrap();
+        let err = read_text_file_guarded(&f).unwrap_err();
+        assert!(
+            err.to_lowercase().contains("too large"),
+            "expected a 'too large' message, got: {err}"
+        );
+    }
+
+    #[test]
+    fn read_text_file_guarded_allows_file_at_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("atlimit.bin");
+        // Exactly at the limit (not over) is allowed; content is valid UTF-8.
+        std::fs::write(&f, vec![b'a'; MAX_EDITOR_FILE_SIZE as usize]).unwrap();
+        assert!(read_text_file_guarded(&f).is_ok());
+    }
+
+    #[test]
+    fn read_text_file_guarded_with_limit_respects_custom_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("sized.txt");
+        std::fs::write(&f, vec![b'a'; 50]).unwrap();
+        // Under a generous limit → read; over a tight limit → refused "too large".
+        assert!(read_text_file_guarded_with_limit(&f, 100).is_ok());
+        let err = read_text_file_guarded_with_limit(&f, 10).unwrap_err();
+        assert!(
+            err.to_lowercase().contains("too large"),
+            "expected a 'too large' message, got: {err}"
+        );
+    }
+
+    #[test]
+    fn editor_large_cap_exceeds_generic_cap() {
+        // The editor reader must allow strictly larger files than the generic one,
+        // otherwise the dedicated command is pointless.
+        assert!(MAX_EDITOR_LARGE_FILE_SIZE > MAX_EDITOR_FILE_SIZE);
+    }
+
+    #[test]
+    fn read_editor_file_external_requires_absolute_path() {
+        let err = read_external_file_with_limit("relative/path.txt", MAX_EDITOR_LARGE_FILE_SIZE)
+            .unwrap_err();
+        assert!(
+            err.contains("absolute path"),
+            "expected an absolute-path error, got: {err}"
         );
     }
 

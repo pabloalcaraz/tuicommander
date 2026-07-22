@@ -18,7 +18,7 @@ Main branches (main, master, develop) use the original repository directory — 
 
 ## Worktree Storage Strategies
 
-Configure where worktrees are stored (Settings → General → Worktree Defaults → Storage):
+Configure where worktrees are stored (Settings → Git & GitHub → Worktree Defaults → Storage):
 
 | Strategy | Location | Use case |
 |----------|----------|----------|
@@ -41,7 +41,7 @@ Click `+` next to a repository name. A dialog opens where you can:
 
 ### From the `+` Button (instant mode)
 
-When "Prompt on create" is off (Settings → Worktree Defaults), clicking `+` instantly creates a worktree with an auto-generated name based on the default branch.
+When "Prompt on create" is off (Settings → Git & GitHub → Worktree Defaults), clicking `+` instantly creates a worktree with an auto-generated name based on the default branch.
 
 ### From Branch Right-Click (quick-clone)
 
@@ -51,15 +51,15 @@ Right-click any non-main branch without a worktree → **Create Worktree**. This
 
 Global defaults apply to all repos. Per-repo overrides take precedence when set.
 
-### Global Defaults (Settings → General → Worktree Defaults)
+### Global Defaults (Settings → Git & GitHub → Worktree Defaults)
 
 | Setting | Options | Default |
 |---------|---------|---------|
-| **Storage** | Sibling / App directory / Inside repo | Sibling |
+| **Storage** | Sibling / App directory / Inside repo / Claude Code default | Sibling |
 | **Prompt on create** | On / Off | On |
 | **Delete branch on remove** | On / Off | On |
 | **Auto-archive merged** | On / Off | Off |
-| **Orphan cleanup** | Manual / Prompt / Auto | Manual |
+| **Orphan cleanup** | Ask before removing / Auto-remove / Keep | Ask |
 | **PR merge strategy** | Merge / Squash / Rebase | Merge |
 | **After merge** | Archive / Delete / Ask | Archive |
 
@@ -77,7 +77,7 @@ Right-click a worktree branch → **Merge & Archive** to:
    - **Delete**: Removes the worktree and branch entirely
    - **Ask**: Merge succeeds, then you choose what to do
 
-The merge uses `--no-edit` for a clean fast-forward or merge commit. If conflicts are detected, the merge is aborted and the worktree is left intact.
+The merge uses `--no-edit` for a clean fast-forward or merge commit. If conflicts are detected, TUICommander attempts `git merge --abort` and leaves the worktree intact. If that abort fails, the error message tells you the repository may still be conflicted and includes the manual abort command.
 
 When using **Ask** mode, the cleanup dialog detects uncommitted changes and auto-stashes them during the branch switch. An "Unstash after switch" checkbox lets you restore changes on the target branch.
 
@@ -106,6 +106,7 @@ Removing a worktree:
 1. Closes all terminals associated with that branch
 2. Runs `git worktree remove` to clean up
 3. Removes the branch entry from the sidebar
+4. If branch deletion was requested but `git branch -d` keeps the branch because it is not safely merged, shows a status message that the worktree was removed and the branch was kept
 
 ## Worktree Manager Panel
 

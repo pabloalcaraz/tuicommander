@@ -30,9 +30,7 @@ The entry point for all MCP traffic is `POST /mcp` (Streamable HTTP transport, s
 
 ## Tool Namespace
 
-All proxied tools are exposed with the prefix `{upstream_name}__{tool_name}`. The double underscore (`__`) is the routing discriminator — native TUIC tools never contain it. The separator splits only on the first occurrence, so tool names with internal underscores work correctly (e.g. `upstream__tool__with__underscores` routes to upstream `upstream`, tool `tool__with__underscores`).
-
-The tool description is also annotated with `[via {upstream_name}]` so the downstream AI client knows the origin.
+All proxied tools are exposed with the prefix `{upstream_name}__{tool_name}`. The double underscore (`__`) is the routing discriminator — native TUIC tools never contain it. The separator splits only on the first occurrence, so tool names with internal underscores work correctly (e.g. `upstream__tool__with__underscores` routes to upstream `upstream`, tool `tool__with__underscores`). The namespace identifies the origin; the upstream description is preserved byte-for-byte so TUIC instructions are not duplicated across every discovered tool.
 
 ## UpstreamRegistry
 
@@ -67,6 +65,19 @@ connect_upstream(config)
 | `CircuitOpen` | Too many failures, backoff timer active |
 | `Disabled` | Disabled by user in config (`enabled: false`) |
 | `Failed` | Permanently failed after max retries exceeded |
+| `NeedsAuth` | Upstream returned 401/challenge (or its OAuth token was rejected and could not be refreshed) — awaiting the user to click "Authorize". Tool calls are rejected with `-32001` until a user-initiated OAuth flow succeeds |
+| `Authenticating` | OAuth flow in progress (user clicked "Authorize") — tool calls rejected with `-32001` |
+
+### Boot-Time Auto-Connect & `tools/list` Readiness
+
+On startup, `auto_connect_saved_upstreams()` (`mcp_upstream_config.rs`) registers every saved upstream. It is **spawned, not awaited**, on both boot paths (desktop `lib.rs` and headless `run_headless`): `mcp_http::start_server` parks on the shutdown signal and never returns, so any auto-connect placed *after* it would be dead code — leaving every upstream unconnected until the user touches the UI. Registration is fast (the per-upstream async `initialize` is itself spawned), so it never delays IPC socket binding.
+
+To avoid serving a stale tool list, the registry exposes a one-shot settle gate:
+
+- `mark_initial_connect_complete()` — set by `auto_connect_saved_upstreams` once every upstream is registered (at both exits, including the empty-config early return). Async `initialize` may still be in flight.
+- `await_initial_settle(timeout)` — the first `tools/list` calls this before `merged_tool_definitions()`. It blocks (≤ `timeout`, default 3s) until auto-connect is complete **and** no entry is still `Connecting`, then serves. A global `initial_settle_done` latch makes every later call a no-op, so steady-state `tools/list` never blocks. On timeout it logs a warning and serves a possibly-partial list rather than hanging.
+
+This works around [anthropics/claude-code#4118](https://github.com/anthropics/claude-code/issues/4118): Claude Code fetches `tools/list` during its handshake — before async upstream init finishes — and never refetches on `notifications/tools/list_changed`, so without the settle wait the proxied tools (e.g. `quill__*`) would be missing until a manual reconnect.
 
 ### Tool Aggregation
 
@@ -108,6 +119,15 @@ Implements the MCP Streamable HTTP transport (spec 2025-03-26):
 5. **`shutdown()`** — Sends `DELETE /mcp` with the session ID to cleanly terminate the upstream session.
 
 The User-Agent header is set to `tuicommander-mcp-proxy/{version}`.
+
+### OAuth Refresh Failure → Re-Authorization
+
+When a request needs a fresh token, `refresh_token_if_needed()` runs the refresh and routes any failure through `classify_refresh_error()`:
+
+- **Fatal** (`invalid_grant`, no refresh token available, HTTP 400/401) → `UpstreamError::AuthFailed`. The refresh token is expired/revoked and cannot recover automatically.
+- **Transient** (network, 5xx) → `UpstreamError::Other` (retryable) so the circuit breaker + health checks keep trying.
+
+In `initialize_entry_with_oauth`, an `AuthFailed` on an OAuth2-configured upstream deletes the dead keyring token and re-enters `NeedsAuth` (UI shows "Authorize") instead of parking the upstream in a silent red `Failed`/`CircuitOpen` the user can't act on. Non-OAuth upstreams with a bad static token still go red (the arm is guarded by `matches!(auth, Some(OAuth2 { .. }))`). The health checker skips `NeedsAuth` entries, so there is no delete/init loop.
 
 ## Stdio Client (`stdio_client.rs`)
 
@@ -241,7 +261,7 @@ Status changes emit `UpstreamStatusChanged` events via the app event bus, which 
 }
 ```
 
-Valid status values: `connecting`, `ready`, `circuit_open`, `disabled`, `failed`.
+Valid status values: `connecting`, `ready`, `circuit_open`, `disabled`, `failed`, `needs_auth`, `authenticating`.
 
 ## Metrics
 
@@ -271,4 +291,12 @@ if tool_name.contains("__") {
 
 The `tools/list` response merges native tools with upstream tools via `merged_tool_definitions()`.
 
-The `build_mcp_instructions()` function that generates the system prompt for connecting agents also documents the proxied upstream tools and their statuses, giving the AI client situational awareness about which upstream servers are available.
+The `build_mcp_instructions()` function supplies TUIC protocol and orchestration context once in the initialize response. Proxied upstream descriptions remain upstream-owned and do not repeat that preamble.
+
+Successful proxied `tools/call` responses that are valid MCP `CallToolResult` objects
+(an object with a `content` array) pass through as the downstream JSON-RPC result.
+TUIC does not re-wrap or mutate their `content`, `isError`, `structuredContent`, or
+extension fields. The same passthrough is used when `collapse_tools` routes an upstream
+call through the `call_tool` meta-tool. If an upstream returns a malformed result, TUIC
+falls back to a compact JSON text content envelope; native TUIC tools always use that
+compact envelope.

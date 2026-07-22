@@ -66,6 +66,19 @@ When adding or changing Tauri commands:
 | `docs/api/http-api.md` | HTTP endpoint mapping (if browser/remote mode) |
 | Domain backend doc | e.g. `docs/backend/pty.md`, `docs/backend/git.md` |
 
+#### Tauri events emitted by backend
+When adding a new `app.emit(event_name, payload)` call, document it here and listen in `useAppInit.ts`:
+
+| Event | Payload | Emitted from | Frontend listener |
+|-------|---------|-------------|-------------------|
+| `session-standby` | `{ session_id: string, standby: bool }` | `pty.rs emit_standby_event()` | `useAppInit.ts` → `terminalsStore.update(termId, { standby })` |
+| `worktree-created` | `{ repo_path: string, branch: string, worktree_path: string }` | `mcp_transport.rs`, `session.rs`, `worktree_routes.rs` | TBD — frontend switch prompt |
+| `repo-changed` (git-state) | `{ repo_path: string }` | `repo_watcher.rs` — **only when the git-state fingerprint changed** (index size + resolved HEAD + porcelain status; skips no-op `.git` touches). Last fingerprint in `AppState.repo_git_fingerprints`. | `useAppInit.ts` → coalesced one bump/repo/frame via `revisionCoalescer` → `repositoriesStore.bumpRevision` |
+| `head-changed` | `{ repo_path: string, branch: string }` | `repo_watcher.rs` — **only when the resolved HEAD target changed** (`resolve_head_target`); skips the Linux inotify storm where `.git/HEAD` events recur without HEAD moving (issue #82). Last target in `AppState.repo_head_targets`; suppressed-emit count in `AppState.repo_head_emits_suppressed`. | `useAppInit.ts` → branch rename/activate (also dedupes on `activeBranch === branch`) |
+| `review-progress` | `{ repo_path: string, payload: { pr_number, summary, files, phase, done, llm_used, llm_model } }` | `diff_triage.rs` `ProgressSink::PrReview` during `run_pr_review`; also sent on `event_bus` for `/events` SSE | `githubOpsStore` listener updates per-PR review progress |
+| `conflict-assist-status` | `{ repo_path: string, payload: { pr_number, status, conflicted_files } }` | `conflict_assist.rs` `emit_conflict_assist_status()` lifecycle; also sent on `event_bus` for `/events` SSE | `githubOpsStore` listener updates conflict-assist state |
+| `proposals-ready` | `{ repo_path: string, payload: ImprovementScanResult }` | `improvement_scan.rs` after `run_improvement_scan` completes; also sent on `event_bus` for `/events` SSE | `githubOpsStore` listener accumulates proposals for the GitHub Ops dashboard |
+
 ### HTTP & MCP Server
 When adding routes or changing server behavior:
 
@@ -75,6 +88,16 @@ When adding routes or changing server behavior:
 | `docs/backend/mcp-http.md` | Server architecture, routing, lazy tool discovery (`collapse_tools` / meta-tools) |
 | `docs/user-guide/remote-access.md` | User setup guide |
 | `src-tauri/src/mcp_http/plugin_docs.rs` | PLUGIN_DOCS (if plugin-facing) |
+
+### Diagnostics
+When modifying `cpu_watchdog.rs` or the `/diagnostics` HTTP endpoint:
+
+| File | What to update |
+|------|----------------|
+| `src-tauri/src/cpu_watchdog.rs` | Watchdog logic, thresholds, snapshot fields |
+| `src-tauri/src/mcp_http/log_routes.rs` | `/diagnostics` GET/POST handlers |
+| `AGENTS.md` | Diagnostics section (usage, known failure patterns) |
+| `docs/FEATURES.md` | Section 20.11 (Runtime Diagnostics) |
 
 ### MCP Tool Surface (native tools, upstream proxy, meta-tools)
 When changing the tool list, tool handlers, `disabled_native_tools`, upstream allow/deny filters, or the Speakeasy meta-tools:
@@ -141,6 +164,18 @@ When modifying AI Chat panel, settings, context menu actions, or streaming backe
 | `docs/user-guide/ai-chat.md` | User-facing AI Chat guide |
 | `docs/api/tauri-commands.md` | Chat Registry + `open_panel_window` / `close_panel_window` / `focus_main_window` commands |
 
+### Extended thinking (Opus 4.7+ reasoning)
+When modifying reasoning effort, the thinking stream, or its gating:
+
+| File | What to update |
+|------|----------------|
+| `src-tauri/src/ai_agent/conversation_engine.rs` | `ReasoningLevel`, `supports_extended_thinking`, `resolve_reasoning`, `ConversationEvent::ReasoningChunk`, ChatOptions build + `captured_content` (thinking+signature) append |
+| `src-tauri/src/ai_agent/commands.rs` | `reasoning_effort` param + persisted-config fallback + 50ms ReasoningChunk batching |
+| `src-tauri/src/ai_chat.rs` | `AiChatConfig.reasoning_effort` field |
+| `src/stores/conversationStore.ts` | `reasoning_chunk` event + `reasoningChunks` signal + reset on new turn |
+| `src/components/AIChatPanel/AIChatPanel.tsx` | "Thinking" disclosure render |
+| `src/components/SettingsPanel/tabs/AiChatTab.tsx` | Extended-thinking effort dropdown |
+
 ### AI Agent (ReAct loop, knowledge store, MCP terminal tools)
 When modifying the AI agent loop engine, tool dispatch, session knowledge store,
 OSC 133 outcome capture, or the `ai_terminal_*` MCP tools:
@@ -148,7 +183,8 @@ OSC 133 outcome capture, or the `ai_terminal_*` MCP tools:
 | File | What to update |
 |------|----------------|
 | `src-tauri/src/ai_agent/engine.rs` | ReAct loop, approval flow, ACTIVE_AGENTS registry, system prompt |
-| `src-tauri/src/ai_agent/tools.rs` | Tool dispatch: 19 tools (terminal, filesystem, drive_agent, search, list_sessions) |
+| `src-tauri/src/ai_agent/tools.rs` | Tool dispatch: 31 tools (terminal observe incl. get_command_history/explain_last_failure/get_error_fixes/search_scrollback/get_hyperlinks/get_semantic_zones, reactive watches watch_for/list_watches/cancel_watch, filesystem, drive_agent, search, list_sessions). Tool count assertions live in tools.rs `#[cfg(test)]` — bump them on add/remove |
+| `src-tauri/src/terminal_grid.rs` | Grid reader methods backing agent tools: `search_buffer`, `enumerate_visible_hyperlinks` (get_hyperlinks), `extract_semantic_zones` (get_semantic_zones); `VtLogBuffer` delegates in `state.rs` |
 | `src-tauri/src/ai_agent/safety.rs` | SafetyChecker: command safety + file-write sensitive path rules |
 | `src-tauri/src/ai_agent/sandbox.rs` | FileSandbox: path jail for filesystem tools (canonicalize + starts_with) |
 | `src-tauri/src/mcp_http/ai_terminal.rs` | MCP exposure of all 13 `ai_terminal_*` tools; write-tool confirmation |
@@ -236,7 +272,8 @@ When modifying git operations, worktree logic, or GitHub API:
 
 | File | What to update |
 |------|----------------|
-| `docs/backend/git.md` | Git command lifecycle, diff parsing |
+| `docs/backend/git.md` | Git command lifecycle, diff parsing, **GitReads port (gix vs CLI op split)**, moka cache |
+| `src-tauri/src/git_reads.rs` | **GitReads port**: flipping an op to gix requires a green byte-parity shootout test first |
 | `docs/backend/github.md` | PR fetching, CI checks, GraphQL |
 | `docs/user-guide/worktrees.md` | Worktree workflow, configuration |
 | `docs/user-guide/github-integration.md` | PR monitoring, CI rings |
@@ -271,6 +308,18 @@ When adding or modifying panels, status bar, toolbar, sidebar:
 | `docs/frontend/STYLE_GUIDE.md` | If changing visual patterns |
 | `docs/frontend/components.md` | Component tree, panel descriptions |
 | Domain user guide | e.g. `docs/user-guide/sidebar.md`, `docs/user-guide/file-browser.md` |
+
+### Markdown Inline Review Comments (tweaks) & Highlight Rendering
+When modifying the tweak-comment format, the selection/popover UI, or the DOM highlight wrapping:
+
+| File | What to update |
+|------|----------------|
+| `src/utils/tweakComments.ts` | Marker format, parse/insert/remove/update, sentinels, convention header |
+| `src/utils/tweakDomHighlight.ts` | DOM-side sentinel→`.tweak-highlight` span wrapping |
+| `src/components/MarkdownTab/CommentOverlay.tsx` | Floating Comment button + inline popover + hover tooltip |
+| `src/components/MarkdownTab/MarkdownTab.tsx` | Save/delete wiring, write-back to disk |
+| `src/components/ui/ContentRenderer.tsx` | Sentinel injection + `applyTweakDomHighlights` on render (shared by PR detail) |
+| `docs/FEATURES.md` | Section 3.3 (Markdown Panel) — Inline review comments |
 
 ### TUIC SDK & iframe Integration
 When modifying the TUIC SDK, iframe postMessage protocol, path resolution, or tab injection:
@@ -326,8 +375,8 @@ When adding or changing `tuic://` schemes:
 | `docs/frontend/transport.md` | Tauri/HTTP dual-mode transport |
 | `docs/frontend/utilities.md` | Utility function reference |
 | `docs/features/ssh-tunnels.md` | SSH tunnel architecture and module map |
-| `docs/user-guide/*.md` | User-facing guides (14 files) |
+| `docs/user-guide/*.md` | User-facing guides (20 files) |
 | **Code-embedded docs** | |
 | `src-tauri/src/mcp_http/plugin_docs.rs` | AI-optimized plugin reference (`PLUGIN_DOCS` const) |
 | `src/actions/actionRegistry.ts` | ACTION_META → auto-populates HelpPanel + Command Palette |
-| `examples/plugins/` | Reference plugin implementations (6 examples) |
+| `examples/plugins/` | Reference plugin implementations (7 examples) |

@@ -2,7 +2,9 @@ import { createStore } from "solid-js/store";
 import { setLocale } from "../i18n";
 import { invoke } from "../invoke";
 import type { IssueFilterMode } from "../types";
+import { runSerializedConfigWrite, updateAppConfig } from "../utils/updateAppConfig";
 import { appLogger } from "./appLogger";
+import { toastsStore } from "./toasts";
 
 // Legacy storage keys for one-time migration
 const LEGACY_KEYS = {
@@ -11,6 +13,19 @@ const LEGACY_KEYS = {
 } as const;
 
 /** Rust AppConfig shape (subset needed for font/ide read/write) */
+/** A user-defined launcher for the "Open in" menu (GH #71). */
+export interface CustomLauncher {
+	id: string;
+	name: string;
+	/** Executable: bare name (resolved on PATH) or absolute path. */
+	executable: string;
+	/** Args; each may contain {path}/{file}/{line}/{column} placeholders. */
+	args: string[];
+	enabled: boolean;
+	/** Optional platform filter: "macos" | "windows" | "linux". undefined = all. */
+	platform?: "macos" | "windows" | "linux";
+}
+
 interface RustAppConfig {
 	shell: string | null;
 	font_family: string;
@@ -25,6 +40,8 @@ interface RustAppConfig {
 	max_tab_name_length: number;
 	split_tab_mode: string;
 	tab_ordering_mode: string;
+	tab_cycling_all_types: boolean;
+	tab_tree_enabled: boolean;
 	auto_show_pr_popover: boolean;
 	prevent_sleep_when_busy: boolean;
 	auto_update_enabled: boolean;
@@ -38,6 +55,7 @@ interface RustAppConfig {
 	intent_tab_title: boolean;
 	suggest_followups: boolean;
 	copy_on_select: boolean;
+	osc52_clipboard: boolean;
 	show_last_prompt: boolean;
 	bell_style: string;
 	global_hotkey: string | null;
@@ -55,6 +73,10 @@ interface RustAppConfig {
 	show_block_timestamps?: boolean;
 	show_scrollbar_marks?: boolean;
 	block_folding_enabled?: boolean;
+	index_strategy?: string;
+	standby_timeout_minutes?: number;
+	custom_launchers?: CustomLauncher[];
+	inline_blame_enabled?: boolean;
 }
 
 // Default values
@@ -78,11 +100,25 @@ export type IdeType =
 	| "alacritty"
 	| "kitty"
 	| "warp"
+	| "iterm2"
 	| "sourcetree"
 	| "github-desktop"
 	| "fork"
 	| "gitkraken"
 	| "smerge"
+	| "tower"
+	| "intellij"
+	| "pycharm"
+	| "webstorm"
+	| "goland"
+	| "clion"
+	| "phpstorm"
+	| "rubymine"
+	| "rider"
+	| "datagrip"
+	| "rustrover"
+	| "android-studio"
+	| "fleet"
 	| "terminal"
 	| "finder"
 	| "editor";
@@ -114,32 +150,60 @@ export const IDE_NAMES: Record<IdeType, string> = {
 	alacritty: "Alacritty",
 	kitty: "Kitty",
 	warp: "Warp",
+	iterm2: "iTerm2",
 	sourcetree: "Sourcetree",
 	"github-desktop": "GitHub Desktop",
 	fork: "Fork",
 	gitkraken: "GitKraken",
 	smerge: "Sublime Merge",
+	tower: "Tower",
+	intellij: "IntelliJ IDEA",
+	pycharm: "PyCharm",
+	webstorm: "WebStorm",
+	goland: "GoLand",
+	clion: "CLion",
+	phpstorm: "PhpStorm",
+	rubymine: "RubyMine",
+	rider: "Rider",
+	datagrip: "DataGrip",
+	rustrover: "RustRover",
+	"android-studio": "Android Studio",
+	fleet: "Fleet",
 	terminal: "Terminal",
 	finder: "Finder",
 	editor: "$EDITOR",
 };
 
 import alacritySvg from "../assets/icons/alacritty.svg";
+import androidStudioSvg from "../assets/icons/android-studio.svg";
+import clionSvg from "../assets/icons/clion.svg";
 import cursorSvg from "../assets/icons/cursor.svg";
+import datagripSvg from "../assets/icons/datagrip.svg";
 import editorSvg from "../assets/icons/editor.svg";
 import finderSvg from "../assets/icons/finder.svg";
+import fleetSvg from "../assets/icons/fleet.svg";
 import forkSvg from "../assets/icons/fork.svg";
 import ghosttySvg from "../assets/icons/ghostty.svg";
 import githubDesktopSvg from "../assets/icons/github-desktop.svg";
 import gitkrakenSvg from "../assets/icons/gitkraken.svg";
+import golandSvg from "../assets/icons/goland.svg";
+import intellijSvg from "../assets/icons/intellij.svg";
+import iterm2Svg from "../assets/icons/iterm2.svg";
 import kittySvg from "../assets/icons/kitty.svg";
 import neovimSvg from "../assets/icons/neovim.svg";
+import phpstormSvg from "../assets/icons/phpstorm.svg";
+import pycharmSvg from "../assets/icons/pycharm.svg";
+import riderSvg from "../assets/icons/rider.svg";
+import rubymineSvg from "../assets/icons/rubymine.svg";
+import rustroverSvg from "../assets/icons/rustrover.svg";
 import smergeSvg from "../assets/icons/smerge.svg";
 import sourcetreeSvg from "../assets/icons/sourcetree.svg";
 import terminalSvg from "../assets/icons/terminal.svg";
+import towerSvg from "../assets/icons/tower.svg";
 /** IDE icon SVG imports */
 import vscodeSvg from "../assets/icons/vscode.svg";
 import warpSvg from "../assets/icons/warp.svg";
+import webstormSvg from "../assets/icons/webstorm.svg";
 import weztermSvg from "../assets/icons/wezterm.svg";
 import windsurfSvg from "../assets/icons/windsurf.svg";
 import xcodeSvg from "../assets/icons/xcode.svg";
@@ -158,44 +222,49 @@ export const IDE_ICON_PATHS: Record<IdeType, string> = {
 	alacritty: alacritySvg,
 	kitty: kittySvg,
 	warp: warpSvg,
+	iterm2: iterm2Svg,
 	sourcetree: sourcetreeSvg,
 	"github-desktop": githubDesktopSvg,
 	fork: forkSvg,
 	gitkraken: gitkrakenSvg,
 	smerge: smergeSvg,
+	tower: towerSvg,
+	intellij: intellijSvg,
+	pycharm: pycharmSvg,
+	webstorm: webstormSvg,
+	goland: golandSvg,
+	clion: clionSvg,
+	phpstorm: phpstormSvg,
+	rubymine: rubymineSvg,
+	rider: riderSvg,
+	datagrip: datagripSvg,
+	rustrover: rustroverSvg,
+	"android-studio": androidStudioSvg,
+	fleet: fleetSvg,
 	terminal: terminalSvg,
 	finder: finderSvg,
 	editor: editorSvg,
 };
 
-/** IDE icons (emoji fallbacks for text-only contexts) */
-export const IDE_ICONS: Record<IdeType, string> = {
-	vscode: "🔵",
-	cursor: "🟣",
-	zed: "⚡",
-	windsurf: "🌊",
-	neovim: "🟢",
-	xcode: "🔨",
-	ghostty: "👻",
-	wezterm: "🟪",
-	alacritty: "🔳",
-	kitty: "🐱",
-	warp: "🔷",
-	sourcetree: "🌳",
-	"github-desktop": "🐙",
-	fork: "🔱",
-	gitkraken: "🦑",
-	smerge: "🔀",
-	terminal: ">_",
-	finder: "📁",
-	editor: "$_",
-};
-
 /** IDE categories */
 export const IDE_CATEGORIES: Record<string, IdeType[]> = {
 	editors: ["vscode", "cursor", "zed", "windsurf", "neovim", "xcode", "editor"],
-	terminals: ["ghostty", "wezterm", "alacritty", "kitty", "warp"],
-	git: ["sourcetree", "github-desktop", "fork", "gitkraken", "smerge"],
+	jetbrains: [
+		"intellij",
+		"pycharm",
+		"webstorm",
+		"goland",
+		"clion",
+		"phpstorm",
+		"rubymine",
+		"rider",
+		"datagrip",
+		"rustrover",
+		"android-studio",
+		"fleet",
+	],
+	terminals: ["ghostty", "wezterm", "alacritty", "kitty", "warp", "iterm2"],
+	git: ["sourcetree", "github-desktop", "fork", "gitkraken", "smerge", "tower"],
 	utilities: ["terminal", "finder"],
 };
 
@@ -282,6 +351,8 @@ interface SettingsStoreState {
 	maxTabNameLength: number;
 	splitTabMode: SplitTabMode;
 	tabOrderingMode: TabOrderingMode;
+	tabCyclingAllTypes: boolean;
+	tabTreeEnabled: boolean;
 	autoShowPrPopover: boolean;
 	preventSleepWhenBusy: boolean;
 	autoUpdateEnabled: boolean;
@@ -292,6 +363,7 @@ interface SettingsStoreState {
 	intentTabTitle: boolean;
 	suggestFollowups: boolean;
 	copyOnSelect: boolean;
+	osc52Clipboard: boolean;
 	showLastPrompt: boolean;
 	bellStyle: "none" | "visual" | "sound" | "both";
 	globalHotkey: string | null;
@@ -309,6 +381,10 @@ interface SettingsStoreState {
 	showBlockTimestamps: boolean;
 	showScrollbarMarks: boolean;
 	blockFoldingEnabled: boolean;
+	indexStrategy: "disabled" | "active_only" | "active_and_switch" | "all_sequential";
+	standbyTimeoutMinutes: number;
+	customLaunchers: CustomLauncher[];
+	inlineBlameEnabled: boolean;
 }
 
 const SAVE_DEBOUNCE_MS = 500;
@@ -327,6 +403,8 @@ function createSettingsStore() {
 		maxTabNameLength: 25,
 		splitTabMode: "separate",
 		tabOrderingMode: "grouped-by-type",
+		tabCyclingAllTypes: false,
+		tabTreeEnabled: false,
 		autoShowPrPopover: true,
 		preventSleepWhenBusy: false,
 		autoUpdateEnabled: true,
@@ -337,6 +415,7 @@ function createSettingsStore() {
 		intentTabTitle: true,
 		suggestFollowups: true,
 		copyOnSelect: true,
+		osc52Clipboard: true,
 		showLastPrompt: true,
 		bellStyle: "visual",
 		globalHotkey: null,
@@ -354,69 +433,110 @@ function createSettingsStore() {
 		showBlockTimestamps: true,
 		showScrollbarMarks: true,
 		blockFoldingEnabled: true,
+		indexStrategy: "active_and_switch",
+		standbyTimeoutMinutes: 5,
+		customLaunchers: [],
+		inlineBlameEnabled: true,
 	});
 
-	// Shadow copy of the last loaded config — preserves fields not tracked in SolidJS store
-	// (e.g. session_token_duration_secs, mcp_server_enabled). Updated on hydrate.
+	// Cache of the last loaded config, refreshed on hydrate and each persist.
+	// Only read by loadFontFromConfig() now — the save path no longer builds
+	// on top of this snapshot (it does a fresh load-modify-save instead).
 	let baseConfig: RustAppConfig | null = null;
 	let saveTimer: ReturnType<typeof setTimeout> | null = null;
+	// Write lock: save() serializes the ENTIRE state, so a save before a
+	// successful hydrate would overwrite config.json with defaults, wiping the
+	// user's settings (observed in the field: full config reset to defaults).
+	// No successful hydrate, no persist.
+	let hydrated = false;
 
-	/** Build a full RustAppConfig from current store state + base config fields */
-	function buildConfig(): RustAppConfig {
-		return {
-			...(baseConfig ?? ({} as RustAppConfig)),
-			shell: state.shell,
-			font_family: state.font,
-			font_size: state.defaultFontSize,
-			font_weight: state.fontWeight,
-			theme: state.theme,
-			ide: state.ide,
-			default_font_size: state.defaultFontSize,
-			confirm_before_quit: state.confirmBeforeQuit,
-			confirm_before_closing_tab: state.confirmBeforeClosingTab,
-			max_tab_name_length: state.maxTabNameLength,
-			split_tab_mode: state.splitTabMode,
-			tab_ordering_mode: state.tabOrderingMode,
-			auto_show_pr_popover: state.autoShowPrPopover,
-			prevent_sleep_when_busy: state.preventSleepWhenBusy,
-			auto_update_enabled: state.autoUpdateEnabled,
-			auto_update_plugins_enabled: state.autoUpdatePluginsEnabled,
-			language: state.language,
-			update_channel: state.updateChannel,
-			disabled_agents: [...state.disabledAgents],
-			intent_tab_title: state.intentTabTitle,
-			suggest_followups: state.suggestFollowups,
-			copy_on_select: state.copyOnSelect,
-			show_last_prompt: state.showLastPrompt,
-			bell_style: state.bellStyle,
-			global_hotkey: state.globalHotkey,
-			issue_filter: state.issueFilter,
-			pr_hide_drafts: state.prHideDrafts,
-			pr_hide_conflicting: state.prHideConflicting,
-			pr_hide_ci_failing: state.prHideCiFailing,
-			experimental_features_enabled: state.experimentalFeaturesEnabled,
-			ai_chat_enabled: state.aiChatEnabled,
-			ai_triage_enabled: state.aiTriageEnabled,
-			ai_watchers_enabled: state.aiWatchersEnabled,
-			scrollback_reflow: state.scrollbackReflow,
-			cursor_style: state.cursorStyle,
-			terminal_renderer: state.terminalRenderer,
-			show_block_timestamps: state.showBlockTimestamps,
-			show_scrollbar_marks: state.showScrollbarMarks,
-			block_folding_enabled: state.blockFoldingEnabled,
-			services: baseConfig?.services ?? { auth: { session_token_duration_secs: 86400 } },
-			mcp_server_enabled: baseConfig?.mcp_server_enabled ?? true,
-		};
+	/** Overwrite the settings-store-owned fields on a freshly-loaded config.
+	 *  Fields owned by OTHER surfaces are deliberately left as loaded:
+	 *   - `services.*`        — ServicesTab (its own load-modify-save)
+	 *   - `mcp_server_enabled` — ServicesTab
+	 *   - `global_hotkey`      — the `set_global_hotkey` command
+	 *  This store must never write them from its own (possibly stale) snapshot,
+	 *  or a general-settings save clobbers a concurrent writer's change — the
+	 *  "web server disabled / hotkey lost on restart" bug. Mirrors the
+	 *  load-modify-save pattern ServicesTab already uses. */
+	function applyOwnedFields(config: RustAppConfig): RustAppConfig {
+		config.shell = state.shell;
+		config.font_family = state.font;
+		config.font_size = state.defaultFontSize;
+		config.font_weight = state.fontWeight;
+		config.theme = state.theme;
+		config.ide = state.ide;
+		config.default_font_size = state.defaultFontSize;
+		config.confirm_before_quit = state.confirmBeforeQuit;
+		config.confirm_before_closing_tab = state.confirmBeforeClosingTab;
+		config.max_tab_name_length = state.maxTabNameLength;
+		config.split_tab_mode = state.splitTabMode;
+		config.tab_ordering_mode = state.tabOrderingMode;
+		config.tab_cycling_all_types = state.tabCyclingAllTypes;
+		config.tab_tree_enabled = state.tabTreeEnabled;
+		config.auto_show_pr_popover = state.autoShowPrPopover;
+		config.prevent_sleep_when_busy = state.preventSleepWhenBusy;
+		config.auto_update_enabled = state.autoUpdateEnabled;
+		config.auto_update_plugins_enabled = state.autoUpdatePluginsEnabled;
+		config.language = state.language;
+		config.update_channel = state.updateChannel;
+		config.disabled_agents = [...state.disabledAgents];
+		config.intent_tab_title = state.intentTabTitle;
+		config.suggest_followups = state.suggestFollowups;
+		config.copy_on_select = state.copyOnSelect;
+		config.osc52_clipboard = state.osc52Clipboard;
+		config.show_last_prompt = state.showLastPrompt;
+		config.bell_style = state.bellStyle;
+		config.issue_filter = state.issueFilter;
+		config.pr_hide_drafts = state.prHideDrafts;
+		config.pr_hide_conflicting = state.prHideConflicting;
+		config.pr_hide_ci_failing = state.prHideCiFailing;
+		config.experimental_features_enabled = state.experimentalFeaturesEnabled;
+		config.ai_chat_enabled = state.aiChatEnabled;
+		config.ai_triage_enabled = state.aiTriageEnabled;
+		config.ai_watchers_enabled = state.aiWatchersEnabled;
+		config.scrollback_reflow = state.scrollbackReflow;
+		config.cursor_style = state.cursorStyle;
+		config.terminal_renderer = state.terminalRenderer;
+		config.show_block_timestamps = state.showBlockTimestamps;
+		config.show_scrollbar_marks = state.showScrollbarMarks;
+		config.block_folding_enabled = state.blockFoldingEnabled;
+		config.index_strategy = state.indexStrategy;
+		config.standby_timeout_minutes = state.standbyTimeoutMinutes;
+		config.custom_launchers = [...state.customLaunchers];
+		config.inline_blame_enabled = state.inlineBlameEnabled;
+		return config;
 	}
 
-	/** Debounced save — coalesces rapid setting changes into a single IPC call */
+	/** Load the current on-disk config, apply this store's owned fields, and
+	 *  persist. Load-modify-save guarantees fields written by other surfaces
+	 *  (services, global_hotkey, …) survive — never overwritten from a stale
+	 *  in-memory snapshot. If the fresh load fails we skip the save entirely
+	 *  rather than risk writing a partial config. */
+	async function persist(): Promise<void> {
+		try {
+			const config = await updateAppConfig<RustAppConfig>((fresh) => {
+				applyOwnedFields(fresh);
+			});
+			baseConfig = config; // keep the cache (loadFontFromConfig) current
+		} catch (err) {
+			appLogger.error("config", "Failed to save config", err);
+		}
+	}
+
+	/** Debounced save — coalesces rapid setting changes into a single persist */
 	function save(): void {
+		if (!hydrated) {
+			appLogger.error(
+				"config",
+				"Refusing to persist settings: store not hydrated — would clobber config.json with defaults",
+			);
+			return;
+		}
 		if (saveTimer) clearTimeout(saveTimer);
 		saveTimer = setTimeout(() => {
 			saveTimer = null;
-			invoke("save_config", { config: buildConfig() }).catch((err: unknown) =>
-				appLogger.error("config", "Failed to save config", err),
-			);
+			void persist();
 		}, SAVE_DEBOUNCE_MS);
 	}
 
@@ -428,9 +548,9 @@ function createSettingsStore() {
 				const legacyIde = localStorage.getItem(LEGACY_KEYS.IDE);
 				if (legacyIde) {
 					try {
-						const config = await invoke<RustAppConfig>("load_config");
-						config.ide = legacyIde;
-						await invoke("save_config", { config });
+						await updateAppConfig<RustAppConfig>((config) => {
+							config.ide = legacyIde;
+						});
 					} catch {
 						/* ignore migration failure */
 					}
@@ -453,6 +573,8 @@ function createSettingsStore() {
 				setState("splitTabMode", config.split_tab_mode === "unified" ? "unified" : "separate");
 				const tom = config.tab_ordering_mode;
 				setState("tabOrderingMode", tom === "terminals-first" || tom === "free" ? tom : "grouped-by-type");
+				setState("tabCyclingAllTypes", config.tab_cycling_all_types ?? false);
+				setState("tabTreeEnabled", config.tab_tree_enabled ?? false);
 				setState("autoShowPrPopover", config.auto_show_pr_popover ?? true);
 				setState("preventSleepWhenBusy", config.prevent_sleep_when_busy ?? false);
 				setState("autoUpdateEnabled", config.auto_update_enabled ?? true);
@@ -464,6 +586,7 @@ function createSettingsStore() {
 				setState("disabledAgents", config.disabled_agents ?? []);
 				setState("intentTabTitle", config.intent_tab_title ?? true);
 				setState("copyOnSelect", config.copy_on_select ?? true);
+				setState("osc52Clipboard", config.osc52_clipboard ?? true);
 				setState("showLastPrompt", config.show_last_prompt ?? false);
 				setState("bellStyle", (config.bell_style || "visual") as SettingsStoreState["bellStyle"]);
 				setState("suggestFollowups", config.suggest_followups ?? true);
@@ -483,8 +606,21 @@ function createSettingsStore() {
 				setState("showBlockTimestamps", config.show_block_timestamps ?? true);
 				setState("showScrollbarMarks", config.show_scrollbar_marks ?? true);
 				setState("blockFoldingEnabled", config.block_folding_enabled ?? true);
+				setState(
+					"indexStrategy",
+					(config.index_strategy as SettingsStoreState["indexStrategy"]) ?? "active_and_switch",
+				);
+				setState("standbyTimeoutMinutes", config.standby_timeout_minutes ?? 5);
+				setState("customLaunchers", config.custom_launchers ?? []);
+				setState("inlineBlameEnabled", config.inline_blame_enabled ?? true);
+				hydrated = true;
 			} catch (err) {
-				appLogger.error("config", "Failed to hydrate settings", err);
+				appLogger.error("config", "Failed to hydrate settings — persistence disabled for this session", err);
+				toastsStore.add(
+					"Settings failed to load",
+					"Running on defaults; changes will NOT be saved. Check logs and restart.",
+					"error",
+				);
 			}
 		},
 
@@ -547,6 +683,16 @@ function createSettingsStore() {
 			save();
 		},
 
+		setTabCyclingAllTypes(enabled: boolean): void {
+			setState("tabCyclingAllTypes", enabled);
+			save();
+		},
+
+		setTabTreeEnabled(enabled: boolean): void {
+			setState("tabTreeEnabled", enabled);
+			save();
+		},
+
 		/** Set auto-show PR popover preference */
 		setAutoShowPrPopover(enabled: boolean): void {
 			setState("autoShowPrPopover", enabled);
@@ -556,6 +702,16 @@ function createSettingsStore() {
 		/** Set prevent-sleep-when-busy preference */
 		setPreventSleepWhenBusy(enabled: boolean): void {
 			setState("preventSleepWhenBusy", enabled);
+			save();
+		},
+
+		setStandbyTimeoutMinutes(minutes: number): void {
+			setState("standbyTimeoutMinutes", Math.max(0, Math.min(60, minutes)));
+			save();
+		},
+
+		setIndexStrategy(strategy: SettingsStoreState["indexStrategy"]): void {
+			setState("indexStrategy", strategy);
 			save();
 		},
 
@@ -605,6 +761,12 @@ function createSettingsStore() {
 			return !state.disabledAgents.includes(agentType);
 		},
 
+		/** Replace the full list of custom launchers (add/edit/remove all go through here) */
+		setCustomLaunchers(launchers: CustomLauncher[]): void {
+			setState("customLaunchers", launchers);
+			save();
+		},
+
 		/** Set intent-as-tab-title preference */
 		setIntentTabTitle(enabled: boolean): void {
 			setState("intentTabTitle", enabled);
@@ -620,6 +782,12 @@ function createSettingsStore() {
 		/** Set copy-on-select preference */
 		setCopyOnSelect(enabled: boolean): void {
 			setState("copyOnSelect", enabled);
+			save();
+		},
+
+		/** Enable/disable honoring OSC 52 clipboard-write sequences from terminal output */
+		setOsc52Clipboard(enabled: boolean): void {
+			setState("osc52Clipboard", enabled);
 			save();
 		},
 
@@ -680,6 +848,12 @@ function createSettingsStore() {
 			save();
 		},
 
+		/** Toggle GitLens-style inline git blame on the editor's active line */
+		setInlineBlameEnabled(enabled: boolean): void {
+			setState("inlineBlameEnabled", enabled);
+			save();
+		},
+
 		setCursorStyle(style: SettingsStoreState["cursorStyle"]): void {
 			setState("cursorStyle", style);
 			save();
@@ -702,7 +876,7 @@ function createSettingsStore() {
 			const prevValue = state.globalHotkey;
 			setState("globalHotkey", combo);
 			try {
-				await invoke("set_global_hotkey", { combo });
+				await runSerializedConfigWrite(() => invoke("set_global_hotkey", { combo }));
 			} catch (err) {
 				appLogger.error("config", "Failed to set global hotkey", err);
 				setState("globalHotkey", prevValue);
@@ -762,6 +936,8 @@ registerDebugSnapshot("settings", () => {
 		language: s.language,
 		splitTabMode: s.splitTabMode,
 		tabOrderingMode: s.tabOrderingMode,
+		tabCyclingAllTypes: s.tabCyclingAllTypes,
+		tabTreeEnabled: s.tabTreeEnabled,
 		bellStyle: s.bellStyle,
 		updateChannel: s.updateChannel,
 		intentTabTitle: s.intentTabTitle,

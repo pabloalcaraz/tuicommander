@@ -1,6 +1,7 @@
 import { type Component, createEffect, createSignal, Match, Show, Switch } from "solid-js";
 import { type DiffStatus, diffTabsStore } from "../../stores/diffTabs";
 import { cx } from "../../utils";
+import { onClickKeyDown } from "../../utils/a11y";
 import p from "../shared/panel.module.css";
 import { PanelResizeHandle } from "../ui/PanelResizeHandle";
 import { PanelWindowControls } from "../ui/PanelWindowControls";
@@ -58,24 +59,6 @@ export const GitPanel: Component<GitPanelProps> = (props) => {
 		if (tab) setActiveTab(tab);
 	});
 
-	function handlePanelKeyDown(e: KeyboardEvent) {
-		if (e.key === "Escape") {
-			e.preventDefault();
-			props.onClose();
-			return;
-		}
-
-		const mod = e.metaKey || e.ctrlKey;
-		if (mod && e.key >= "1" && e.key <= String(TABS.length)) {
-			const idx = parseInt(e.key, 10) - 1;
-			if (idx < TABS.length) {
-				e.preventDefault();
-				e.stopPropagation();
-				setActiveTab(TABS[idx].id);
-			}
-		}
-	}
-
 	/** Split path into basename for compact display */
 	function basename(path: string): string {
 		const i = path.lastIndexOf("/");
@@ -86,14 +69,25 @@ export const GitPanel: Component<GitPanelProps> = (props) => {
 		<div
 			id="git-panel"
 			class={cx(s.panel, mode() === "detached" && s.detached, !props.visible && s.hidden)}
-			tabIndex={0}
-			onKeyDown={handlePanelKeyDown}
+			tabIndex={-1}
 		>
 			<Show when={mode() === "inline"}>
 				<PanelResizeHandle panelId="git-panel" />
 			</Show>
 			<div class={p.header}>
-				<div class={s.tabs}>
+				<div
+					class={s.tabs}
+					// The strip hides its scrollbar (see GitPanel.module.css); map vertical
+					// wheel/trackpad to horizontal scroll so the overflowing tabs stay reachable.
+					onWheel={(e) => {
+						const el = e.currentTarget;
+						if (el.scrollWidth <= el.clientWidth) return;
+						const delta = Math.abs(e.deltaX) > Math.abs(e.deltaY) ? e.deltaX : e.deltaY;
+						if (delta === 0) return;
+						el.scrollLeft += delta;
+						e.preventDefault();
+					}}
+				>
 					{TABS.map((tab) => (
 						<button class={cx(s.tab, activeTab() === tab.id && s.tabActive)} onClick={() => setActiveTab(tab.id)}>
 							{tab.label}
@@ -129,7 +123,13 @@ export const GitPanel: Component<GitPanelProps> = (props) => {
 			{/* Sub-panels: History & Blame — only visible in Changes tab */}
 			<Show when={activeTab() === "changes"}>
 				<div class={s.subPanels}>
-					<div class={s.subPanelHeader} onClick={() => setHistoryExpanded((v) => !v)}>
+					<div
+						class={s.subPanelHeader}
+						role="button"
+						tabIndex={0}
+						onClick={() => setHistoryExpanded((v) => !v)}
+						onKeyDown={onClickKeyDown(() => setHistoryExpanded((v) => !v))}
+					>
 						<span class={cx(s.subChevron, !historyExpanded() && s.subChevronCollapsed)}>&#x25BC;</span>
 						<span class={s.subPanelLabel}>History</span>
 						<Show when={selectedFile()}>
@@ -141,7 +141,13 @@ export const GitPanel: Component<GitPanelProps> = (props) => {
 							<HistoryTab repoPath={props.visible ? gitPath() : null} filePath={selectedFile()} onOpenDiff={openDiff} />
 						</div>
 					</Show>
-					<div class={s.subPanelHeader} onClick={() => setBlameExpanded((v) => !v)}>
+					<div
+						class={s.subPanelHeader}
+						role="button"
+						tabIndex={0}
+						onClick={() => setBlameExpanded((v) => !v)}
+						onKeyDown={onClickKeyDown(() => setBlameExpanded((v) => !v))}
+					>
 						<span class={cx(s.subChevron, !blameExpanded() && s.subChevronCollapsed)}>&#x25BC;</span>
 						<span class={s.subPanelLabel}>Blame</span>
 						<Show when={selectedFile()}>

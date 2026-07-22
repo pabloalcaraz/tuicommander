@@ -61,6 +61,9 @@ export interface ActivityItem {
 	icon: string;
 	/** CSS color for the icon (e.g. "var(--fg-muted)", "#3fb950") */
 	iconColor?: string;
+	/** Outcome severity, drives notification coloring (e.g. the toolbar pill:
+	 *  red for "error", green for "success"). Defaults to neutral "info". */
+	severity?: "error" | "success" | "warn" | "info";
 	/** Absolute path of the repository this item belongs to (for repo-scoped filtering) */
 	repoPath?: string;
 	/** Whether the user can dismiss this item individually */
@@ -283,6 +286,23 @@ export interface FsChangeEvent {
 	path: string;
 }
 
+/**
+ * One matched build-artifact directory returned by `scanBuildArtifacts`.
+ * Mirrors the Rust `ArtifactEntry` (snake_case fields preserved over IPC).
+ */
+export interface ArtifactEntry {
+	/** Absolute path of the artifact directory. */
+	path: string;
+	/** Tool kind: "rust" | "node" | "python" | "dotnet" | "gradle". */
+	kind: string;
+	/** Total on-disk size in bytes (summed whole; nested artifacts folded in). */
+	size_bytes: number;
+	/** Last-build signal: max mtime of the dir's direct children (Unix secs). */
+	last_modified_secs: number;
+	/** Registered repo root this artifact was found under. */
+	repo: string;
+}
+
 // ---------------------------------------------------------------------------
 // Capabilities
 // ---------------------------------------------------------------------------
@@ -300,6 +320,8 @@ export type PluginCapability =
 	| "fs:watch"
 	| "fs:write"
 	| "fs:rename"
+	| "fs:scan"
+	| "fs:delete"
 	| "net:http"
 	| "credentials:read"
 	| "ui:panel"
@@ -622,6 +644,9 @@ export interface PluginHost {
 	/** Read a file as UTF-8 text. Path must be absolute and within $HOME. Requires "fs:read". */
 	readFile(absolutePath: string): Promise<string>;
 
+	/** Read a file as base64-encoded bytes. Path must be absolute and within $HOME. Requires "fs:read". */
+	readFileBase64(absolutePath: string): Promise<string>;
+
 	/**
 	 * Read the last N bytes of a file, skipping partial first line.
 	 * Useful for large JSONL files. Requires "fs:read".
@@ -646,6 +671,24 @@ export interface PluginHost {
 	 * @param to - Absolute destination path
 	 */
 	renamePath(from: string, to: string): Promise<void>;
+
+	/**
+	 * Scan registered repo roots for build-artifact directories (target/,
+	 * node_modules/, .venv, __pycache__, obj/bin, .gradle). Read-only; ignores
+	 * gitignore (artifact dirs are gitignored by design). Requires "fs:scan".
+	 * @param repoPaths - Absolute repo roots to scan; each is $HOME-scoped and
+	 *        silently skipped if it fails validation.
+	 */
+	scanBuildArtifacts(repoPaths: string[], options?: { forceRefresh?: boolean }): Promise<ArtifactEntry[]>;
+
+	/**
+	 * Delete a build-artifact directory. Destructive; gated by "fs:delete".
+	 * The backend guard requires: path is inside one of `repoPaths`, its
+	 * basename is a known artifact dir, and it is not a repo root itself.
+	 * @param path - Absolute path of the artifact dir to remove
+	 * @param repoPaths - The registered repo roots (containment guard)
+	 */
+	deleteBuildArtifact(path: string, repoPaths: string[]): Promise<void>;
 
 	/**
 	 * Watch a path for filesystem changes. Requires "fs:watch".

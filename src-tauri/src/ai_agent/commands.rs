@@ -23,64 +23,32 @@ pub(crate) async fn start_conversation(
     temperature: Option<f32>,
     model_override: Option<String>,
     bypassed_tools: Option<Vec<String>>,
+    reasoning_effort: Option<String>,
     on_event: tauri::ipc::Channel<super::conversation_engine::ConversationEvent>,
 ) -> Result<(), String> {
     use super::conversation_engine::{
-        Autonomy, ConversationConfig, ConversationEvent, start_conversation as engine_start,
+        batched_conversation_stream, build_config, start_conversation as engine_start,
     };
-    use std::collections::HashSet;
 
-    let config = ConversationConfig {
-        autonomy: match autonomy.as_deref() {
-            Some("autonomous") => Autonomy::Autonomous,
-            _ => Autonomy::Assisted,
-        },
+    let config = build_config(
+        autonomy,
         max_steps,
-        temperature: temperature.unwrap_or(0.7),
+        temperature,
         model_override,
-        bypassed_tools: bypassed_tools
-            .unwrap_or_default()
-            .into_iter()
-            .collect::<HashSet<_>>(),
-    };
+        bypassed_tools,
+        reasoning_effort,
+    )
+    .await;
 
-    let mut rx = engine_start(state.inner().clone(), session_id, message, config).await?;
+    let rx = engine_start(state.inner().clone(), session_id, message, config).await?;
 
-    // Bridge broadcast→Channel with 50ms TextChunk batching
+    // Bridge broadcast→Channel via the shared 50ms batcher (same logic the
+    // browser WebSocket bridge uses — see conversation_engine::batched_conversation_stream).
+    let mut batched = batched_conversation_stream(rx);
     tokio::spawn(async move {
-        let mut text_batch = String::new();
-        let mut interval = tokio::time::interval(std::time::Duration::from_millis(50));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            tokio::select! {
-                result = rx.recv() => {
-                    match result {
-                        Ok(ConversationEvent::TextChunk { text }) => {
-                            text_batch.push_str(&text);
-                        }
-                        Ok(other) => {
-                            // Flush pending text batch before non-text event
-                            if !text_batch.is_empty() {
-                                let _ = on_event.send(ConversationEvent::TextChunk { text: std::mem::take(&mut text_batch) });
-                            }
-                            let done = matches!(other, ConversationEvent::Completed { .. } | ConversationEvent::Error { .. });
-                            let _ = on_event.send(other);
-                            if done { break; }
-                        }
-                        Err(_) => {
-                            // Flush remaining text on channel close
-                            if !text_batch.is_empty() {
-                                let _ = on_event.send(ConversationEvent::TextChunk { text: std::mem::take(&mut text_batch) });
-                            }
-                            break;
-                        }
-                    }
-                }
-                _ = interval.tick() => {
-                    if !text_batch.is_empty() {
-                        let _ = on_event.send(ConversationEvent::TextChunk { text: std::mem::take(&mut text_batch) });
-                    }
-                }
+        while let Some(ev) = batched.recv().await {
+            if on_event.send(ev).is_err() {
+                break;
             }
         }
     });
@@ -382,6 +350,14 @@ pub(crate) async fn get_knowledge_session_detail(
     state: State<'_, Arc<AppState>>,
     session_id: String,
 ) -> Result<Option<SessionDetail>, String> {
+    get_knowledge_session_detail_impl(state.inner(), session_id).await
+}
+
+/// Non-gated core for HTTP parity (browser/PWA). See `get_knowledge_session_detail`.
+pub(crate) async fn get_knowledge_session_detail_impl(
+    state: &Arc<AppState>,
+    session_id: String,
+) -> Result<Option<SessionDetail>, String> {
     if let Some(entry) = state.session_knowledge.get(&session_id) {
         let k = entry.lock();
         return Ok(Some(to_detail(&session_id, &k)));
@@ -438,12 +414,41 @@ pub(crate) fn save_scheduler_config(
 
 #[cfg(feature = "desktop")]
 #[tauri::command]
+#[allow(clippy::too_many_arguments)] // Tauri command: args are deserialized from a JS object.
 pub(crate) async fn watcher_create(
     state: State<'_, Arc<AppState>>,
     name: String,
     session_id: Option<String>,
     trigger: super::watcher::WatcherTrigger,
-    instructions: String,
+    instructions: Option<String>,
+    prompt_id: Option<String>,
+    repo_path: Option<String>,
+    max_fires: Option<u32>,
+    cooldown_secs: Option<u32>,
+) -> Result<String, String> {
+    watcher_create_impl(
+        state.inner(),
+        name,
+        session_id,
+        trigger,
+        instructions,
+        prompt_id,
+        repo_path,
+        max_fires,
+        cooldown_secs,
+    )
+}
+
+/// Non-gated core for HTTP parity (browser/PWA). See `watcher_create`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn watcher_create_impl(
+    state: &Arc<AppState>,
+    name: String,
+    session_id: Option<String>,
+    trigger: super::watcher::WatcherTrigger,
+    instructions: Option<String>,
+    prompt_id: Option<String>,
+    repo_path: Option<String>,
     max_fires: Option<u32>,
     cooldown_secs: Option<u32>,
 ) -> Result<String, String> {
@@ -452,6 +457,8 @@ pub(crate) async fn watcher_create(
         name,
         session_id,
         template_id: None,
+        prompt_id,
+        repo_path,
         trigger,
         instructions,
         max_fires: max_fires.unwrap_or(super::watcher::default_max_fires()),
@@ -550,12 +557,41 @@ pub(crate) async fn watcher_detach(
 
 #[cfg(feature = "desktop")]
 #[tauri::command]
+#[allow(clippy::too_many_arguments)] // Tauri command: args are deserialized from a JS object.
 pub(crate) async fn watcher_update(
     state: State<'_, Arc<AppState>>,
     id: String,
     name: Option<String>,
     trigger: Option<super::watcher::WatcherTrigger>,
     instructions: Option<String>,
+    prompt_id: Option<String>,
+    repo_path: Option<String>,
+    max_fires: Option<u32>,
+    cooldown_secs: Option<u32>,
+) -> Result<(), String> {
+    watcher_update_impl(
+        state.inner(),
+        id,
+        name,
+        trigger,
+        instructions,
+        prompt_id,
+        repo_path,
+        max_fires,
+        cooldown_secs,
+    )
+}
+
+/// Non-gated core for HTTP parity (browser/PWA). See `watcher_update`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn watcher_update_impl(
+    state: &Arc<AppState>,
+    id: String,
+    name: Option<String>,
+    trigger: Option<super::watcher::WatcherTrigger>,
+    instructions: Option<String>,
+    prompt_id: Option<String>,
+    repo_path: Option<String>,
     max_fires: Option<u32>,
     cooldown_secs: Option<u32>,
 ) -> Result<(), String> {
@@ -571,6 +607,8 @@ pub(crate) async fn watcher_update(
         name,
         trigger,
         instructions,
+        prompt_id,
+        repo_path,
         max_fires,
         cooldown_secs,
     )
@@ -582,6 +620,14 @@ pub(crate) async fn watcher_update(
 #[tauri::command]
 pub(crate) async fn get_session_knowledge(
     state: State<'_, Arc<AppState>>,
+    session_id: String,
+) -> Result<SessionKnowledgeSummary, String> {
+    get_session_knowledge_impl(state.inner(), session_id)
+}
+
+/// Non-gated core for HTTP parity (browser/PWA). See `get_session_knowledge`.
+pub(crate) fn get_session_knowledge_impl(
+    state: &Arc<AppState>,
     session_id: String,
 ) -> Result<SessionKnowledgeSummary, String> {
     let entry = state.session_knowledge.get(&session_id);
@@ -602,6 +648,11 @@ pub(crate) async fn get_session_knowledge(
 #[cfg(feature = "desktop")]
 #[tauri::command]
 pub(crate) fn toggle_ai_suggestions(state: State<'_, Arc<AppState>>, session_id: String) -> bool {
+    toggle_ai_suggestions_impl(state.inner(), session_id)
+}
+
+/// Non-gated core for HTTP parity (browser/PWA). See `toggle_ai_suggestions`.
+pub(crate) fn toggle_ai_suggestions_impl(state: &Arc<AppState>, session_id: String) -> bool {
     let current = state
         .ai_suggestions_enabled
         .get(&session_id)

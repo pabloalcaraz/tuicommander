@@ -6,24 +6,270 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.6.3] - 2026-07-22
+
+### Changed
+
+- **Dependency stack modernized** — Updated the frontend, Tauri application, CLI, website, icon plugin, and relay service to their latest compatible releases, including Vite 8, Vitest 4, TypeScript 7, Tauri 2.11, tower-http 0.7, tokio-tungstenite 0.30, rodio 0.22, rusqlite 0.40, and current cryptography crates. The dev overlay keeps the native TypeScript 7 CLI while using Microsoft's TypeScript 6 compatibility API for watch mode. Unused direct dependencies and duplicate build/runtime packages were removed; Web Push VAPID signing now uses P-256 directly instead of the vulnerable transitive RSA backend, and Wayland code generation consumes the upstream quick-xml 0.41 security fix.
+
+### Fixed
+
+- **Reliable Nightly publishing across Linux and signed-tag setups** — The quick-xml security update now patches the published Wayland scanner source instead of mixing its unreleased generator ABI with stable Wayland crates, and the `tip` tag no longer opens an editor when Git is configured to sign tags.
+- **Activity Dashboard now agrees with ready agent tabs** — A ready input composer is shown as idle even when Codex retains a long-lived background terminal such as a development server; backend lifecycle tracking remains unchanged.
+- **Agent lifecycle no longer sticks or flickers at terminal UI boundaries** — A current-turn `suggest:` completion marker now prevents a stale Codex Working row from relatching BUSY, while confirmed background descendants still keep the task working. Claude can recover from a missed idle hook after real turn activity once its empty composer remains stable, and animated status rows no longer erase a visible choice prompt or its `awaiting_input` state.
+- **MCP peer sends no longer create ghost or missing turns** — `notifications/claude/channel` is used only to add messages to an already working Claude Code turn. Idle or completed managed agents, including Claude and Codex, receive the PTY split-write payload plus Enter so a successful SSE broadcast cannot consume wake-up ownership without submitting a new turn. Channel/inbox delivery alone no longer clears completion or reports the recipient as working.
+- **Blocking MCP waits now honor their advertised deadline** — Agent inbox and session lifecycle waits sleep on events instead of polling. Both default to 60 seconds, cap at 300 seconds, and the stdio/socket bridge derives its read deadline from the requested wait plus a five-second transport margin for direct and collapsed calls, eliminating the unrelated ten-second IPC cutoff.
+
+## [1.6.2] - 2026-07-20
+
+- Fixed local MCP socket stalls under multi-agent load caused by re-entering an `input_buffers` DashMap shard while its entry guard was still held; bridge health checks now use constant-size MCP `ping`, report endpoint availability accurately, safely reclaim stale peer bindings after reconnect, reject initialize auto-bind takeover while the prior bridge remains live, and reuse the bridge's existing session for its proxied initialize so its own SSE stream cannot block identity binding.
+- **Lean MCP orchestration contract** — TUIC connection acknowledgment is now explicitly once per MCP connection/reconnect, upstream tool descriptions no longer duplicate TUIC context, and multi-agent guidance uses the real `agent`/`session` primitives. Blocking waits default to 60 seconds and support up to 300000 ms through the bridge. Headerless callers can register without a PTY or supplied UUID, session lists mark the caller's managed PTY, and lifecycle notifications are documented as state-only while task results travel through `agent action=send`.
+- **Lower-token MCP orchestration responses** — Successful `agent wait` calls now inline every retained new message (up to the 100-message inbox capacity) with a per-recipient logical `next_since` cursor that disambiguates equal-millisecond bursts. `agent send` returns the managed recipient's shell/agent state, while generated external peers use inbox-only delivery when no waiter or SSE stream is available. Session/peer/spawn/status/output responses omit absent optional values instead of repeating `null`; wait timeouts and screenshot success no longer repeat obvious next-step hints. Native MCP tool values now use compact JSON text, while valid upstream `CallToolResult` objects pass through unchanged—including `isError` and structured content—on both direct and collapsed `call_tool` paths; malformed upstream values retain the compact text fallback.
+
+### Fixed
+- **Dev/release repository persistence collision** — Debug builds now use a one-time production-seeded `~/.tuicommander-dev/repositories.json`, preventing a concurrently running development frontend from overwriting the installed app's repository list without changing unrelated config paths.
+- **Background agent commands no longer look complete at a ready prompt** — Session lifecycle waits for a process snapshot newer than the ready observation, keeps `agent_state=working`, and defers parent idle mail while meaningful descendants such as Cargo/test processes remain alive, without conflating that task state with terminal input readiness. Persistent integration helpers and Claude's standalone timed macOS `caffeinate` assertion do not pin agents working; command-wrapping `caffeinate` remains meaningful, and process scans stop when no probe or background work remains.
+- **Claude spawn no longer reports an early false idle** — Claude's echoed `❯ task` transcript row is no longer mistaken for its empty input composer while the submitted turn is still running; drafts remain non-idle and movement continues to drive working state.
+- **Build Cleaner no longer rescans every repository after each HMR reload** — Concurrent scans now share one backend walk, recent results are reused briefly by exact normalized repository set, and the dashboard's explicit Rescan action still forces fresh filesystem data.
+- **MCP-spawned agent names remain stable in terminal tabs** — The assigned display name now travels with `session-created` across desktop and SSE transports and is restored as a custom name after reconnect, preventing repository-derived OSC or intent titles from overwriting it.
+- **Agent completion is no longer reported as generic idle** — Session list/status and HTTP session state now expose task-level `agent_state` separately from PTY `shell_state`. The explicit `suggest:` end marker reports `completed`; silence without that marker remains `idle`, and spawned-agent lifecycle mail preserves the same distinction.
+- **Autonomous agent delivery no longer corrupts active turns** — Idle-to-busy injection now uses an atomic composer claim, publishes the idle event before any queued wake-up can make the session busy again, and submits at most one queued message per agent turn. The MCP bridge reads bounded HTTP response bodies instead of waiting for socket EOF, preserves a valid identity across one-off transport errors, and repairs identity bindings on subsequent calls. The CLI now bounds IPC waits and submits agent messages as separate framed payload and Enter writes.
+- **Codex MCP spawn and submit reliability** — `agent action=spawn` composes structured `model` with explicit `args`, derives Codex prompt and parser semantics from a direct Codex executable, includes the approval-bypass default for direct commands, and preserves authoritative run-config prompt placement. Wrapper run configs remain untouched by the bypass default and receive an additive validation warning. Structured parameters retain their existing composition, so a caller-supplied model is still appended to wrapper args. Interactive Codex/OpenCode sessions defer the task through the existing ready-screen injection path outside authored run-config argv. Combined MCP `session input` text + Enter now uses the required split-write gap for those prefill-only TUIs instead of leaving text unsubmitted in the composer. Claude's established input path and default spawn argv remain unchanged.
+- **Spawned-agent communication bootstrap** — Every MCP-spawned child is now registered server-side with an inbox before prompt delivery. Registered parents and children receive explicit reciprocal addressing, while callers without a bound peer identity get a warning instead of a false bidirectional guarantee. If that caller registers later, existing children and any early lifecycle messages are linked to the new parent identity. Send acknowledgments now distinguish accepted inbox delivery from the optional SSE channel path. Deferred prompts emit a single parent error only if still undelivered after the internal timeout; successful delivery remains silent and requires no polling.
+- **Peer messages no longer overwrite partially typed input** — Terminal wake-up injection now requires an idle recipient with an empty composer and no active question or approval. Messages remain queued while the user or agent has draft input; clearing or submitting the composer safely rechecks delivery, while `agent wait` continues to wake directly from the inbox.
+- **Peer delivery no longer leaves ghost busy sessions or races blocking waits** — Idle composer claims now roll back only when PTY delivery provably wrote no bytes; partial or ambiguous writes remain conservatively busy and surface `delivery_uncertain` without an automatic duplicate retry. Per-message delivery leases atomically hand each wake-up to either `agent wait` or SSE/PTY delivery, including deadline and cancellation races. SSE delivery reserves the recipient's new task epoch before consumer visibility, restores it only on proven zero delivery, and serializes old-turn idle notification against new submissions.
+
+### Added
+- **Names for MCP-spawned agents** — `agent action=spawn` accepts an optional `name`, assigns it to both the peer identity and PTY session before prompt delivery, returns it in the spawn response, and preserves it when the child later auto-binds its MCP connection.
+- **Independent PTY color environment** — New PTY sessions no longer inherit a Codex parent's `NO_COLOR`; terminal capability variables remain present, while explicit per-command color flags remain authoritative. MCP `session action=list` now exposes the assigned `display_name` alongside the independent repo-derived `alias`.
+
+## [1.6.1] - 2026-07-15
+
+### Added
+- **Dictation live microphone meter** — The floating dictation preview now includes a compact centered spectrum meter whose bars widen outward from the center with your voice, so you can confirm that the selected microphone is receiving speech before the first partial transcription appears.
+
+### Fixed
+- **Status bar crash during Claude usage rotation** — The agent badge could crash the app (`undefined is not an object … claudeTicker().priority`) when the Claude usage ticker expired at the exact moment it was being rendered. The badge now uses a scoped match so a mid-render removal can no longer dereference a missing message.
+- **Create Branch from a branch whose name contains a slash** — Basing a new branch on a local branch with a slash in its name (e.g. `POC-0001/merge-radar`) no longer fails with `'POC-0001' does not appear to be a git repository`. Such refs are correctly treated as local instead of being mistaken for a remote to fetch.
+- **Agents no longer flip idle mid API-retry** — During an API connection-retry loop (e.g. `Unable to connect to API · Retrying · attempt N/M`) the agent's TUI freezes between attempts, which previously looked like completion. The session is now held busy across the retry gap until the agent recovers, the retries stop, or you re-engage.
+- **CI auto-heal on partially completed workflows** — A failed job now reaches the branch agent immediately even when sibling jobs keep the overall GitHub Actions workflow running. Failed log lookup or PTY delivery no longer consumes one of the three heal attempts.
+- **MCP upstream authentication editor** — Switching an HTTP upstream from Bearer to OAuth now clears the incompatible stored token, persists DCR mode when the client ID is blank, and reconnects with the selected method instead of silently remaining on Bearer.
+- **Concurrent settings saves** — Frontend configuration writers now share one serialized load-modify-save queue, preventing overlapping General, Services, and plugin writes from losing each other's fields.
+- **MCP bridge returning zero tools after a settings save** — Restarting the remote HTTP server no longer drops the runtime that owns the local Unix-socket MCP listener. Claude and other stdio clients remain connected to TUICommander instead of reporting `connected · no tools` while the web UI still appears healthy.
+- **Settings no longer clobber the web-server toggle or global hotkey** — Changing any General setting used to overwrite `config.json` wholesale from a stale in-memory snapshot, silently resetting fields owned by other panels — most visibly turning the Remote Access web server **off** and wiping the **global hotkey** on the next restart. The settings store now uses a load-modify-save (fresh `load_config` → apply only its own fields → `save_config`), matching the Services tab, so `services.*`, `mcp_server_enabled`, and `global_hotkey` are always preserved from disk.
+
+## [1.6.0] - 2026-07-11
+
+### Added
+- **DOCX Preview plugin + plugin binary reads** — The external plugin registry now includes `docx-preview`, which previews Word `.docx`/`.dotx` files as Mammoth.js HTML with raw-text fallback and conversion notes. PluginHost also gains `host.readFileBase64()` (IPC + HTTP parity) so file-preview plugins can handle binary formats without abusing UTF-8 reads.
+
+### Fixed
+- **Reliable agent busy/idle state** — Agent activity is now movement-based: "if the text above the input area moves, the agent is active". BUSY is latched and kept alive only by actual screen changes (text-equality diffed, so a frozen glyph — a completed-turn summary `✻ Sautéed…`, a `· run /mcp` hint, a HUD progress bar — can never pin a session BUSY), by user submission, and by lifecycle hooks; Claude/Gemini/Aider screen classifiers are prompt-based only, so an idle prompt is always reachable. Codex keeps its presence-based `Working (… esc to interrupt)` detection because its TUI legitimately freezes while a child process runs. Ctrl-C/Escape wait for confirmed interruption; observed hook busy state outranks silence; heuristic-only idle cannot trigger peer-message injection or auto-standby for adapter-backed agents. Manually launched Droid sessions now receive the agent idle threshold.
+- **Context menus at viewport edges** — Large context menus and nested submenus now constrain themselves to the visible viewport and scroll when needed instead of opening partly off-screen.
+- **AI Review on oversized PRs** — When GitHub refuses to render a PR diff because it exceeds the file cap, AI Review now falls back to a local-clone `git diff` instead of surfacing the raw 406 response.
+- **File Browser "go up" in empty folders** — The `..` parent entry now shows even when a subdirectory is empty, so you are never stranded without a way back out.
+
+## [1.5.2] - 2026-07-09
+
+### Added
+- **OSC 52 clipboard notice + toggle, and safer suggestion chips** — Clipboard writes emitted by terminal output (OSC 52) now surface a non-blocking "Clipboard updated by &lt;session&gt;" notice, and a new Settings → General → Terminal toggle ("Allow OSC 52 clipboard writes") lets you ignore them entirely. Suggestion chips (OSC 7770 `suggest=`, emittable by any displayed file/log) that contain shell metacharacters are now inserted without an automatic Enter, so a click can never silently execute a spoofed chained/redirected command — the user reviews it first. No provenance gating, so legitimate shell-integration clipboard/suggestion flows are unaffected.
+- **"QR for Remote Mobile Connection" command** — A Command Palette entry that pops a large, black-on-white QR code in a dialog: scan it with your phone to open the mobile companion PWA, no typing. Reuses the Settings → Services connect flow (the session token is embedded server-side and never reaches the UI); shows a hint when Remote Access is disabled and a network picker when the machine has multiple IPs.
+- **Multiple GitHub accounts (github.com + GitHub Enterprise)** — TUICommander is now account-centric instead of single-account. Add a second github.com account (device flow) or any number of **GitHub Enterprise Server** accounts (paste a Personal Access Token), and bind each workspace repo to the account that should monitor it. A repo with an ambiguous origin (multiple GitHub remotes or matching accounts) surfaces a **binding chooser** instead of silently picking `origin`. Every account gets its own isolated polling, rate-limit budget, viewer identity, and circuit breaker, so a rate limit or auth failure on one account never stalls the others. github.com-only setups are byte-for-byte unchanged — the OAuth device flow, token resolution, and single-batch polling behave exactly as before. Managed under Settings → GitHub → *Additional GitHub Accounts* and *Repository Bindings*.
+- **Event-driven multi-agent orchestration (MCP)** — Agents connected over the MCP control surface can coordinate through TUICommander as the hub: discover peers, exchange messages, and receive push-style notifications driven by session events rather than polling.
+- **Full browser / PWA / remote HTTP parity** — Git Panel writes, the GitHub panel and auth, AI Chat and the autonomous agent loop, the Claude Usage dashboard, plugin data/lifecycle, provider keyring, filesystem, and terminal reads now all have HTTP/SSE/WS equivalents. The mobile PWA and remote clients can now drive nearly the entire app, not just terminals.
+- **Command Palette button in browser mode** — The toolbar exposes the Command Palette directly when running over HTTP/PWA, replacing the hidden desktop-only IDE launcher entry.
+- **Merge with pending CI + squash default** — The PR Merge action is available while CI is still running and defaults to *Squash & merge*.
+- **GitHub Ops improvement proposals** — The Ops Dashboard can scan a repo for refactor, testing, or performance proposals using the Headless AI slot, then create a GitHub issue only after explicit approval.
+
+### Changed
+- **Branch context menu reorganized by usage frequency** — The sidebar branch menu groups the actions you reach for most at the top.
+- **Design-system audit — tokens, accessibility, GPU animations** — Canonical CSS token migration (no orphan/aliased variables left), keyboard accessibility (`role`/`tabindex`/Enter–Space) across collapsible headers and clickable rows, progress bars moved to GPU `transform: scaleX()`, and removal of side-stripe accents and mobile glassmorphism. Active/selected states now use a non-layout inset ring, so selecting an item no longer shifts its neighbors. Contributed by @paulovitin (#93).
+- **Terminal grid: damage-tracked row diffing** — The PTY→grid `process()` path now diffs only the rows alacritty marks damaged instead of rebuilding and comparing the entire visible screen on every output chunk. Under spinner-heavy/flooding output (hundreds of chunks/sec) this drops the per-chunk cost from O(rows×cols) to O(changed rows). A byte-parity differential test pins the new path to the old full-diff output; the text-equality guard is preserved so no spurious or missed row events reach the parsers (slash-menu, choice-prompt, question detection). Backed by a new independent parse-damage view in our alacritty fork.
+- **Per-session PTY event delivery (browser/remote WS)** — Each session's WebSocket handlers now receive parsed/exit/closed events over a dedicated per-session channel instead of every handler subscribing to the global event bus and filtering by id. Under many concurrent sessions with heavy output this removes O(sessions × subscribers) event cloning+matching on the hot path. Wire frames are unchanged; close notifications remain redundantly delivered over `/events` SSE.
+
+### Fixed
+- **Codex tab showed idle while working** — Codex freezes its terminal UI while a child process runs (a long `cargo`/`git`), producing no output, so the output-driven busy detection flipped the tab to idle after ~2.5s even though the agent was still working. The idle timer now treats the on-screen `• Working (… esc to interrupt)` status line as a liveness signal and keeps the tab busy until it disappears.
+- **Context-menu items dropped + dangling separators** — A regression made every menu item that requested a trailing divider (the File Browser's New File, Paste, Delete, Add to .gitignore) render as *only* a divider, so those items vanished from the menu. Items now always render; a separator on the last item is suppressed so no context menu ends with a dangling divider (affected every menu — sidebar, terminal, file browser, git). The terminal menu also groups Copy and Paste together.
+- **SSH tunnel remote forwards** — The tunnel editor now saves Remote forwards with `local_host`/`local_port`, matching the backend schema and preventing Remote forwards from being rejected as malformed Local-forward payloads.
+- **Codex spawn reliability + intent parsing** — Hardened Codex CLI launching, intent parsing, and several related UI issues (#100–#104).
+- **Browser / PWA mode fixes** — Killed a duplicate "PTY:" tab race, fixed worktree-create routing, wired scroll history and coalesced scroll-to-offset so browser-mode scrolling renders, forwarded the mouse wheel to the app whenever mouse reporting is on, and added `convertFileSrc` to the Tauri shim to stop a PWA crash.
+- **iPad / touch input** — Fixed on-screen-keyboard focus (only the focused terminal lifts above the keyboard, anchored to the cursor row), touch-scroll direction, emoji-glyph rendering, and long-press to start drags so sidebar scroll still works.
+- **Clipboard consistency** — All copy paths route through the shared `writeClipboard` helper.
+
+## [1.5.1] - 2026-06-26
+
+### Fixed
+- **Git Log — expanded commit body overlap** — Expanding a commit in the Git Panel's Log tab no longer lets its (wrapped) body and changed-files list overlap the next row. The expanded section's real height is now measured rather than estimated from a line count that ignored wrapping.
+- **Stuck "awaiting input" badge** — A confident interactive prompt (e.g. an agent's "Enter to select" menu) answered via a channel/MCP prompt box instead of a direct keystroke no longer leaves the tab pulsing amber. The badge now also clears once the terminal has been busy (producing output, no re-detection) for a short window; a statically-waiting prompt still keeps the badge.
+- **Boot-time unhandled rejection** — Disposing a Tauri event listener that was already unregistered no longer surfaces an "undefined is not an object (listeners[eventId].handlerId)" rejection at startup; the async unlisten path is now swallowed.
+- **Dictation docs** — Corrected the documented Windows whisper acceleration (CPU-only, not Vulkan/GPU).
+
+## [1.5.0] - 2026-06-25
+
+### Added
+- **Native agent hooks for status (Claude, Gemini, Grok, Codex, OpenCode)** — Opt in per agent in Settings → Agents to drive busy/idle/waiting state from the agent's own hook system instead of output heuristics. Enabling installs small `OSC 7770`-emitting hooks into the agent's native settings format (Claude/Gemini/Codex JSON settings-hooks, Grok own-file, OpenCode plugin); disabling removes only TUIC's entries (sentinel-owned, so your own/wiz hooks are never touched). Instrumented agents report question/approval prompts precisely and suppress heuristic question-detection (the silence-idle crash backstop stays on). macOS/Linux only; Windows keeps heuristics. Default off — byte-for-byte current behavior.
+- **Inline git blame in the code editor** — A dim italic "author · relative time · summary" annotation at the end of the editor's active line (GitLens-style), following the cursor over already-loaded blame data. Uncommitted lines show "You · Uncommitted changes". On by default; toggle via the `inline_blame_enabled` config field. External (non-repo) files show no annotation.
+- **One-click delete-merged branch cleanup** — The Git Panel's Branches tab shows a broom button (with a count badge) that bulk-deletes local branches already merged into main, behind a confirm dialog listing the targets. Uses safe `git branch -d`, so a stale merged flag can never cause data loss.
+- **"Active only" repo filter** — A filter icon in the toolbar (next to the sidebar toggle) hides repositories that have no open terminals. An accent banner at the top of the sidebar shows the shown/total count and offers "Show all". Session-only.
+- **Context-menu shortcut keys** — While a context menu is open, pressing an item's shortcut chord (e.g. the branch menu's `M`/`R`/`d`) now fires that item's action directly instead of just closing the menu.
+- **Two new built-in themes** — deep-black and minimal-kiwi.
+- **Cmd/Ctrl+R reloads a web/preview tab** — When a web or HTML-preview tab is active, the Run shortcut reloads it instead of opening the Run Command dialog.
+- **User-prompt markers on the terminal scrollbar** — Green ticks on the scrollbar mark the lines where you entered a command, so you can jump back to an earlier prompt at a glance.
+- **Large files up to 250 MB in the code editor** — A dedicated read path raises the editor's file-size ceiling to 250 MB; files beyond the cap are refused up front with a notice instead of freezing the UI while loading.
+
+### Changed
+- **Branch merge feedback** — Merging a branch from the Branches tab now surfaces the result explicitly: a conflict error toast on failure, an "Already up to date" toast on a no-op, and a success toast with a one-click "Delete branch" action for the now-merged branch.
+- **Readable theme contrast** — Raised muted / bright-black tones across catppuccin-mocha, darksun, delicate-one, nord, solarized-dark, tokyo-night and vscode-light so muted text clears a readable floor. The Appearance terminal preview now picks powerline segment text color by WCAG contrast against the fill instead of the literal ANSI token.
+- **Unified PTY command injection** — The Notes "Send to Terminal" action (attached and detached), the mobile command/ideas widgets, agent auto-retry, the git terminal fallback, the CI auto-heal conflict prompt, and the terminal `writeln` API all route through the canonical `sendCommand` helper, so the Enter keypress registers correctly even for Ink-based agents in raw mode.
+- **Responsive typing under heavy load (macOS)** — The PTY reader, frame ticker, and keystroke-write threads now run at `USER_INTERACTIVE` QoS, so typing and echo stay fluid while a saturating `cargo build`/compile runs in another pane. Complements the existing renice of PTY child processes.
+
+### Security
+- **Deep-link command gating** — `tuic://cmd/{tool}/{action}` deep links now default-deny: only read-only/notify actions run silently, while every other (destructive or unknown) action requires a confirmation dialog — closing previously un-gated paths such as `agent/send` and `session/pause`. A Rust-side backstop rejects `config/save` and `debug/invoke_js` regardless of the frontend. The `session pause`/`resume` MCP actions are now restricted to loopback clients like the other destructive session actions, and remote (TCP) clients get the standard 10 MB cap on the editor file-read routes instead of the 250 MB local cap.
+
+### Fixed
+- **No false completion sounds on sleep/wake** — Busy→idle transitions in the grace window after a system wake, and shell-integrated terminals that went busy without a command actually running (OSC 133), no longer fire spurious completion notifications.
+- **Terminal stability** — Fixed a stale-read crash when a PTY auto-closes mid-frame, a document-listener leak when a terminal unmounts while subscribing, a layout-forcing read on every scrollbar drag, and a ghost-terminal resurrection from a late OSC 133 flush after removal.
+- **Terminal interaction fixes** — Cmd+C no longer copies duplicated text and now unwraps soft-wrapped selections; a stale "awaiting input" badge is cleared when an agent exits back to the shell; and smooth-scroll self-heals canvas drift, snapping to the line when a scroll gesture ends.
+- **Git Panel header alignment** — The Branches/Changes/Log/Stashes tab strip no longer reserves a horizontal scrollbar that misaligned the detach/close icons and left dead space; overflowing tabs scroll via vertical wheel/trackpad, and the close button is now an SVG icon matching the detach/reattach controls.
+- **macOS dock-icon reopen** — Clicking the dock icon while the main window is minimized now restores it, even when a detached panel window is open (which previously suppressed the default un-minimize).
+- **Resilient git operations** — Stale `.git/index.lock` files left by crashed processes are reclaimed on size+age thresholds; branch-switch failures show the full git output and offer Retry on recoverable lock contention; concurrent confirmation dialogs queue instead of being silently dropped; rapid branch selection is serialized so it can't duplicate terminals.
+- **PR check status accuracy** — The PR detail popover no longer lists duplicate checks when a workflow re-runs (deduped to the newest run per name, matching the summary counts); `ACTION_REQUIRED` checks now count as failed so a PR blocked by a gate no longer renders as all-green; and the detail query fetches up to 100 checks to stay consistent with the summary tally.
+- **MCP agent grid streaming** — Agent sessions spawned over MCP now register their grid watch channel and a terminal alias, so `format=grid` WebSocket streaming works.
+- **MCP OAuth refresh tokens** — Authorization requests now include `offline_access`, so upstreams issue a refresh token instead of silently dropping to a re-auth prompt after the access token expires.
+- **Binary terminal output** — The UTF-8 read buffer decodes iteratively (no reader-thread stack overflow on large binary reads), and absolute scrollback line reads return the correct rows.
+- **AI Chat** — A lagging event stream no longer wedges the chat spinner; completion and error events still arrive.
+
+## [1.4.2] - 2026-06-13
+
+### Added
+- **Nested terminal tabs** (#85) — Optional setting (Appearance ▸ Tabs, default off) that shows a branch's open terminals as a collapsible list under its sidebar row when the branch has more than one terminal, each with a status dot; clicking a sub-item switches to that terminal.
+
+### Changed
+- **Consistent HTML-preview search** — Find-in-page in the Preview tab's HTML view now uses the same SearchBar pill as the editor, diff, terminal and markdown views (with case/regex/whole-word toggles and a match counter), instead of a bespoke in-iframe overlay. The parent drives the iframe over a postMessage bridge; plugin panels keep their own overlay search.
+
+### Fixed
+- **Markdown search scrollbar ticks** — Find-in-page in the markdown view now shows the same match ticks on the scrollbar as the diff and editor views.
+- **Approve button on your own PR** — The PR Approve button no longer briefly appears on your own pull requests before your GitHub identity has loaded (which GitHub rejects with a 422).
+- **Branch indicator after fetch/rebase** — A momentarily-unreadable `.git/HEAD` (during a fetch, rebase or gc) no longer suppresses the next real branch-change refresh in the sidebar.
+- **MCP upstream reconnection** — Fixed a rare crash when an OAuth upstream finished authenticating while being disconnected; upstreams added at runtime now reliably appear in the tool list, and a failed auto-connect no longer stalls the first tool listing.
+- **Audio output device errors** are now logged instead of silently showing an empty device list.
+- **Accessibility** — Terminal tab lists in the sidebar expose correct ARIA roles to screen readers.
+
+## [1.4.0] - 2026-06-09
+
+### Added
+- **Native-feel smooth scrolling** — The terminal now scrolls with momentum and a draggable scrollbar, with selection highlight preserved across the animation.
+- **Editor change-overview ruler** — VS Code-style colored ticks on the editor's scrollbar mark added/modified/deleted lines, fed by the same git-gutter data (no second diff parse).
+- **Extended thinking in AI Chat** — Claude Opus 4.7+ reasoning is surfaced live in the chat panel.
+- **Custom "Open in…" launchers** (#71) — Define your own editor/tool launch commands; iTerm2 and Tower are added as built-in launchers.
+- **Event-driven smart prompts** — Repo watchers fire smart prompts on PR-pushed / PR-opened events behind an idle gate, instead of polling.
+- **Markdown panel** — A dedicated markdown panel with refreshed keyboard shortcuts.
+- **Sidebar "Create Branch"** — A Create Branch action with a condensed "Branch ›" submenu.
+- **Faster terminal navigation** — Keybindings to return to the last terminal and jump to the next terminal awaiting input; the shortcuts panel now lists every canonical action.
+- **Inline review comments on markdown ("tweaks")** — Attach review comments to any passage in a rendered markdown file; they're highlighted in place and stored inside the `.md` source as invisible HTML-comment markers that AI agents can read and apply.
+- **Cmd/Ctrl+hover go-to-definition affordance** — Holding Cmd (macOS) / Ctrl underlines the symbol under the cursor in the code editor as a Cmd+Click affordance.
+- **Cycle All Tab Types** (#58) — Optional setting (Appearance, default off) to let next/prev-tab cycle file/diff/markdown/editor tabs alongside terminals.
+- **Right-click menu on terminal links** (#57) — Right-clicking a detected file path or URL offers Open and Copy link; single left-click still opens instantly.
+- **JetBrains IDE family in the launcher** (#70) — IntelliJ IDEA, PyCharm, WebStorm, GoLand, CLion, PhpStorm, RubyMine, Rider, DataGrip, RustRover, Android Studio and Fleet are selectable as the default IDE and in "Open in…", launched with `--line`/`--column` goto.
+
+### Changed
+- **In-process git reads (gix)** — Branch detail, commit log/graph, ahead/behind, worktree paths, status counts, diff stats and blame now run through an in-process `gix` backend behind a GitReads port with a coalescing TTL cache, cutting git subprocesses and file-descriptor pressure. Narrow edge cases (sparse-checkout/submodule status, staged/commit diffs, renamed-file blame) fall back to the git CLI inside the adapter.
+- **Diff & editor performance** (#020) — The diff parser moved to Rust; multi-file diffs and PR views are virtualized (only on-screen sections mount) and the editor's disk poll stat-gates before re-reading, keeping large diffs and long sessions responsive.
+- **Commit graph** — Lane starts are marked and per-frame canvas reallocation was removed.
+- **Error Log severity threshold** (#69) — Selecting a level shows that level and everything more severe (e.g. Warn shows Warn + Error), with a tooltip describing the range.
+
+### Fixed
+- **Readable terminal text on light themes** (#80) — The default foreground read an undefined CSS variable and fell back to gray; it now reads the theme's foreground color.
+- **Consistent New Tab** (#81) — Cmd+T, the command palette, and File ▸ New Tab now route through the same handler.
+- **macOS press-and-hold** (#79) — The accent-picker popup no longer hijacks key-repeat in the terminal.
+- **Terminal interaction** — Right-click link menu works under mouse reporting, Cmd/Ctrl+C copies, and menu-bar Copy/Paste route to the focused terminal.
+- **Freeze detection** — The freeze detector no longer reports paint jank or system sleep as UI freezes.
+- **File browser** — Cross-repo copy/paste and keyboard focus fixed.
+- **Shell & CLI** — The `tuic` sidecar resolves next to the executable (closes #52); zsh `compinit` runs correctly when the ZDOTDIR trick is skipped.
+- **Worktrees** — Worktree-add failures are classified and fail loudly instead of creating phantom entries.
+
+### Community
+- [@jajugoguma](https://github.com/jajugoguma) — fixed terminal text being unreadable on light themes (#80)
+- [@jklap](https://github.com/jklap) — added release-version checking to the macOS `install.sh` (#75)
+
+## [1.2.11-nightly] - 2026-06-02
+
+### Fixed
+- **False completion sounds on wake (sleep/lid reopen)** — The silence timer's sleep-wake guard measured the inter-tick gap with `Instant` (monotonic), but on macOS `Instant` does not advance while the system is asleep, so the guard never fired and the wall-clock jump triggered a false busy→idle completion sound on every terminal. The gap is now measured against the same wall clock the idle decision uses.
+- **Sleep counted as UI freezes** — The frontend freeze detector logged multi-minute "UI freeze" gaps on every lid reopen (RAF pauses during sleep). Gaps over 10s are now treated as system sleep and skipped, so the freeze count and logs reflect only real main-thread stalls.
+
+## [1.2.10-nightly] - 2026-05-30
+
+### Added
+- **Full commit message body in expanded log view** — Expanding a commit in the Git Panel's Log tab now shows the complete multi-line commit message body below the subject; the subject is no longer truncated when expanded. Backed by a new `body` field on `CommitLogEntry`.
+
+### Changed
+- **GitHub OAuth scope reduced to `repo`** — Device Flow login no longer requests `read:org`. TUIC never calls any org/team/membership endpoint; access to org-owned private repos comes from `repo` + per-org SAML SSO authorization.
+- **Bounded monitoring git fan-out** — Background repo-monitoring refreshes (`get_repo_summary`, `get_repo_structure`, `get_repo_diff_stats`) now share a concurrency semaphore (max 8 concurrent refreshes), so a `repo-changed` burst across many registered repos can't spike concurrent git subprocesses past the FD limit (EMFILE) or storm the main thread with IPC. Operational git (commit/push/stage/checkout/diff-on-click) is never throttled.
+- **Faster grid-frame stuck recovery** — The stuck grid-frame back-off was shortened from 5s to 1s (chunked, respecting the running ticker) so the terminal recovers more quickly after a WebView JS-thread stall.
+
+### Fixed
+- **Raised file-descriptor soft limit at startup** — macOS launchd hands GUI apps a soft `RLIMIT_NOFILE` of 256; TUIC now raises it to 65536 at startup, preventing EMFILE errors during git fan-out bursts.
+- **Dead terminal tabs no longer show green** — On PTY exit, the tab's shell state is now set to `exited` (it was left `idle` with a null session ID), so closed/dead tabs render the correct grey indicator instead of a green "active" dot.
+
+## [1.2.9-nightly] - 2026-05-29
+
+### Added
+- **In-iframe Cmd/Ctrl+F search** — HTML previews and plugin panels now support find-in-page via an injected search overlay.
+- **UI freeze detector** — A RAF-loop watchdog records main-thread stalls for diagnostics.
+- **Programmatic main-window recovery** — If the window config is missing (bad edit/merge), the main window is now created programmatically so the app never starts headless.
+
+### Fixed
+- **Finder → File Browser drop coordinates (macOS Retina)** — Tauri reports drag-drop positions in logical (CSS) pixels on macOS; dividing by `devicePixelRatio` halved them on Retina and routed drops to the terminal behind the panel. Coordinates are now correct per-platform.
+- **Duplicate plugin reload on Cmd/Ctrl+R** — The SDK and search scripts both posted `tuic:reload-request`, double-reloading plugin iframes. Deduplicated to a single handler.
+- **Cross-platform release build** — Guarded macOS-only window-builder methods (`hidden_title`, `title_bar_style`) behind `cfg(target_os = "macos")` so Linux and Windows builds compile.
+
+## [1.2.8-nightly] - 2026-05-29
+
+### Added
+- **Worktree setup scripts** — All three worktree creation paths (MCP `repo action=worktree_create`, HTTP `POST /worktrees`, HTTP `POST /sessions/worktree`) now resolve and execute the configured `setup_script` (per-repo override > global default) after creating the worktree. Result or error returned in the response as `setup_script` / `setup_script_error`.
+- **Worktree-created event emission** — `worktree-created` Tauri event and `AppEvent::WorktreeCreated` event bus message now emitted from all three worktree creation paths (MCP, HTTP worktree, HTTP session+worktree), enabling frontend switch prompts.
+- **AI Chat FileSandbox auto-init** — `run_conversation` now creates a `FileSandbox` from the session's CWD before tool dispatch, so file tools (`list_files`, `read_file`, etc.) work without a prior explicit sandbox setup.
+
+### Fixed
+- **IME candidate window positioning** — Hidden input element now tracks the terminal cursor position so East Asian IME candidate windows (Chinese Pinyin, Japanese, Korean) appear near the cursor instead of at the top-left corner of the screen. Also adds `compositionstart` handler for accurate position at composition onset. ([#42](https://github.com/sstraus/tuicommander/issues/42))
+- **Git diff crash on deleted files** — `get_file_diff` no longer attempts `--no-index` for files deleted from disk, falling through to standard `git diff` which reads from the index.
+- **Worktree stale directory** — Stale worktree directories now read the actual HEAD instead of echoing the originally requested branch; concurrent removal prevented via reentrancy guard. ([#47](https://github.com/sstraus/tuicommander/pull/47))
+
+## [1.2.6-nightly] - 2026-05-25
+
 ### Added
 - **Command block system** — Terminal output is segmented into command blocks (one per prompt+output cycle). Features include: semantic scrollbar marks with color-coded indicators, block timestamp overlay (hold `Ctrl+Cmd`), gutter click to select entire block output, block folding with `Cmd+Shift+.` toggle, block-scoped search with `Cmd+Shift+B` toggle, block navigation with `Cmd+Shift+Up/Down`, cap at 500 blocks per session (oldest evicted), and OSC 7770;block= agent-emitted block markers. Settings at `Settings > Terminal > Blocks`.
 - **Heuristic agent-block detection** — Claude Code tool calls (`⏺ ToolName(args)`) are now detected heuristically and synthesized into AgentBlock start/end events, so the block system works without CC emitting OSC 7770 sequences.
 - **Generators modal** — Secure value generators accessible from the command palette (`open-generators`). Generates: Password, UUID v4, UUID v7, ULID, CUID2, JWT Secret, TOTP Secret, Nano ID, Slug, Ed25519 Key Pair. All generation happens in the Rust backend via `ring` crate.
 - **Process stats & monitor** — New MCP session action `process_stats` and HTTP routes (`/process/stats`, `/process/monitor`) returning CPU% and RSS memory for TUIC and all child process trees. The monitor route serves a self-contained HTML dashboard.
 - **App logger extra fields** — Tracing events now capture all extra fields (beyond `message` and `source`) as a JSON `data` column, making structured logging queryable via the `/logs` endpoint.
+- **Auto-standby** — SIGSTOP entire PTY process groups after configurable N minutes of being both unfocused and idle. SIGCONT on tab focus or agent message arrival. Settings at `Settings > General > Auto-Standby Timeout` (default 5 min, 0 = disabled). Pause badge in tab bar.
+- **ANSI colors in markdown code blocks** — Code fences containing ANSI escape sequences are now colorized using `ansi-to-html` instead of being stripped.
+- **Dormant repo throttling** — Cold repos (no active terminals) get 15s watcher debounce (vs 1.5s) and GitHub polling every ~10min with per-path jitter. Switching to a cold repo triggers immediate data refresh. New `set_hot_repos` command and `PUT /watchers/hot-repos` endpoint.
+- **File browser intra-tree drag & drop** — Drag files and folders between directories within the file browser tree. Uses `renamePath` for the actual move.
+- **Expanded menu bar** — New File, Find in Content, Clear Scrollback, Refresh Terminal, Maximize/Restore Pane, Focus Mode, Zoom All Terminals, File Browser, Outline, AI Chat, Compose, Global Workspace, Content Search, SSH Tunnels, Process Manager.
+- **`prefers-reduced-motion` support** — Global CSS media query disables animations and transitions for users who prefer reduced motion.
 
 ### Changed
 - **GitHub polling: updated_at change detection** — Replaced ETag-based HTTP caching with `updated_at` timestamp comparison, fixing stale data when GitHub CDN caches return 304 on changed content.
 - **GitHub module split** — Extracted `github_debug` module for API debug logging. Fixed route prefix (`github` → `github-poller`). Removed dead Tauri commands.
 - **PTY write error handling** — PTY writer `write_all`/`flush` failures are now logged via `tracing::warn` instead of silently ignored.
 - **Session write tracing** — `write_pty` slash_mode logging downgraded from `info` to `trace` to reduce log noise.
+- **Panel unmounting** — Outline, References, AiTriage, and Activity Dashboard panels now unmount when closed, releasing memos/subscriptions.
+- **CanvasTerminal visibility** — Hidden terminals shrink canvas to 1x1px and clear caches. Cursor hidden when terminal is unfocused.
+- **Dev build profile** — `[profile.dev]` opt-level=1 with dependencies at opt-level=2 for faster dev builds.
 
 ### Fixed
 - **Idle keepalive spinner detection** — Tool progress spinners (◐◑◒◓) now detected for CC idle keepalive, preventing false idle transitions during tool execution.
 - **MCP default pinned=false** — MCP-created tabs no longer default to pinned, preventing unintended tab persistence across branch switches.
 - **Build: cfg-gate desktop modules** — Desktop-only modules properly gated for `tuic-remote` and agent-only builds.
 - **CI: check-remote job** — New CI job catches missing `cfg(desktop)` gates before they break remote builds.
+- **Block timestamp overlap** — `paintBlockTimestamps` now skips labels that would overlap vertically, preventing consecutive close prompts from rendering on top of each other.
+- **Search scrollbar marks** — Orange markers for search match positions in the scrollbar, de-duplicated by pixel row, with cache key tied to search state.
+- **Plugin watcher spurious reload** (#43) — Watcher now filters by `EventKind` (only Create/Modify(Data)/Modify(Name)/Remove), ignoring access/metadata events that caused ~1s flash loops on some Linux configurations. Disabled plugins are skipped entirely (zero IPC, zero store updates).
+- **ContentIndex rebuild storm** — 60-second cooldown between consecutive index rebuilds for the same repo.
+- **Memory caps** — Tool calls capped at 500, activity items at 500, PR notifications at 200 to prevent unbounded memory growth in long sessions.
 
 ## [1.2.3-nightly] - 2026-05-19
 
@@ -835,7 +1081,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Plugin panel CSS theme injection** — CSS custom properties (`--bg-*`, `--fg-*`, `--border*`, etc.) are automatically injected into plugin panel iframes, so plugins inherit the app theme without manual color copying
 - **Auto-delete branch on PR close** — Per-repo setting (off/ask/auto) to automatically delete local branches when their GitHub PR is merged or closed. Handles worktree cleanup, dirty-state escalation, and main-branch protection
 - **Worktree system overhaul** — Configurable storage strategies (sibling, app dir, inside-repo), three creation flows (dialog with base ref, instant, right-click quick-clone), hybrid branch naming (`{source}--{random}`), merge & archive workflow, external worktree detection via `.git/worktrees/` monitoring, per-repo worktree settings with global defaults
-- **Centralized error log panel** — Ring-buffer logger captures all errors, warnings, and info from app, plugins, git, network, and terminal subsystems. Filterable overlay panel with level tabs, source dropdown, and text search. Status bar badge shows unseen error count. Keyboard shortcut: `Cmd+Shift+E` ([solution doc](docs/solutions/integration-issues/centralized-error-logging.md))
+- **Centralized error log panel** — Ring-buffer logger captures all errors, warnings, and info from app, plugins, git, network, and terminal subsystems. Filterable overlay panel with level tabs, source dropdown, and text search. Status bar badge shows unseen error count. Keyboard shortcut: `Cmd+Shift+E`
 - **Plugin log forwarding** — Plugin `host.log()` calls now appear in the centralized error log panel alongside app-wide logs
 - **Agent-scoped plugins** — `agentTypes` manifest field restricts plugin output watchers and structured event handlers to terminals running specific agents (e.g. `["claude"]`). Universal plugins (empty array) continue to receive all events
 - **File browser → Markdown viewer routing** — `.md`/`.mdx` files opened from the file browser now open in the Markdown panel instead of the code editor

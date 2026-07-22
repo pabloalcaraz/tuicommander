@@ -69,6 +69,12 @@ impl Response {
 /// Send an HTTP request over the IPC socket and return the response.
 pub fn request(method: &str, path: &str, body: Option<&str>) -> io::Result<Response> {
     let mut stream = connect()?;
+    #[cfg(unix)]
+    {
+        let timeout = Some(std::time::Duration::from_secs(3));
+        stream.set_read_timeout(timeout)?;
+        stream.set_write_timeout(timeout)?;
+    }
 
     let content = body.unwrap_or("");
     let req = if content.is_empty() {
@@ -93,13 +99,6 @@ pub fn request(method: &str, path: &str, body: Option<&str>) -> io::Result<Respo
 
     stream.write_all(req.as_bytes())?;
     stream.flush()?;
-
-    // Shutdown write side so server knows we're done
-    #[cfg(unix)]
-    {
-        use std::os::unix::net::UnixStream;
-        let _ = UnixStream::shutdown(&stream, std::net::Shutdown::Write);
-    }
 
     let mut reader = BufReader::new(&mut stream);
 

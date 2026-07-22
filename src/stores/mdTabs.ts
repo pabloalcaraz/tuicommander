@@ -42,12 +42,27 @@ export interface PluginPanelTab extends BaseTab {
 	html: string;
 	/** Optional URL to load instead of inline HTML (mutually exclusive with html) */
 	url?: string;
+	/**
+	 * Source-derived styling mode. Undefined/false for SDK plugin dashboards
+	 * (`addPluginPanel`) — they get PLUGIN_BASE_CSS forced on so the shared
+	 * `.dashboard`/`.dash-*` classes render. True for MCP `ui action=tab` design/
+	 * preview tabs (`openUiTab`) — they keep their own background/typography and
+	 * the base sheet is omitted (#080).
+	 */
+	selfStyled?: boolean;
 }
 
 /** Native Claude Usage Dashboard tab */
 export interface ClaudeUsageTab extends BaseTab {
 	type: "claude-usage";
 	title: string;
+}
+
+/** Native GitHub Ops Dashboard tab (repo-scoped) */
+export interface GithubOpsTab extends BaseTab {
+	type: "github-ops";
+	title: string;
+	repoPath: string;
 }
 
 /** PR diff tab (renders a full PR diff in the main panel) */
@@ -83,6 +98,7 @@ export type MdTabData =
 	| VirtualTab
 	| PluginPanelTab
 	| ClaudeUsageTab
+	| GithubOpsTab
 	| PrDiffTab
 	| HtmlPreviewTab
 	| CommandOverviewTab;
@@ -137,6 +153,11 @@ function createMdTabsStore() {
 				(tab) => tab.type === "file" && (tab as FileTab).fsRoot === effectiveRoot && tab.filePath === filePath,
 			) as FileTab | undefined;
 			if (existing) {
+				const key = currentBranchKey();
+				if (existing.repoPath !== repoPath || existing.branchKey !== key) {
+					base._setState("tabs", existing.id, "repoPath" as keyof MdTabData, repoPath as MdTabData[keyof MdTabData]);
+					base._setState("tabs", existing.id, "branchKey" as keyof MdTabData, key as MdTabData[keyof MdTabData]);
+				}
 				base.setActive(existing.id);
 
 				return existing.id;
@@ -269,7 +290,10 @@ function createMdTabsStore() {
 			}
 
 			const id = base._nextId("md");
-			const tab: PluginPanelTab = { type: "plugin-panel", id, title, pluginId, html, pinned };
+			// MCP `ui` tabs are design/preview surfaces: keep their own styling and
+			// omit PLUGIN_BASE_CSS (#080). SDK plugin dashboards use addPluginPanel,
+			// which leaves selfStyled unset so the base sheet is injected.
+			const tab: PluginPanelTab = { type: "plugin-panel", id, title, pluginId, html, pinned, selfStyled: true };
 			const resolvedRepo = resolveRepoForCwd(originRepoPath) ?? undefined;
 			if (resolvedRepo) tab.repoPath = resolvedRepo;
 			if (url) tab.url = url;
@@ -313,6 +337,29 @@ function createMdTabsStore() {
 			return tabId;
 		},
 
+		/** Add the GitHub Ops Dashboard tab (singleton per repo — reuses existing if open) */
+		addGithubOps(repoPath: string): string {
+			const existing = Object.values(base.state.tabs).find(
+				(tab) => tab.type === "github-ops" && (tab as GithubOpsTab).repoPath === repoPath,
+			) as GithubOpsTab | undefined;
+			if (existing) {
+				base.setActive(existing.id);
+
+				return existing.id;
+			}
+
+			const id = base._nextId("md");
+			const tabId = base._addTab({
+				type: "github-ops",
+				id,
+				title: "GitHub Ops",
+				repoPath,
+				pinned: true,
+			} as GithubOpsTab);
+
+			return tabId;
+		},
+
 		/** Add the Command Overview panel tab (singleton — reuses existing if open) */
 		addCommandOverview(): string {
 			const existing = Object.values(base.state.tabs).find((tab) => tab.type === "command-overview") as
@@ -327,7 +374,6 @@ function createMdTabsStore() {
 			return base._addTab({ type: "command-overview", id, title: "Commands", pinned: true } as CommandOverviewTab);
 		},
 
-		/** Add the AI Triage panel tab (singleton per repo — reuses existing if open) */
 		/** Add a PR diff tab (or reuse existing for same repo+prNumber, updating diff content) */
 		addPrDiff(repoPath: string, prNumber: number, prTitle: string, diff: string): string {
 			const existing = Object.values(base.state.tabs).find(
@@ -366,6 +412,11 @@ function createMdTabsStore() {
 					tab.type === "html-preview" && (tab as HtmlPreviewTab).fsRoot === effectiveRoot && tab.filePath === filePath,
 			) as HtmlPreviewTab | undefined;
 			if (existing) {
+				const key = currentBranchKey();
+				if (existing.repoPath !== repoPath || existing.branchKey !== key) {
+					base._setState("tabs", existing.id, "repoPath" as keyof MdTabData, repoPath as MdTabData[keyof MdTabData]);
+					base._setState("tabs", existing.id, "branchKey" as keyof MdTabData, key as MdTabData[keyof MdTabData]);
+				}
 				base.setActive(existing.id);
 				return existing.id;
 			}

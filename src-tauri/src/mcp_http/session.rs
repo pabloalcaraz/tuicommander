@@ -85,31 +85,115 @@ pub(super) async fn write_to_session(
     Path(session_id): Path<String>,
     Json(body): Json<WriteRequest>,
 ) -> impl IntoResponse {
-    let entry = match state.sessions.get(&session_id) {
-        Some(e) => e,
-        None => return session_not_found(),
-    };
-    let mut session = entry.lock();
-    if let Err(e) = session.writer.write_all(body.data.as_bytes()) {
+    if let Err(e) = write_pty_input(&state, &session_id, &body.data) {
+        if e == "Session not found" {
+            return session_not_found();
+        }
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Write failed: {}", e)})),
+            Json(serde_json::json!({"error": e})),
         );
     }
-    if let Err(e) = session.writer.flush() {
-        tracing::warn!(session_id = %session_id, "PTY flush failed: {e}");
+
+    (StatusCode::OK, Json(serde_json::json!({"ok": true})))
+}
+
+pub(crate) fn write_pty_input(
+    state: &Arc<AppState>,
+    session_id: &str,
+    data: &str,
+) -> Result<(), String> {
+    let entry = state
+        .sessions
+        .get(session_id)
+        .ok_or_else(|| "Session not found".to_string())?;
+    {
+        let mut session = entry.lock();
+        session
+            .writer
+            .write_all(data.as_bytes())
+            .map_err(|e| format!("Write failed: {e}"))?;
+        if let Err(e) = session.writer.flush() {
+            tracing::warn!(session_id = %session_id, "PTY flush failed: {e}");
+        }
     }
+    drop(entry);
+
+    apply_input_bookkeeping(state, session_id, data);
+
+    Ok(())
+}
+
+/// Write two input parts (e.g. text + a special-key sequence) to a session's
+/// PTY under a SINGLE lock acquisition, then run the same post-write
+/// bookkeeping (input-time stamp + InputLineBuffer FSM feed) that two
+/// sequential `write_pty_input` calls would have run — once per part, in
+/// order. Closes the interleave window a concurrent writer (peer injection,
+/// desktop `write_pty`) could otherwise land in between the text write and
+/// the Enter keystroke when the two writes took the PTY mutex separately.
+pub(crate) fn write_pty_input_pair(
+    state: &Arc<AppState>,
+    session_id: &str,
+    text: &str,
+    key: &str,
+) -> Result<(), String> {
+    let entry = state
+        .sessions
+        .get(session_id)
+        .ok_or_else(|| "Session not found".to_string())?;
+    {
+        let mut session = entry.lock();
+        session
+            .writer
+            .write_all(text.as_bytes())
+            .map_err(|e| format!("Write failed: {e}"))?;
+        session
+            .writer
+            .write_all(key.as_bytes())
+            .map_err(|e| format!("Write failed: {e}"))?;
+        if let Err(e) = session.writer.flush() {
+            tracing::warn!(session_id = %session_id, "PTY flush failed: {e}");
+        }
+    }
+    drop(entry);
+
+    apply_input_bookkeeping(state, session_id, text);
+    apply_input_bookkeeping(state, session_id, key);
+
+    Ok(())
+}
+
+/// Post-write bookkeeping shared by `write_pty_input` and
+/// `write_pty_input_pair`: stamps last-input time and feeds the
+/// InputLineBuffer FSM to track slash_mode accurately. Runs once per input
+/// part, after the PTY lock for that part's write has already been released.
+pub(crate) fn apply_input_bookkeeping(state: &Arc<AppState>, session_id: &str, data: &str) {
+    // Stamp last-input time (same as desktop write_pty) so the grid ticker
+    // throttles frames for remote/PWA typing under CPU saturation too.
+    crate::pty::stamp_input_ms(state, session_id);
+    crate::state::resolve_choice_prompt_input(state, session_id, data);
 
     // Feed input through InputLineBuffer FSM to track slash_mode accurately.
     // The old substring heuristic false-positived on pastes starting with '/'.
-    let input_entry = state
-        .input_buffers
-        .entry(session_id.clone())
-        .or_insert_with(|| {
-            parking_lot::Mutex::new(crate::input_line_buffer::InputLineBuffer::new())
-        });
-    let mut buf = input_entry.lock();
-    let actions = buf.feed(&body.data);
+    // Copy the FSM result and composer content, then release BOTH the inner
+    // mutex and DashMap entry guard before any transition/delivery callback.
+    // `flush_pending_injections` re-reads input_buffers; retaining the entry
+    // guard across that call self-deadlocks its DashMap shard.
+    let (actions, buffer_content) = {
+        let input_entry = state
+            .input_buffers
+            .entry(session_id.to_string())
+            .or_insert_with(|| {
+                parking_lot::Mutex::new(crate::input_line_buffer::InputLineBuffer::new())
+            });
+        let mut buf = input_entry.lock();
+        let actions = buf.feed(data);
+        let buffer_content = buf.content();
+        (actions, buffer_content)
+    };
+    let interrupted = actions
+        .iter()
+        .any(|a| matches!(a, crate::input_line_buffer::InputAction::Interrupt));
     let line_submitted = actions.iter().any(|a| {
         matches!(
             a,
@@ -117,40 +201,50 @@ pub(super) async fn write_to_session(
                 | crate::input_line_buffer::InputAction::Interrupt
         )
     });
+    let nonempty_line_submitted = actions.iter().any(|a| {
+        matches!(a, crate::input_line_buffer::InputAction::Line(content) if !content.is_empty())
+    });
+    if interrupted || data == "\x1b" {
+        if let Some(sl) = state.silence_states.get(session_id) {
+            sl.lock().note_interrupt_requested();
+        }
+    } else if nonempty_line_submitted {
+        crate::pty::note_submitted_input(state, session_id);
+    }
     // Determine slash mode. The InputLineBuffer may accumulate junk from
     // terminal responses (e.g. DA reply "1;2c"), so buf.content() alone is
     // unreliable. Use multiple signals:
     let in_slash = if line_submitted {
         false
-    } else if buf.content().starts_with('/') {
+    } else if buffer_content.starts_with('/') {
         true
-    } else if body.data == "/" {
-        // Fresh slash keystroke from PWA — always enters slash mode
+    } else if data == "/" {
+        // Fresh slash keystroke from PWA/MCP — always enters slash mode
         true
     } else {
         // Maintain current slash_mode for subsequent chars (delta sync sends
         // one char at a time after the initial "/"), unless dismissed
-        let is_bare_esc =
-            body.data == "\x1b" || (body.data.contains('\x1b') && !body.data.contains("\x1b["));
-        let dismissed = is_bare_esc || body.data.contains('\x03');
+        let is_bare_esc = data == "\x1b" || (data.contains('\x1b') && !data.contains("\x1b["));
+        let dismissed = is_bare_esc || data.contains('\x03');
         !dismissed
             && state
                 .slash_mode
-                .get(&session_id)
+                .get(session_id)
                 .is_some_and(|v| v.load(std::sync::atomic::Ordering::Relaxed))
     };
     tracing::trace!(
         "write_pty slash_mode: in_slash={in_slash} buf='{}' data='{}'",
-        buf.content(),
-        body.data
+        buffer_content,
+        data
     );
     state
         .slash_mode
-        .entry(session_id.clone())
+        .entry(session_id.to_string())
         .or_insert_with(|| std::sync::atomic::AtomicBool::new(false))
         .store(in_slash, std::sync::atomic::Ordering::Relaxed);
-
-    (StatusCode::OK, Json(serde_json::json!({"ok": true})))
+    if buffer_content.is_empty() {
+        crate::pty::flush_pending_injections(state, session_id);
+    }
 }
 
 pub(super) async fn set_session_name(
@@ -177,28 +271,43 @@ pub(super) async fn resize_session(
             Json(serde_json::json!({"error": msg})),
         );
     }
-    let entry = match state.sessions.get(&session_id) {
-        Some(e) => e,
-        None => return session_not_found(),
-    };
-    let session = entry.lock();
-    if let Err(e) = session.master.resize(PtySize {
-        rows: body.rows,
-        cols: body.cols,
-        pixel_width: 0,
-        pixel_height: 0,
-    }) {
-        return (
+    // Shared core: grid-before-SIGWINCH ordering + same-dims no-op (056-7545).
+    match crate::pty::resize_session_core(&state, &session_id, body.rows, body.cols) {
+        Ok(Some(frame)) => {
+            crate::pty::send_grid_frame(&state, &session_id, frame);
+            (StatusCode::OK, Json(serde_json::json!({"ok": true})))
+        }
+        Ok(None) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))),
+        Err(e) if e.starts_with("Session not found") => session_not_found(),
+        Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": format!("Resize failed: {}", e)})),
-        );
+        ),
     }
-    drop(session);
-    // Resize VT log buffer to match new terminal dimensions.
-    if let Some(vt_log) = state.vt_log_buffers.get(&session_id) {
-        vt_log.lock().resize(body.rows, body.cols);
+}
+
+/// Dump the raw PTY byte flight recorder for a session (story 056-7545).
+/// Returns the most recent raw output bytes (pre-transform, up to 2 MiB) as
+/// binary, for offline replay via `replay_capture_from_env`.
+pub(super) async fn get_raw_ring(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+) -> impl IntoResponse {
+    match state.pty_raw_rings.get(&session_id) {
+        Some(ring) => {
+            let bytes: Vec<u8> = {
+                let ring = ring.lock();
+                ring.iter().copied().collect()
+            };
+            (
+                StatusCode::OK,
+                [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+                bytes,
+            )
+                .into_response()
+        }
+        None => session_not_found().into_response(),
     }
-    (StatusCode::OK, Json(serde_json::json!({"ok": true})))
 }
 
 pub(super) async fn get_output(
@@ -297,11 +406,13 @@ pub(super) async fn close_session(
             let _ = session.writer.write_all(&[0x03]);
             let _ = session.writer.flush();
         }
-        crate::pty::cleanup_session(&session_id, &state);
-
-        // Broadcast to SSE/WebSocket consumers
+        // Broadcast to SSE/WebSocket consumers BEFORE cleanup: cleanup_session reaps
+        // this session's per-session PTY channel, so the closed frame must be emitted
+        // while the channel still exists. broadcast keeps the buffered frame available
+        // to live subscribers even after the sender is dropped, so they drain the
+        // "closed" frame and THEN see the channel close (no lost close notification).
         tracing::info!(source = "session", session_id = %session_id, "Session closed: explicit close");
-        let _ = state.event_bus.send(crate::state::AppEvent::SessionClosed {
+        state.emit_pty_event(crate::state::AppEvent::SessionClosed {
             session_id: session_id.clone(),
             reason: "explicit_close".to_string(),
         });
@@ -315,6 +426,8 @@ pub(super) async fn close_session(
                 }),
             );
         }
+
+        crate::pty::cleanup_session(&session_id, &state);
 
         (StatusCode::OK, Json(serde_json::json!({"ok": true})))
     } else {
@@ -333,8 +446,14 @@ pub(super) fn spawn_pty_session(
     rows: u16,
     cols: u16,
     worktree: Option<crate::state::WorktreeInfo>,
+    requested_id: Option<String>,
 ) -> Result<String, (StatusCode, Json<serde_json::Value>)> {
-    let session_id = Uuid::new_v4().to_string();
+    // Honor a client-provided id when it is non-empty and not already taken
+    // (browser duplicate-tab fix); otherwise mint a fresh one.
+    let session_id = match requested_id {
+        Some(id) if !id.is_empty() && !state.sessions.contains_key(&id) => id,
+        _ => Uuid::new_v4().to_string(),
+    };
     let pty_system = native_pty_system();
 
     let pair = pty_system
@@ -424,6 +543,7 @@ pub(super) fn spawn_pty_session(
             session_id: session_id.clone(),
             cwd: cwd.clone(),
             agent_type: None,
+            display_name: None,
         });
 
     #[cfg(feature = "desktop")]
@@ -437,6 +557,7 @@ pub(super) fn spawn_pty_session(
             serde_json::json!({
                 "session_id": session_id,
                 "cwd": cwd,
+                "display_name": null,
             }),
         );
     }
@@ -465,7 +586,7 @@ pub(super) async fn create_session(
     }
     let shell = resolve_shell(body.shell);
 
-    match spawn_pty_session(state, shell, body.cwd, rows, cols, None) {
+    match spawn_pty_session(state, shell, body.cwd, rows, cols, None, body.session_id) {
         Ok(session_id) => (
             StatusCode::CREATED,
             Json(serde_json::json!({"session_id": session_id})),
@@ -540,6 +661,130 @@ pub(super) async fn get_foreground_process(
     }
 }
 
+// --- PTY/terminal read-state queries (browser/remote parity, story 062). ---
+// These mirror the desktop-only `#[tauri::command]`s in pty.rs by reading the
+// same AppState directly — the commands themselves are cfg'd out of the remote
+// build, so the access logic is replicated here (as get_foreground_process does).
+
+/// Shell state atom ("busy"/"idle") for a session, or null if never produced output.
+pub(super) async fn get_shell_state(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+) -> impl IntoResponse {
+    let value = state
+        .shell_states
+        .get(&session_id)
+        .map(|atom| crate::pty::shell_state_str(atom.load(Ordering::Relaxed)).to_string());
+    Json(serde_json::json!({ "state": value }))
+}
+
+/// Last relevant user prompt (>= 10 words) for a session, or null.
+pub(super) async fn get_last_prompt(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+) -> impl IntoResponse {
+    let value = state.last_prompts.get(&session_id).map(|v| v.clone());
+    Json(serde_json::json!({ "prompt": value }))
+}
+
+/// Current input-line buffer content for a session (empty string if not typing).
+pub(super) async fn get_input_buffer_content(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+) -> impl IntoResponse {
+    let content = state
+        .input_buffers
+        .get(&session_id)
+        .map(|entry| entry.lock().content())
+        .unwrap_or_default();
+    Json(serde_json::json!({ "content": content }))
+}
+
+/// PID of the deepest foreground process (PGID on Unix), or null.
+pub(super) async fn get_session_leaf_pid(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+) -> impl IntoResponse {
+    let pid = (|| -> Option<u32> {
+        let entry = state.sessions.get(&session_id)?;
+        let session = entry.value().lock();
+        #[cfg(not(windows))]
+        {
+            let pgid = session.master.process_group_leader()?;
+            Some(pgid as u32)
+        }
+        #[cfg(windows)]
+        {
+            let child_pid = session._child.process_id()?;
+            crate::pty::deepest_descendant_pid(child_pid)
+        }
+    })();
+    Json(serde_json::json!({ "pid": pid }))
+}
+
+/// Non-shell foreground process name (e.g. "htop", "node"), or null if the
+/// foreground is the shell itself. Used to warn before closing a tab.
+pub(super) async fn has_foreground_process(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+) -> impl IntoResponse {
+    const SHELLS: &[&str] = &[
+        "zsh",
+        "bash",
+        "fish",
+        "sh",
+        "dash",
+        "ksh",
+        "csh",
+        "tcsh",
+        "nushell",
+        "nu",
+        "powershell",
+        "pwsh",
+        "cmd",
+    ];
+    let process = (|| -> Option<String> {
+        let entry = state.sessions.get(&session_id)?;
+        #[cfg(not(windows))]
+        let pid = {
+            let session = entry.value().lock();
+            let pgid = session.master.process_group_leader()?;
+            u32::try_from(pgid).ok()?
+        };
+        #[cfg(windows)]
+        let pid = {
+            let session = entry.value().lock();
+            let child_pid = session._child.process_id()?;
+            crate::pty::deepest_descendant_pid(child_pid)?
+        };
+        let name = crate::pty::process_name_from_pid(pid)?;
+        if SHELLS.contains(&name.as_str()) {
+            None
+        } else {
+            Some(name)
+        }
+    })();
+    Json(serde_json::json!({ "process": process }))
+}
+
+/// Set a session's tab-visibility flag (focus/blur tracking; wakes on Unix).
+pub(super) async fn set_session_visible(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+    Json(body): Json<SessionVisibleRequest>,
+) -> impl IntoResponse {
+    state
+        .session_visibility
+        .insert(session_id.clone(), body.visible);
+    #[cfg(unix)]
+    if body.visible
+        && let Err(e) = crate::pty::wake_session(&state, &session_id)
+    {
+        tracing::warn!(session_id, error = %e, "Wake on focus failed");
+    }
+    (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
+}
+
 pub(super) async fn get_stats(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     Json(state.orchestrator_stats())
 }
@@ -574,16 +819,54 @@ pub(super) async fn create_session_with_worktree(
         branch: Some(body.branch_name),
         create_branch: true,
     };
-    let worktree =
-        match crate::worktree::create_worktree_internal(&state.worktrees_dir, &wt_config, None) {
-            Ok(wt) => wt,
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"error": e})),
-                );
-            }
-        };
+    let worktrees_dir = crate::worktree::resolve_worktree_dir_for_repo(
+        std::path::Path::new(&wt_config.base_repo),
+        &state.worktrees_dir,
+    );
+    let wt_config_bg = wt_config.clone();
+    let worktree = match tokio::task::spawn_blocking(move || {
+        crate::worktree::create_worktree_with_stale_recovery(&worktrees_dir, &wt_config_bg, None)
+    })
+    .await
+    {
+        Ok(Ok(wt)) => wt,
+        Ok(Err(e)) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e})),
+            );
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("task panic: {e}")})),
+            );
+        }
+    };
+
+    let base_repo = wt_config.base_repo.clone();
+    state.invalidate_repo_caches(&base_repo);
+    let worktree_path_str = worktree.path.to_string_lossy().to_string();
+    let worktree_branch = worktree.branch.clone();
+    let branch_name = worktree_branch.clone().unwrap_or_default();
+    let _ = state
+        .event_bus
+        .send(crate::state::AppEvent::WorktreeCreated {
+            repo_path: base_repo.clone(),
+            branch: branch_name.clone(),
+            worktree_path: worktree_path_str.clone(),
+        });
+    #[cfg(feature = "desktop")]
+    if let Some(handle) = state.app_handle.read().as_ref() {
+        let _ = handle.emit(
+            "worktree-created",
+            serde_json::json!({
+                "repo_path": &base_repo,
+                "branch": &branch_name,
+                "worktree_path": &worktree_path_str,
+            }),
+        );
+    }
 
     let rows = body.config.rows.unwrap_or(24);
     let cols = body.config.cols.unwrap_or(80);
@@ -594,8 +877,6 @@ pub(super) async fn create_session_with_worktree(
         );
     }
     let shell = resolve_shell(body.config.shell);
-    let worktree_path_str = worktree.path.to_string_lossy().to_string();
-    let worktree_branch = worktree.branch.clone();
 
     match spawn_pty_session(
         state,
@@ -604,15 +885,42 @@ pub(super) async fn create_session_with_worktree(
         rows,
         cols,
         Some(worktree),
+        body.config.session_id,
     ) {
-        Ok(session_id) => (
-            StatusCode::CREATED,
-            Json(serde_json::json!({
+        Ok(session_id) => {
+            let mut response = serde_json::json!({
                 "session_id": session_id,
-                "worktree_path": worktree_path_str,
+                "worktree_path": worktree_path_str.clone(),
                 "branch": worktree_branch,
-            })),
-        ),
+            });
+            let repo_for_script = base_repo.clone();
+            let cwd_for_script = worktree_path_str;
+            if let Some(script) = tokio::task::spawn_blocking(move || {
+                crate::config::resolve_effective_setup_script(&repo_for_script)
+            })
+            .await
+            .ok()
+            .flatten()
+            {
+                match tokio::task::spawn_blocking(move || {
+                    crate::worktree::run_setup_script(script, cwd_for_script)
+                })
+                .await
+                {
+                    Ok(Ok(result)) => {
+                        response["setup_script"] = result;
+                    }
+                    Ok(Err(e)) => {
+                        response["setup_script_error"] = serde_json::json!(e);
+                    }
+                    Err(e) => {
+                        response["setup_script_error"] =
+                            serde_json::json!(format!("task panic: {e}"));
+                    }
+                }
+            }
+            (StatusCode::CREATED, Json(response))
+        }
         Err(err) => err,
     }
 }
@@ -655,6 +963,7 @@ pub(super) async fn ws_stream(
 /// `{"type":"log","lines":[...],"offset":N}`
 ///
 /// Client → server messages are written to the PTY as input.
+
 async fn handle_ws_session(
     socket: WebSocket,
     session_id: String,
@@ -677,8 +986,8 @@ async fn handle_ws_session(
         return;
     }
 
-    // Subscribe to broadcast channel for parsed events (filtered by session_id)
-    let mut event_rx = state.event_bus.subscribe();
+    // Subscribe to this session's per-session PTY event channel (no global-bus fan-out).
+    let mut event_rx = state.subscribe_pty_events(&session_id);
 
     // Snapshot the ring buffer and register the live mpsc subscription
     // atomically while holding ring.lock(). The PTY writer takes the same
@@ -745,16 +1054,8 @@ async fn handle_ws_session(
                 result = event_rx.recv() => {
                     match result {
                         Ok(event) => {
-                            // Filter: only forward events for this session
-                            let matches = match &event {
-                                crate::state::AppEvent::PtyParsed { session_id: sid, .. } => sid == &sid_for_events,
-                                crate::state::AppEvent::PtyExit { session_id: sid } => sid == &sid_for_events,
-                                crate::state::AppEvent::SessionClosed { session_id: sid, .. } => sid == &sid_for_events,
-                                _ => false,
-                            };
-                            if !matches { continue; }
-
-                            // Extract the inner payload (without serde tag wrapping)
+                            // Per-session channel — every event belongs to this session.
+                            // Extract the inner payload (without serde tag wrapping).
                             let payload = match &event {
                                 crate::state::AppEvent::PtyParsed { parsed, .. } => {
                                     serde_json::json!({"type": "parsed", "event": parsed})
@@ -846,7 +1147,10 @@ async fn handle_ws_log_session(
                 let frame = if total > skip_offset {
                     let (lines, _) = buf.lines_since_owned(skip_offset, usize::MAX);
                     if !lines.is_empty() {
-                        Some(serde_json::json!({"type": "log", "lines": lines, "offset": skip_offset}).to_string())
+                        // total_lines is the post-read cursor (monotonic): the client
+                        // stores it and passes it back as ?offset= on reconnect, so the
+                        // next catch-up resumes from here instead of replaying from mount.
+                        Some(serde_json::json!({"type": "log", "lines": lines, "offset": skip_offset, "total_lines": total}).to_string())
                     } else {
                         None
                     }
@@ -871,7 +1175,7 @@ async fn handle_ws_log_session(
     let state_poll = state.clone();
     let send_task = tokio::spawn(async move {
         let mut offset = initial_offset;
-        let mut event_rx = state_poll.event_bus.subscribe();
+        let mut event_rx = state_poll.subscribe_pty_events(&sid_poll);
         let mut prev_screen_hash: u64 = 0;
         // Dedup: only send state frames when SessionState actually changed
         let mut prev_state: Option<crate::state::SessionState> = None;
@@ -905,14 +1209,15 @@ async fn handle_ws_log_session(
                     }
                 }
                 event = event_rx.recv() => {
-                    let Ok(event) = event else { continue };
-                    let is_relevant = match &event {
-                        crate::state::AppEvent::PtyParsed { session_id: sid, .. }
-                        | crate::state::AppEvent::PtyExit { session_id: sid }
-                        | crate::state::AppEvent::SessionClosed { session_id: sid, .. } => sid == &sid_poll,
-                        _ => false,
-                    };
-                    if is_relevant { LoopAction::Event } else { LoopAction::Skip }
+                    // Per-session channel — every delivered event belongs to this
+                    // session, so any Ok triggers a state re-check. On Closed the
+                    // channel was reaped (session gone): exit instead of spinning on
+                    // the immediately-ready error arm. Lagged is a transient skip.
+                    match event {
+                        Ok(_) => LoopAction::Event,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => LoopAction::SessionGone,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => LoopAction::Skip,
+                    }
                 }
             };
 
@@ -975,7 +1280,9 @@ async fn handle_ws_log_session(
                 let screen_changed = screen_hash != prev_screen_hash && !screen_lines.is_empty();
                 // Send frame if there are new log lines OR screen content changed
                 if !lines.is_empty() || screen_changed {
-                    let mut frame = serde_json::json!({"type": "log", "offset": offset});
+                    // total_lines = post-read monotonic cursor (== offset when no new
+                    // lines). The client tracks it for reconnect resume — see catch-up above.
+                    let mut frame = serde_json::json!({"type": "log", "offset": offset, "total_lines": new_offset});
                     if !lines.is_empty() {
                         frame["lines"] = serde_json::json!(lines);
                     }
@@ -1077,8 +1384,8 @@ async fn handle_ws_grid_session(socket: WebSocket, session_id: String, state: Ar
         return;
     }
 
-    // Subscribe to event bus for parsed events (exit, closed, etc.)
-    let mut event_rx = state.event_bus.subscribe();
+    // Subscribe to this session's per-session PTY event channel (exit, closed, parsed).
+    let mut event_rx = state.subscribe_pty_events(&session_id);
     let sid_for_events = session_id.clone();
 
     let send_task = tokio::spawn(async move {
@@ -1101,14 +1408,7 @@ async fn handle_ws_grid_session(socket: WebSocket, session_id: String, state: Ar
                 result = event_rx.recv() => {
                     match result {
                         Ok(event) => {
-                            let matches = match &event {
-                                crate::state::AppEvent::PtyParsed { session_id: sid, .. } => sid == &sid_for_events,
-                                crate::state::AppEvent::PtyExit { session_id: sid } => sid == &sid_for_events,
-                                crate::state::AppEvent::SessionClosed { session_id: sid, .. } => sid == &sid_for_events,
-                                _ => false,
-                            };
-                            if !matches { continue; }
-
+                            // Per-session channel — every event belongs to this session.
                             let payload = match &event {
                                 crate::state::AppEvent::PtyParsed { parsed, .. } => {
                                     serde_json::json!({"type": "parsed", "event": parsed})
@@ -1228,6 +1528,26 @@ pub(super) async fn terminal_scroll_to(
     (StatusCode::OK, Json(serde_json::json!({"ok": true})))
 }
 
+/// Coalesced scroll to an absolute display offset. Mirrors the desktop
+/// `terminal_scroll_to_offset` Tauri command: records the target and marks the
+/// grid dirty so the frame ticker applies it under its own lock — taking NO vt
+/// lock here, so scrolling never contends with the PTY output processor. The
+/// ticker emits the resulting frame over the same bus SSE/WS feeds in browser
+/// mode. This is the wheel + scrollbar-drag scroll path.
+pub(super) async fn terminal_scroll_to_offset(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+    Json(body): Json<super::types::TerminalScrollToOffsetRequest>,
+) -> impl IntoResponse {
+    if let Some(p) = state.pending_scroll.get(&session_id) {
+        p.store(body.offset as i64, std::sync::atomic::Ordering::Relaxed);
+    }
+    if let Some(d) = state.grid_frame_dirty.get(&session_id) {
+        d.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    (StatusCode::OK, Json(serde_json::json!({"ok": true})))
+}
+
 pub(super) async fn terminal_scroll_info(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
@@ -1296,6 +1616,47 @@ pub(super) async fn terminal_get_row_text(
     Json(serde_json::json!({"text": text})).into_response()
 }
 
+/// Extract the text of a selection span (start/end row/col) from the grid.
+pub(super) async fn terminal_get_selection_text(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+    Query(q): Query<super::types::TerminalSelectionQuery>,
+) -> impl IntoResponse {
+    let Some(vt) = state.vt_log_buffers.get(&session_id) else {
+        return session_not_found().into_response();
+    };
+    let text = vt
+        .lock()
+        .grid_get_selection_text(q.start_row, q.start_col, q.end_row, q.end_col);
+    Json(serde_json::json!({"text": text})).into_response()
+}
+
+/// Unwrap a soft-wrapped logical line at `row` → `[logicalStartRow, text]`.
+pub(super) async fn terminal_get_logical_line(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+    Query(q): Query<super::types::TerminalRowQuery>,
+) -> impl IntoResponse {
+    let Some(vt) = state.vt_log_buffers.get(&session_id) else {
+        return session_not_found().into_response();
+    };
+    let (idx, text) = vt.lock().grid_get_logical_line(q.row);
+    Json(serde_json::json!([idx, text])).into_response()
+}
+
+/// Hyperlink span at a cell → `[startCol, endCol, url]` or null (OSC 8).
+pub(super) async fn terminal_hyperlink_span(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+    Query(q): Query<super::types::TerminalCellQuery>,
+) -> impl IntoResponse {
+    let span = state
+        .vt_log_buffers
+        .get(&session_id)
+        .and_then(|vt| vt.lock().grid_hyperlink_span(q.row, q.col));
+    Json(serde_json::json!(span))
+}
+
 pub(super) async fn terminal_get_lines(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
@@ -1310,6 +1671,27 @@ pub(super) async fn terminal_get_lines(
     };
     let lines = vt.lock().grid_get_lines(query.start, query.end);
     Json(serde_json::json!({"lines": lines})).into_response()
+}
+
+/// Styled row range as packed bytes (same encoding as the desktop
+/// `terminal_styled_rows` command). Fills the CanvasTerminal client-side row
+/// cache so scrolled-back history renders during smooth scroll in browser mode
+/// instead of showing blank rows. Returns an empty array when the session or
+/// range is gone — the frontend treats that as "nothing to cache".
+pub(super) async fn terminal_styled_rows(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+    Query(query): Query<super::types::TerminalStyledRowsQuery>,
+) -> impl IntoResponse {
+    let bytes = state
+        .vt_log_buffers
+        .get(&session_id)
+        .map(|vt| {
+            vt.lock()
+                .grid_serialize_styled_range(query.start, query.count)
+        })
+        .unwrap_or_default();
+    Json(bytes)
 }
 
 pub(super) async fn terminal_get_cursor_line(
@@ -1362,6 +1744,34 @@ pub(super) async fn terminal_request_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mcp_regression_input_bookkeeping_releases_guard_before_pending_delivery() {
+        let state = super::super::tests::test_state();
+        let session_id = "deadlock-regression";
+        state.session_states.insert(
+            session_id.to_string(),
+            crate::state::SessionState {
+                agent_type: Some("codex".to_string()),
+                ..Default::default()
+            },
+        );
+        state
+            .pending_injections
+            .entry(session_id.to_string())
+            .or_default()
+            .push_back("queued message".to_string());
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            apply_input_bookkeeping(&state, session_id, "\r");
+            let _ = done_tx.send(());
+        });
+
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("input bookkeeping must not self-deadlock while checking pending delivery");
+    }
 
     // is_separator_line tests live in chrome.rs (canonical location)
 
@@ -1617,6 +2027,7 @@ mod tests {
             24,
             80,
             None,
+            None,
         );
 
         let session_id = match result {
@@ -1635,5 +2046,65 @@ mod tests {
         tx.send(vec![1, 2, 3]).unwrap();
         rx.changed().await.unwrap();
         assert_eq!(*rx.borrow_and_update(), vec![1, 2, 3]);
+    }
+
+    /// A client-provided session id is honored (browser duplicate-tab fix): the
+    /// browser pre-registers this id locally so the session-created echo is
+    /// recognized as locally-created.
+    #[tokio::test]
+    async fn spawn_pty_session_honors_requested_id() {
+        let state = super::super::tests::test_state();
+        let result = super::spawn_pty_session(
+            state.clone(),
+            std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()),
+            None,
+            24,
+            80,
+            None,
+            Some("client-provided-id".to_string()),
+        );
+        match result {
+            Ok(id) => assert_eq!(
+                id, "client-provided-id",
+                "must honor the client-provided id"
+            ),
+            Err(_) => {} // PTY unavailable in CI — skip gracefully
+        }
+    }
+
+    /// A requested id that collides with an existing session is rejected in
+    /// favor of a fresh uuid, so a buggy/duplicate client id can never hijack
+    /// or alias another live session.
+    #[tokio::test]
+    async fn spawn_pty_session_rejects_duplicate_requested_id() {
+        let state = super::super::tests::test_state();
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+        let first = match super::spawn_pty_session(
+            state.clone(),
+            shell.clone(),
+            None,
+            24,
+            80,
+            None,
+            Some("dup-id".to_string()),
+        ) {
+            Ok(id) => id,
+            Err(_) => return, // PTY unavailable in CI — skip gracefully
+        };
+        assert_eq!(first, "dup-id");
+        let second = super::spawn_pty_session(
+            state.clone(),
+            shell,
+            None,
+            24,
+            80,
+            None,
+            Some("dup-id".to_string()),
+        )
+        .expect("second spawn should succeed with a fresh id");
+        assert_ne!(
+            second, "dup-id",
+            "duplicate requested id must fall back to a fresh uuid"
+        );
     }
 }

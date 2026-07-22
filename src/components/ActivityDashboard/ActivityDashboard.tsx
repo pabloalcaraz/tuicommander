@@ -1,10 +1,12 @@
 import { type Component, createEffect, createMemo, createSignal, For, onCleanup, Show } from "solid-js";
 import { activityDashboardStore } from "../../stores/activityDashboard";
 import { globalWorkspaceStore } from "../../stores/globalWorkspace";
+import { registerModal } from "../../stores/modalStack";
 import { rateLimitStore } from "../../stores/ratelimit";
 import { repositoriesStore } from "../../stores/repositories";
 import { terminalsStore } from "../../stores/terminals";
-import { projectName, terminalStatusLabel } from "../../utils/activitySnapshot";
+import { effectiveActivityState, isActivityWorking, projectName, reconcileActivityOrder, terminalStatusLabel } from "../../utils/activitySnapshot";
+import { navigateToTerminal } from "../../utils/navigateToTerminal";
 import { getRepoColor } from "../../utils/repoColor";
 import { formatRelativeTime } from "../../utils/time";
 import { GlobeIcon } from "../GlobeIcon";
@@ -13,6 +15,7 @@ import s from "./ActivityDashboard.module.css";
 
 export const statusClasses = {
 	rateLimited: s.statusRateLimited,
+	error: s.statusError,
 	waiting: s.statusWaiting,
 	working: s.statusWorking,
 	idle: s.statusIdle,
@@ -62,6 +65,7 @@ export type TerminalRow = {
 	status: { label: string; className: string };
 	isWorking: boolean;
 	lastDataAt: number | null;
+	idleSince: number | null;
 	lastPrompt: string | null;
 	agentIntent: string | null;
 	currentTask: string | null;
@@ -90,28 +94,18 @@ export const ActivityDashboard: Component<ActivityDashboardProps> = (props) => {
 		onCleanup(() => clearInterval(interval));
 	});
 
-	// Keyboard navigation
+	// Escape-to-close is handled centrally (stores/modalStack): registering routes
+	// Escape to the dashboard close AND stops it reaching the terminal underneath.
 	createEffect(() => {
 		if (!isOpen()) return;
-
-		const handleKeydown = (e: KeyboardEvent) => {
-			if (e.key === "Escape") {
-				e.preventDefault();
-				e.stopPropagation();
-				activityDashboardStore.close();
-			}
-		};
-
-		document.addEventListener("keydown", handleKeydown, true);
-		onCleanup(() => document.removeEventListener("keydown", handleKeydown, true));
+		registerModal(() => activityDashboardStore.close());
 	});
 
 	const handleRowClick = (termId: string) => {
 		if (props.onSelect) {
 			props.onSelect(termId);
 		} else {
-			terminalsStore.setActive(termId);
-			requestAnimationFrame(() => terminalsStore.get(termId)?.ref?.focus());
+			navigateToTerminal(termId);
 		}
 		if (!props.embedded) activityDashboardStore.close();
 	};
@@ -123,7 +117,21 @@ export const ActivityDashboard: Component<ActivityDashboardProps> = (props) => {
 		const term = terminalsStore.get(id);
 		if (!term) return null;
 		const isRL = !!(term.sessionId && rateLimitStore.isRateLimited(term.sessionId));
-		const status = terminalStatusLabel(term.shellState, term.awaitingInput, isRL, statusClasses);
+		const effectiveState = effectiveActivityState(
+			term.shellState,
+			term.awaitingInput,
+			isRL,
+			term.agentState,
+			term.backgroundWork,
+		);
+		const status = terminalStatusLabel(
+			term.shellState,
+			term.awaitingInput,
+			isRL,
+			statusClasses,
+			term.agentState,
+			term.backgroundWork,
+		);
 		const repoPath = repositoriesStore.getRepoPathForTerminal(id);
 		return {
 			id,
@@ -132,8 +140,9 @@ export const ActivityDashboard: Component<ActivityDashboardProps> = (props) => {
 			projectColor: repoPath ? getRepoColor(repoPath) : undefined,
 			agent: term.agentType || "shell",
 			status,
-			isWorking: isRL || !!term.awaitingInput || terminalsStore.isBusy(id),
+			isWorking: isActivityWorking(effectiveState),
 			lastDataAt: terminalsStore.getLastDataAt(id),
+			idleSince: term.idleSince,
 			lastPrompt: term.lastPrompt,
 			agentIntent: term.agentIntent,
 			// Claude Code spinner verbs are decorative garbage — suppress them
@@ -144,38 +153,18 @@ export const ActivityDashboard: Component<ActivityDashboardProps> = (props) => {
 		};
 	};
 
-	/** Order-only snapshot: working terminals first, idle second.
-	 *  Working group keeps store insertion order (stable); idle group sorts by most recent activity. */
-	const liveOrder = createMemo(() => {
-		const ids = terminalsStore.getAttachedIds();
-		const items = ids.map((id, idx) => {
+	// Persistent display spine: each terminal keeps its slot so rows never
+	// reshuffle while their working/idle state is unchanged. A terminal moves ONLY
+	// when it crosses the working/idle boundary (a real state change). No timers,
+	// no recency re-sort — position is a pure function of (working, spine index).
+	const spine: string[] = [];
+	const orderedIds = createMemo(() => {
+		const isWorking = (id: string): boolean => {
 			const term = terminalsStore.get(id);
 			const isRL = !!(term?.sessionId && rateLimitStore.isRateLimited(term.sessionId));
-			const working = isRL || !!term?.awaitingInput || terminalsStore.isBusy(id);
-			return { id, working, idx, t: terminalsStore.getLastDataAt(id) ?? 0 };
-		});
-		const workingItems = items.filter((x) => x.working).sort((a, b) => a.idx - b.idx);
-		const idleItems = items.filter((x) => !x.working).sort((a, b) => b.t - a.t);
-		return [...workingItems, ...idleItems].map((x) => x.id);
-	});
-
-	// Snapshot sort order every 10s so rows don't reshuffle on every mutation.
-	// New items/removals trigger an immediate snapshot via count change.
-	const [orderSnapshot, setOrderSnapshot] = createSignal<string[]>(liveOrder());
-	createEffect(() => {
-		if (!isOpen()) return;
-		const interval = setInterval(() => setOrderSnapshot(liveOrder()), 10_000);
-		onCleanup(() => clearInterval(interval));
-	});
-
-	let prevCount = liveOrder().length;
-	const orderedIds = createMemo(() => {
-		const current = liveOrder();
-		if (current.length !== prevCount) {
-			prevCount = current.length;
-			setOrderSnapshot(current);
-		}
-		return orderSnapshot();
+			return !!term && isActivityWorking(effectiveActivityState(term.shellState, term.awaitingInput, isRL, term.agentState, term.backgroundWork));
+		};
+		return reconcileActivityOrder(spine, terminalsStore.getAttachedIds(), isWorking);
 	});
 
 	const storeTerminals = createMemo(() => orderedIds().map(buildRow).filter(Boolean) as TerminalRow[]);
@@ -202,7 +191,10 @@ export const ActivityDashboard: Component<ActivityDashboardProps> = (props) => {
 
 				<For each={terminals()}>
 					{(term) => (
-						<div class={`${s.row} ${term.isActive ? s.activeRow : ""}`} onClick={() => handleRowClick(term.id)}>
+						<div
+							class={`${s.row} ${term.isActive ? s.activeRow : ""} ${!term.isWorking ? s.idleRow : ""}`}
+							onClick={() => handleRowClick(term.id)}
+						>
 							<div class={s.rowMain}>
 								<div class={s.nameCell}>
 									<span class={s.termName}>{term.name}</span>
@@ -214,7 +206,7 @@ export const ActivityDashboard: Component<ActivityDashboardProps> = (props) => {
 								</div>
 								<span class={s.agent}>{term.agent}</span>
 								<span class={`${s.status} ${term.status.className}`}>{term.status.label}</span>
-								<span class={s.lastActivity}>{formatRelativeTime(term.lastDataAt)}</span>
+								<span class={s.lastActivity}>{term.isWorking ? "" : formatRelativeTime(term.idleSince)}</span>
 								<button
 									class={`${s.promoteBtn} ${term.isPromoted ? s.promoted : ""}`}
 									title={term.isPromoted ? "Remove from Global Workspace" : "Promote to Global Workspace"}

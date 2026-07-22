@@ -32,6 +32,11 @@ interface UIStoreState {
 	 *  (not persisted) — toggled via Cmd+Alt+Enter. */
 	focusMode: boolean;
 
+	/** Repo filter: when true the sidebar shows only repositories that have at
+	 *  least one open terminal. Session-only (not persisted) — toggled from the
+	 *  toolbar filter icon next to the sidebar collapse button. */
+	repoFilterActiveOnly: boolean;
+
 	// Sidebar width
 	sidebarWidth: number;
 
@@ -71,6 +76,11 @@ interface UIStoreState {
 	// path instead of the active repo. Used by "Open Folder…" / "Open Path…".
 	fileBrowserExternalRoot: string | null;
 
+	// Content-search request nonce (ephemeral) — bumped by the
+	// `toggle-file-browser-content-search` shortcut (Cmd+Shift+F). FileBrowserPanel
+	// watches it and switches its local searchMode to "content" + focuses the input.
+	fileBrowserContentSearchNonce: number;
+
 	// Active dropdown (mutually exclusive)
 	activeDropdown: "ide" | "font" | "agent" | null;
 
@@ -88,6 +98,7 @@ function createUIStore() {
 	const [state, setState] = createStore<UIStoreState>({
 		sidebarVisible: true,
 		focusMode: false,
+		repoFilterActiveOnly: false,
 		sidebarWidth: SIDEBAR_DEFAULT_WIDTH,
 		markdownPanelVisible: false,
 		notesPanelVisible: false,
@@ -108,6 +119,7 @@ function createUIStore() {
 		diffViewMode: "split" as DiffViewMode,
 		fileBrowserViewMode: "flat" as "flat" | "tree",
 		fileBrowserExternalRoot: null,
+		fileBrowserContentSearchNonce: 0,
 		activeDropdown: null,
 		isLoading: false,
 		loadingMessage: "",
@@ -284,6 +296,13 @@ function createUIStore() {
 			setState("fileBrowserExternalRoot", path);
 		},
 
+		// Open the file browser (if not already) and ask it to enter content-search
+		// mode. Bumping the nonce lets the panel react even when it's already visible.
+		requestFileBrowserContentSearch(): void {
+			setExclusivePanel("fileBrowserPanelVisible", true);
+			setState("fileBrowserContentSearchNonce", (n) => n + 1);
+		},
+
 		// Panel toggles — mutually exclusive
 		toggleMarkdownPanel(): void {
 			setExclusivePanel("markdownPanelVisible", !state.markdownPanelVisible);
@@ -417,6 +436,15 @@ function createUIStore() {
 		// Focus mode (session-only, not persisted)
 		toggleFocusMode(): void {
 			setState("focusMode", (v) => !v);
+		},
+
+		// Repo filter (session-only, not persisted)
+		toggleRepoFilter(): void {
+			setState("repoFilterActiveOnly", (v) => !v);
+		},
+
+		setRepoFilterActiveOnly(active: boolean): void {
+			setState("repoFilterActiveOnly", active);
 		},
 
 		setSidebarVisible(visible: boolean): void {

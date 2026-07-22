@@ -7,6 +7,7 @@ import { dictationStore, WHISPER_LANGUAGES } from "../../stores/dictation";
 import { cx } from "../../utils";
 import { KeyComboCapture } from "../shared/KeyComboCapture";
 import d from "./DictationSettings.module.css";
+import { SettingSlider } from "./SettingFields";
 import s from "./Settings.module.css";
 
 /** Single model row in the model selector list */
@@ -50,7 +51,10 @@ const ModelRow: Component<{ model: ModelInfo }> = (props) => {
 				<Show when={isDownloading()}>
 					<div class={d.downloadProgress}>
 						<div class={d.progressBar}>
-							<div class={d.progressFill} style={{ width: `${dictationStore.state.downloadPercent}%` }} />
+							<div
+								class={d.progressFill}
+								style={{ transform: `scaleX(${dictationStore.state.downloadPercent / 100})` }}
+							/>
 						</div>
 						<span class={d.progressText}>{dictationStore.state.downloadPercent}%</span>
 					</div>
@@ -192,28 +196,19 @@ export const DictationSettings: Component = () => {
 			</div>
 
 			{/* Long-press threshold */}
-			<div class={s.group}>
-				<label>{t("dictation.longPressLabel", "Long-press threshold")}</label>
-				<div style={{ display: "flex", "align-items": "center", gap: "8px" }}>
-					<input
-						type="range"
-						min={0}
-						max={1000}
-						step={50}
-						value={dictationStore.state.longPressMs}
-						onInput={(e) => dictationStore.setLongPressMs(Number(e.currentTarget.value))}
-					/>
-					<span style={{ "min-width": "50px", "text-align": "right" }}>
-						{dictationStore.state.longPressMs === 0 ? "Instant" : `${dictationStore.state.longPressMs}ms`}
-					</span>
-				</div>
-				<p class={s.hint}>
-					{t(
-						"dictation.longPressHint",
-						"How long to hold the key before dictation starts. 0 = instant (no short-press pass-through), higher = fewer accidental triggers.",
-					)}
-				</p>
-			</div>
+			<SettingSlider
+				label={t("dictation.longPressLabel", "Long-press threshold")}
+				value={dictationStore.state.longPressMs}
+				onChange={(v) => dictationStore.setLongPressMs(v)}
+				min={0}
+				max={1000}
+				step={50}
+				formatValue={(v) => (v === 0 ? t("dictation.instant", "Instant") : `${v}ms`)}
+				hint={t(
+					"dictation.longPressHint",
+					"How long to hold the key before dictation starts. 0 = instant (no short-press pass-through), higher = fewer accidental triggers.",
+				)}
+			/>
 
 			{/* Auto-send */}
 			<div class={s.group}>

@@ -5,7 +5,9 @@ import { appLogger } from "../../stores/appLogger";
 import { isDiffStatus } from "../../stores/diffTabs";
 import { promptLibraryStore } from "../../stores/promptLibrary";
 import { repositoriesStore } from "../../stores/repositories";
+import { toastsStore } from "../../stores/toasts";
 import { cx, globToRegex } from "../../utils";
+import { onClickKeyDown } from "../../utils/a11y";
 import { joinPath } from "../../utils/pathUtils";
 import { fileContextSmartMenuItem } from "../../utils/promptContext";
 import { ConfirmDialog } from "../ConfirmDialog";
@@ -92,6 +94,17 @@ function splitPath(filePath: string): { dir: string; base: string } {
 	const lastSep = Math.max(filePath.lastIndexOf("/"), filePath.lastIndexOf("\\"));
 	if (lastSep === -1) return { dir: "", base: filePath };
 	return { dir: filePath.slice(0, lastSep + 1), base: filePath.slice(lastSep + 1) };
+}
+
+/**
+ * True for collapsed untracked-directory entries. `git status` (without
+ * `--untracked-files=all`) reports a wholly-untracked directory as a single
+ * trailing-slash path (e.g. `providers/`) — that's not a file, so it has no
+ * diff. Until the backend expands these into individual files, treat them as
+ * non-diffable so a plain click doesn't open an empty "No changes" tab.
+ */
+export function isDirEntry(filePath: string): boolean {
+	return filePath.endsWith("/") || filePath.endsWith("\\");
 }
 
 export const ChangesTab: Component<ChangesTabProps> = (props) => {
@@ -217,6 +230,7 @@ export const ChangesTab: Component<ChangesTabProps> = (props) => {
 			await invoke("git_stage_files", { path: props.repoPath, files: [filePath] });
 		} catch (err) {
 			appLogger.error("git", `Failed to stage ${filePath}`, err);
+			toastsStore.add("Stage failed", `Could not stage "${filePath}": ${String(err)}`, "error", true);
 		}
 	}
 
@@ -226,6 +240,7 @@ export const ChangesTab: Component<ChangesTabProps> = (props) => {
 			await invoke("git_unstage_files", { path: props.repoPath, files: [filePath] });
 		} catch (err) {
 			appLogger.error("git", `Failed to unstage ${filePath}`, err);
+			toastsStore.add("Unstage failed", `Could not unstage "${filePath}": ${String(err)}`, "error", true);
 		}
 	}
 
@@ -240,6 +255,7 @@ export const ChangesTab: Component<ChangesTabProps> = (props) => {
 			repositoriesStore.bumpRevision(props.repoPath);
 		} catch (err) {
 			appLogger.error("git", `Failed to discard ${filePath}`, err);
+			toastsStore.add("Discard failed", `Could not discard "${filePath}": ${String(err)}`, "error", true);
 		}
 	}
 
@@ -251,6 +267,7 @@ export const ChangesTab: Component<ChangesTabProps> = (props) => {
 			await invoke("git_stage_files", { path: props.repoPath, files });
 		} catch (err) {
 			appLogger.error("git", "Failed to stage all files", err);
+			toastsStore.add("Stage failed", `Could not stage all files: ${String(err)}`, "error", true);
 		}
 	}
 
@@ -262,6 +279,7 @@ export const ChangesTab: Component<ChangesTabProps> = (props) => {
 			await invoke("git_unstage_files", { path: props.repoPath, files });
 		} catch (err) {
 			appLogger.error("git", "Failed to unstage all files", err);
+			toastsStore.add("Unstage failed", `Could not unstage all files: ${String(err)}`, "error", true);
 		}
 	}
 
@@ -277,11 +295,12 @@ export const ChangesTab: Component<ChangesTabProps> = (props) => {
 			repositoriesStore.bumpRevision(props.repoPath); // see discardFile (#1378-ce1c)
 		} catch (err) {
 			appLogger.error("git", "Failed to discard all files", err);
+			toastsStore.add("Discard failed", `Could not discard all files: ${String(err)}`, "error", true);
 		}
 	}
 
 	function openDiff(file: FileEntry, section: "staged" | "unstaged") {
-		if (!props.repoPath || !isDiffStatus(file.status)) return;
+		if (!props.repoPath || !isDiffStatus(file.status) || isDirEntry(file.path)) return;
 		props.onOpenDiff(
 			props.repoPath,
 			file.path,
@@ -339,6 +358,7 @@ export const ChangesTab: Component<ChangesTabProps> = (props) => {
 			setSelectedKeys(new Set<string>());
 		} catch (err) {
 			appLogger.error("git", "Failed to stage selected files", err);
+			toastsStore.add("Stage failed", `Could not stage selected files: ${String(err)}`, "error", true);
 		}
 	}
 
@@ -351,6 +371,7 @@ export const ChangesTab: Component<ChangesTabProps> = (props) => {
 			setSelectedKeys(new Set<string>());
 		} catch (err) {
 			appLogger.error("git", "Failed to unstage selected files", err);
+			toastsStore.add("Unstage failed", `Could not unstage selected files: ${String(err)}`, "error", true);
 		}
 	}
 
@@ -367,6 +388,7 @@ export const ChangesTab: Component<ChangesTabProps> = (props) => {
 			repositoriesStore.bumpRevision(props.repoPath); // see discardFile (#1378-ce1c)
 		} catch (err) {
 			appLogger.error("git", "Failed to discard selected files", err);
+			toastsStore.add("Discard failed", `Could not discard selected files: ${String(err)}`, "error", true);
 		}
 	}
 
@@ -401,7 +423,7 @@ export const ChangesTab: Component<ChangesTabProps> = (props) => {
 				},
 			});
 		}
-		if (isDiffStatus(file.status)) {
+		if (isDiffStatus(file.status) && !isDirEntry(file.path)) {
 			items.push({ label: "View Diff", shortcut: "Enter", action: () => openDiff(file, section) });
 		}
 		if (unstagedPaths.length > 0) {
@@ -850,7 +872,13 @@ export const ChangesTab: Component<ChangesTabProps> = (props) => {
 
 			{/* STAGED section */}
 			<Show when={filteredStaged().length > 0}>
-				<div class={s.sectionHeader} onClick={() => setStagedExpanded((v) => !v)}>
+				<div
+					class={s.sectionHeader}
+					role="button"
+					tabIndex={0}
+					onClick={() => setStagedExpanded((v) => !v)}
+					onKeyDown={onClickKeyDown(() => setStagedExpanded((v) => !v))}
+				>
 					<span class={cx(s.chevron, !stagedExpanded() && s.chevronCollapsed)}>&#x25BC;</span>
 					<span class={s.sectionLabel}>Staged</span>
 					<span class={s.sectionCount}>
@@ -874,7 +902,13 @@ export const ChangesTab: Component<ChangesTabProps> = (props) => {
 
 			{/* CHANGES (unstaged + untracked) section */}
 			<Show when={filteredUnstaged().length > 0}>
-				<div class={s.sectionHeader} onClick={() => setUnstagedExpanded((v) => !v)}>
+				<div
+					class={s.sectionHeader}
+					role="button"
+					tabIndex={0}
+					onClick={() => setUnstagedExpanded((v) => !v)}
+					onKeyDown={onClickKeyDown(() => setUnstagedExpanded((v) => !v))}
+				>
 					<span class={cx(s.chevron, !unstagedExpanded() && s.chevronCollapsed)}>&#x25BC;</span>
 					<span class={s.sectionLabel}>Changes (unstaged)</span>
 					<span class={s.sectionCount}>

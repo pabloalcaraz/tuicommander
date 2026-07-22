@@ -1,4 +1,5 @@
-import { type Component, createEffect, onCleanup, Show } from "solid-js";
+import { type Component, createEffect, createSignal, onCleanup, Show } from "solid-js";
+import { registerModal } from "../../stores/modalStack";
 import d from "../shared/dialog.module.css";
 
 export interface ConfirmDialogProps {
@@ -7,9 +8,17 @@ export interface ConfirmDialogProps {
 	message: string;
 	confirmLabel?: string;
 	cancelLabel?: string;
+	/** Optional middle button (e.g. "Don't Save"). Rendered only when set. */
+	discardLabel?: string;
 	kind?: "warning" | "info" | "error";
+	/** Which button Enter activates. Defaults to "confirm". */
+	defaultButton?: "confirm" | "cancel";
+	/** When set, auto-clicks the cancel button after this many ms, showing a countdown on its label. */
+	autoCancelMs?: number;
 	onClose: () => void;
 	onConfirm: () => void;
+	/** Invoked when the middle discard button is clicked. */
+	onDiscard?: () => void;
 }
 
 /**
@@ -18,16 +27,44 @@ export interface ConfirmDialogProps {
  * Uses shared dialog CSS module for consistent dark-theme styling.
  */
 export const ConfirmDialog: Component<ConfirmDialogProps> = (props) => {
+	// Countdown until auto-cancel — null when no auto-cancel is configured.
+	const [remaining, setRemaining] = createSignal<number | null>(null);
+
+	createEffect(() => {
+		if (!props.visible || !props.autoCancelMs) {
+			setRemaining(null);
+			return;
+		}
+		let left = Math.ceil(props.autoCancelMs / 1000);
+		setRemaining(left);
+		const interval = setInterval(() => {
+			left -= 1;
+			setRemaining(left);
+			if (left <= 0) {
+				clearInterval(interval);
+				props.onClose();
+			}
+		}, 1000);
+		onCleanup(() => clearInterval(interval));
+	});
+
 	createEffect(() => {
 		if (!props.visible) return;
 
+		// Escape-to-close is handled centrally (stores/modalStack): registering routes
+		// Escape to props.onClose AND stops it reaching the terminal underneath.
+		registerModal(props.onClose);
+
 		const handleKeydown = (e: KeyboardEvent) => {
-			if (e.key === "Escape") {
+			if (e.key === "Enter") {
 				e.preventDefault();
-				props.onClose();
-			} else if (e.key === "Enter") {
-				e.preventDefault();
-				props.onConfirm();
+				// Enter activates the configured default button. Destructive dialogs
+				// point it at Cancel so an accidental Enter takes the safe path.
+				if ((props.defaultButton ?? "confirm") === "cancel") {
+					props.onClose();
+				} else {
+					props.onConfirm();
+				}
 			}
 		};
 
@@ -57,7 +94,13 @@ export const ConfirmDialog: Component<ConfirmDialogProps> = (props) => {
 					<div class={d.actions}>
 						<button class={d.cancelBtn} onClick={props.onClose}>
 							{props.cancelLabel ?? "Cancel"}
+							{remaining() !== null ? ` (${remaining()})` : ""}
 						</button>
+						<Show when={props.discardLabel}>
+							<button class={d.cancelBtn} onClick={() => props.onDiscard?.()}>
+								{props.discardLabel}
+							</button>
+						</Show>
 						<button class={d.primaryBtn} onClick={props.onConfirm}>
 							{props.confirmLabel ?? "OK"}
 						</button>

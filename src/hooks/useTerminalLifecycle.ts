@@ -1,3 +1,4 @@
+import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { createMemo, createSignal } from "solid-js";
 import { invoke } from "../invoke";
 import { appLogger } from "../stores/appLogger";
@@ -7,7 +8,10 @@ import { mdTabsStore } from "../stores/mdTabs";
 import { paneLayoutStore } from "../stores/paneLayout";
 import { currentBranchKey, repositoriesStore } from "../stores/repositories";
 import { settingsStore } from "../stores/settings";
+import { tabOrderingStore } from "../stores/tabOrdering";
 import { terminalsStore } from "../stores/terminals";
+import { readClipboard, writeClipboard } from "../utils/clipboard";
+import { navigateToTerminal } from "../utils/navigateToTerminal";
 import { assignTabToActiveGroup } from "../utils/paneTabAssign";
 import { filterValidTerminals } from "../utils/terminalFilter";
 
@@ -23,6 +27,7 @@ export interface TerminalLifecycleDeps {
 	};
 	dialogs: {
 		confirmCloseTerminal: (name: string) => Promise<boolean>;
+		confirmSaveChanges: (fileName: string) => Promise<"confirm" | "cancel" | "discard">;
 		confirm: (options: {
 			title: string;
 			message: string;
@@ -142,14 +147,13 @@ export function useTerminalLifecycle(deps: TerminalLifecycleDeps) {
 		if (id.startsWith("edit-")) {
 			const tab = editorTabsStore.get(id);
 			if (!skipConfirm && tab?.isDirty) {
-				const confirmed = await deps.dialogs.confirm({
-					title: "Unsaved changes",
-					message: `"${tab.fileName}" has unsaved changes.\nClose without saving?`,
-					okLabel: "Close without saving",
-					cancelLabel: "Cancel",
-					kind: "warning",
-				});
-				if (!confirmed) return;
+				const choice = await deps.dialogs.confirmSaveChanges(tab.fileName);
+				// Cancel keeps the tab open; Save persists then closes; Don't Save discards.
+				if (choice === "cancel") return;
+				if (choice === "confirm") {
+					const handle = editorTabsStore.getHandle<{ save?: () => Promise<void> }>(id);
+					if (handle?.save) await handle.save();
+				}
 			}
 			selectAfterNonTerminalClose(editorTabsStore, id);
 			editorTabsStore.remove(id);
@@ -179,8 +183,8 @@ export function useTerminalLifecycle(deps: TerminalLifecycleDeps) {
 			const windowLabel = terminalsStore.state.detachedWindows[id];
 			terminalsStore.reattach(id);
 			if (windowLabel) {
-				import("@tauri-apps/api/webviewWindow")
-					.then(({ WebviewWindow }) => WebviewWindow.getByLabel(windowLabel).then((w) => w?.close()))
+				WebviewWindow.getByLabel(windowLabel)
+					.then((w) => w?.close())
 					.catch((err) =>
 						appLogger.warn("terminal", `Failed to close floating window ${windowLabel} on tab close`, err),
 					);
@@ -274,43 +278,43 @@ export function useTerminalLifecycle(deps: TerminalLifecycleDeps) {
 			return;
 		}
 		const ids = filterValidTerminals(repositoriesStore.getActiveTerminals(), terminalsStore.getIds());
-		for (const id of ids) {
-			if (id !== keepId) {
-				await closeTerminal(id, true);
+		const results = await Promise.allSettled(ids.filter((id) => id !== keepId).map((id) => closeTerminal(id, true)));
+		for (const result of results) {
+			if (result.status === "rejected") {
+				appLogger.warn("terminal", "closeOtherTabs: failed to close terminal", result.reason);
 			}
 		}
 		handleTerminalSelect(keepId);
 	};
 
 	const closeTabsToRight = async (afterId: string) => {
-		if (afterId.startsWith("diff-")) {
-			const ids = diffTabsStore.getIds();
+		const store = afterId.startsWith("diff-")
+			? diffTabsStore
+			: afterId.startsWith("md-")
+				? mdTabsStore
+				: afterId.startsWith("edit-")
+					? editorTabsStore
+					: null;
+		if (store) {
+			const ids = store.getIds();
 			const idx = ids.indexOf(afterId);
-			for (const id of ids.slice(idx + 1)) {
-				diffTabsStore.remove(id);
+			const toRemove = ids.slice(idx + 1);
+			const activeId = store.state.activeId;
+			const wasActiveRemoved = activeId !== null && toRemove.includes(activeId);
+			for (const id of toRemove) {
+				store.remove(id);
 			}
-			return;
-		}
-		if (afterId.startsWith("md-")) {
-			const ids = mdTabsStore.getIds();
-			const idx = ids.indexOf(afterId);
-			for (const id of ids.slice(idx + 1)) {
-				mdTabsStore.remove(id);
-			}
-			return;
-		}
-		if (afterId.startsWith("edit-")) {
-			const ids = editorTabsStore.getIds();
-			const idx = ids.indexOf(afterId);
-			for (const id of ids.slice(idx + 1)) {
-				editorTabsStore.remove(id);
-			}
+			// remove() nulls activeId when it closes the active tab — keep the anchor tab focused
+			if (wasActiveRemoved) handleTerminalSelect(afterId);
 			return;
 		}
 		const ids = filterValidTerminals(repositoriesStore.getActiveTerminals(), terminalsStore.getIds());
 		const idx = ids.indexOf(afterId);
-		for (const id of ids.slice(idx + 1)) {
-			await closeTerminal(id, true);
+		const results = await Promise.allSettled(ids.slice(idx + 1).map((id) => closeTerminal(id, true)));
+		for (const result of results) {
+			if (result.status === "rejected") {
+				appLogger.warn("terminal", "closeTabsToRight: failed to close terminal", result.reason);
+			}
 		}
 	};
 
@@ -343,11 +347,33 @@ export function useTerminalLifecycle(deps: TerminalLifecycleDeps) {
 		return filterValidTerminals(repositoriesStore.getActiveTerminals(), terminalsStore.getIds());
 	});
 
+	/** Tab IDs that prev/next cycles through. Terminals only by default; when the
+	 *  `tabCyclingAllTypes` setting is on, include diff/md/editor tabs too, ordered
+	 *  via the shared tabOrdering primitive (same one TabBar uses in free mode). */
+	const cycleTabIds = (): string[] => {
+		const terminals = terminalIds();
+		if (!settingsStore.state.tabCyclingAllTypes) return terminals;
+		const branchKey = currentBranchKey() ?? null;
+		const union = new Set<string>([
+			...terminals,
+			...diffTabsStore.getVisibleIds(branchKey),
+			...mdTabsStore.getVisibleIds(branchKey),
+			...editorTabsStore.getVisibleIds(branchKey),
+		]);
+		return tabOrderingStore.getOrdered(union);
+	};
+
 	const navigateTab = (direction: "prev" | "next") => {
-		const ids = terminalIds();
+		const ids = cycleTabIds();
 		if (ids.length <= 1) return;
 
-		const currentIndex = ids.indexOf(terminalsStore.state.activeId || "");
+		const activeId =
+			terminalsStore.state.activeId ||
+			diffTabsStore.state.activeId ||
+			mdTabsStore.state.activeId ||
+			editorTabsStore.state.activeId ||
+			"";
+		const currentIndex = ids.indexOf(activeId);
 		if (currentIndex === -1) return;
 
 		let newIndex: number;
@@ -399,7 +425,7 @@ export function useTerminalLifecycle(deps: TerminalLifecycleDeps) {
 						.join("\n")
 				: "";
 			if (selection) {
-				await navigator.clipboard.writeText(selection);
+				await writeClipboard(selection);
 				deps.setStatusInfo("Copied to clipboard");
 			}
 		} catch (err) {
@@ -409,11 +435,10 @@ export function useTerminalLifecycle(deps: TerminalLifecycleDeps) {
 
 	const pasteToTerminal = async () => {
 		try {
-			const text = await navigator.clipboard.readText();
+			const text = await readClipboard();
 			const active = terminalsStore.getActive();
 			if (active?.ref && text) {
-				const payload = text.includes("\n") ? `\x1b[200~${text}\x1b[201~` : text;
-				active.ref.write(payload);
+				active.ref.paste(text);
 			}
 		} catch (err) {
 			appLogger.error("terminal", "Failed to paste", err);
@@ -466,32 +491,7 @@ export function useTerminalLifecycle(deps: TerminalLifecycleDeps) {
 			terminalsStore.setActive(null);
 			activateInPaneGroup(id, "editor");
 		} else {
-			// Switch repo/branch context if the terminal belongs to a different one
-			const repoPath = repositoriesStore.getRepoPathForTerminal(id);
-			if (repoPath) {
-				const repo = repositoriesStore.state.repositories[repoPath];
-				if (repo) {
-					// Find which branch owns this terminal
-					for (const [branchName, branch] of Object.entries(repo.branches)) {
-						if (branch.terminals.includes(id)) {
-							if (repositoriesStore.state.activeRepoPath !== repoPath) {
-								repositoriesStore.setActive(repoPath);
-							}
-							if (repo.activeBranch !== branchName) {
-								repositoriesStore.setActiveBranch(repoPath, branchName);
-							}
-							break;
-						}
-					}
-				}
-			}
-			terminalsStore.setActive(id);
-			diffTabsStore.setActive(null);
-			mdTabsStore.setActive(null);
-			editorTabsStore.setActive(null);
-			activateInPaneGroup(id, "terminal");
-			const terminal = terminalsStore.get(id);
-			terminal?.ref?.focus();
+			navigateToTerminal(id);
 		}
 	};
 

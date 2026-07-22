@@ -9,7 +9,9 @@ import { repositoriesStore } from "../../stores/repositories";
 import { settingsStore } from "../../stores/settings";
 import { terminalsStore } from "../../stores/terminals";
 import { toastsStore } from "../../stores/toasts";
+import { writeClipboard } from "../../utils/clipboard";
 import { attachIframeKeyForwarder } from "../../utils/iframeKeyForwarder";
+import { IFRAME_SEARCH_SCRIPT } from "../../utils/iframeSearch";
 import { assignTabToActiveGroup } from "../../utils/paneTabAssign";
 import { ContextMenu, createContextMenu } from "../ContextMenu/ContextMenu";
 import { PLUGIN_BASE_CSS } from "./pluginBaseStyles";
@@ -94,11 +96,29 @@ function extractThemeObject(): Record<string, string> {
 	return theme;
 }
 
-/** Inject theme CSS variables and base stylesheet into HTML before </head> (or prepend if no </head>) */
-function injectThemeVars(html: string): string {
+/**
+ * Inject theme CSS variables, the base stylesheet, and the SDK/search scripts
+ * into HTML before </head> (or prepend if no </head>).
+ *
+ * `selfStyled` decides the base sheet and is derived from the tab's SOURCE, not
+ * by sniffing the HTML. A plugin dashboard legitimately ships its own
+ * supplementary `<style>` for layout yet still relies on PLUGIN_BASE_CSS for
+ * typography/theme; content sniffing conflated the two and dropped the base
+ * sheet, rendering dashboards serif-on-white.
+ *
+ *  - Plugin dashboards (SDK `addPluginPanel`) → selfStyled=false → the base
+ *    sheet is forced on so the shared `.dashboard`/`.dash-*` classes render.
+ *  - Design/preview tabs (MCP `ui action=tab html=…` / `file://`, #080) →
+ *    selfStyled=true → the base sheet is omitted so a self-styled white page
+ *    keeps its own background, color and typography.
+ *
+ * Theme vars and the SDK/search scripts are injected in both cases — they only
+ * define CSS vars / add behavior.
+ */
+export function injectThemeVars(html: string, selfStyled: boolean): string {
 	const themeStyle = extractThemeVars();
-	const baseStyle = `<style id="tuic-base">${PLUGIN_BASE_CSS}</style>`;
-	const injection = baseStyle + themeStyle + TUIC_SDK_SCRIPT;
+	const baseStyle = selfStyled ? "" : `<style id="tuic-base">${PLUGIN_BASE_CSS}</style>`;
+	const injection = baseStyle + themeStyle + TUIC_SDK_SCRIPT + IFRAME_SEARCH_SCRIPT;
 	const headClose = html.indexOf("</head>");
 	if (headClose >= 0) {
 		return html.slice(0, headClose) + injection + html.slice(headClose);
@@ -175,14 +195,14 @@ export const PluginPanel: Component<PluginPanelProps> = (props) => {
 		iframeRef?.contentWindow?.postMessage(data, "*");
 	};
 
-	/** Inject SDK script into a URL-mode iframe (same-origin only) */
+	/** Inject SDK + search scripts into a URL-mode iframe (same-origin only) */
 	const injectSdkIntoUrlIframe = () => {
 		try {
 			const doc = iframeRef?.contentDocument;
 			if (doc && !doc.getElementById("tuic-sdk")) {
 				const range = doc.createRange();
 				range.selectNode(doc.head || doc.documentElement);
-				const frag = range.createContextualFragment(TUIC_SDK_SCRIPT);
+				const frag = range.createContextualFragment(TUIC_SDK_SCRIPT + IFRAME_SEARCH_SCRIPT);
 				(doc.head || doc.documentElement).appendChild(frag);
 			}
 		} catch {
@@ -213,6 +233,10 @@ export const PluginPanel: Component<PluginPanelProps> = (props) => {
 		if (!iframeRef || !props.tab.url || props.tab.url.startsWith("file://")) return;
 		try {
 			if (iframeRef.contentDocument) {
+				// about:blank is same-origin too — it's our OWN reset target, not an
+				// escape. Without this check the guard re-fires on the about:blank load
+				// it just triggered, looping (reset → load → guard → reset → …).
+				if (iframeRef.contentDocument.location?.href === "about:blank") return;
 				appLogger.error("plugin", `Panel '${props.tab.id}' navigated to app origin — blocked`);
 				iframeRef.src = "about:blank";
 			}
@@ -295,7 +319,7 @@ export const PluginPanel: Component<PluginPanelProps> = (props) => {
 			}
 			case "tuic:clipboard": {
 				const text = typeof data.text === "string" ? data.text : "";
-				navigator.clipboard.writeText(text).catch((err) => {
+				writeClipboard(text).catch((err) => {
 					appLogger.warn("plugin", `tuic:clipboard failed: ${err}`);
 				});
 				return;
@@ -415,14 +439,14 @@ export const PluginPanel: Component<PluginPanelProps> = (props) => {
 					const withBase = content.includes("<head")
 						? content.replace(/<head([^>]*)>/i, `<head$1>${baseTag}`)
 						: `${baseTag}${content}`;
-					setSrcdoc(injectThemeVars(withBase));
+					setSrcdoc(injectThemeVars(withBase, props.tab.selfStyled ?? false));
 				})
 				.catch((err) => {
 					appLogger.error("plugin", `Failed to read file:// tab content: ${filePath}`, err);
 					setSrcdoc(`<body style="color:#e55;padding:24px">Failed to load ${filePath}: ${err}</body>`);
 				});
 		} else if (!url) {
-			setSrcdoc(injectThemeVars(props.tab.html));
+			setSrcdoc(injectThemeVars(props.tab.html, props.tab.selfStyled ?? false));
 		}
 	});
 

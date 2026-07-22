@@ -27,7 +27,7 @@
   position: relative;
   justify-content: flex-end;
   padding-right: 10px;
-  gap: 8px;
+  gap: 2px;
   -webkit-app-region: drag;
 }
 
@@ -37,6 +37,22 @@
   transform: translateX(-50%);
   pointer-events: none;
   user-select: none;
+}
+
+.appNameFull {
+  display: block;
+}
+
+.appNameShort {
+  display: none;
+}
+
+.narrowSidebar .appNameFull {
+  display: none;
+}
+
+.narrowSidebar .appNameShort {
+  display: block;
 }
 
 :global(.platform-macos) .left {
@@ -64,7 +80,8 @@
 }
 
 /* Sidebar toggle */
-.sidebarToggle {
+.sidebarToggle,
+.filterToggle {
   width: 26px;
   height: 26px;
   display: flex;
@@ -72,7 +89,7 @@
   justify-content: center;
   background: transparent;
   border: none;
-  border-radius: var(--radius-lg);
+  border-radius: var(--radius-sm);
   color: var(--fg-secondary);
   font-size: var(--font-xl);
   cursor: pointer;
@@ -80,9 +97,18 @@
   -webkit-app-region: no-drag;
 }
 
-.sidebarToggle:hover {
+.sidebarToggle:hover,
+.filterToggle:hover {
   background: var(--bg-tertiary);
   color: var(--fg-primary);
+}
+
+/* Repo filter icon — loud accent state when "active only" is engaged so it is
+   obvious repos are being filtered. */
+.filterToggleActive,
+.filterToggleActive:hover {
+  background: var(--accent);
+  color: var(--text-on-accent);
 }
 
 /* Branch button */
@@ -94,7 +120,7 @@
   padding: 0 10px;
   background: transparent;
   border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
+  border-radius: var(--radius-sm);
   cursor: pointer;
   font-family: inherit;
   transition: background 0.15s ease;
@@ -178,7 +204,7 @@
   min-width: 14px;
   height: 14px;
   padding: 0 3px;
-  border-radius: var(--radius-lg);
+  border-radius: var(--radius-sm);
   background: var(--accent);
   color: var(--text-on-accent);
   font-size: var(--font-2xs);
@@ -198,7 +224,7 @@
   max-width: 320px;
   background: var(--bg-secondary);
   border: 1px solid var(--border);
-  border-radius: var(--radius-xl);
+  border-radius: var(--radius-md);
   box-shadow: var(--shadow-dropdown);
   z-index: 100;
   max-height: calc(100vh - 60px);
@@ -316,11 +342,11 @@
 }
 
 /* Notification type colors */
-.notifMerged .notifIcon { color: #a371f7; }
+.notifMerged .notifIcon { color: var(--merged); }
 .notifClosed .notifIcon { color: var(--fg-muted); }
 .notifBlocked .notifIcon { color: var(--error); }
 .notifCiFailed .notifIcon { color: var(--error); }
-.notifChanges .notifIcon { color: #d29922; }
+.notifChanges .notifIcon { color: var(--changes); }
 .notifReady .notifIcon { color: var(--success); }
 
 /* Activity Center — generic plugin sections */
@@ -481,6 +507,38 @@
 
 .lastItemBtn:hover {
   background: var(--bg-tertiary);
+}
+
+/* Severity tints — the pill is a notification, not a neutral button: make the
+   outcome readable at a glance (red = failure, green = success, amber = attention). */
+.lastItemError {
+  border-color: var(--error);
+  color: var(--error);
+  background: color-mix(in srgb, var(--error) 12%, transparent);
+}
+
+.lastItemError:hover {
+  background: color-mix(in srgb, var(--error) 22%, transparent);
+}
+
+.lastItemSuccess {
+  border-color: var(--success);
+  color: var(--success);
+  background: color-mix(in srgb, var(--success) 12%, transparent);
+}
+
+.lastItemSuccess:hover {
+  background: color-mix(in srgb, var(--success) 22%, transparent);
+}
+
+.lastItemWarn {
+  border-color: var(--changes);
+  color: var(--changes);
+  background: color-mix(in srgb, var(--changes) 12%, transparent);
+}
+
+.lastItemWarn:hover {
+  background: color-mix(in srgb, var(--changes) 22%, transparent);
 }
 
 .lastItemIcon {

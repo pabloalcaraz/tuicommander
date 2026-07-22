@@ -30,16 +30,24 @@ jobs:
           git tag -f nightly
           git push origin nightly --force
 
-      - name: Delete old nightly assets
+      - name: Delete old nightly release (keep tag, refresh published_at)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Delete all existing assets from the nightly release so only the
-          # current build's artifacts remain after the build matrix completes.
-          gh release view nightly --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' 2>/dev/null | while read -r name; do
-            echo "Deleting $name"
-            gh release delete-asset nightly "$name" --repo "$GITHUB_REPOSITORY" --yes
-          done
+          # Delete the whole rolling nightly release (KEEPING the tag we just moved) so
+          # the build matrix's tauri-action recreates it fresh — resetting published_at
+          # to the current run time. The previous approach deleted only the ASSETS and
+          # left the release object intact; GitHub freezes published_at at the initial
+          # draft->published transition and NEVER refreshes it on tag moves, asset swaps,
+          # or note edits, so the public page showed a stale "released this Apr 13" date.
+          #
+          # Rejected alternative — PATCH the release to set published_at: the GitHub
+          # "Update a release" API does not accept published_at as a writable field, so
+          # delete+recreate is the only route that refreshes it. Do NOT revert this to an
+          # asset-only cleanup. --cleanup-tag=false preserves the nightly tag (and the
+          # stable /releases/tag/nightly URL); `|| true` tolerates the first-ever run
+          # when no release exists yet.
+          gh release delete nightly --repo "$GITHUB_REPOSITORY" --cleanup-tag=false --yes || true
 
   build:
     needs: cleanup
@@ -94,29 +102,30 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libasound2-dev mold
 
-      - name: Install Vulkan SDK (Windows)
-        if: matrix.platform == 'windows-latest'
-        uses: jakoch/install-vulkan-sdk-action@v1
-        with:
-          vulkan_version: 1.4.309.0
-          cache: true
-          stripdown: true
-
-      # Windows MAX_PATH workaround: whisper.cpp's vulkan-shaders-gen sub-build
-      # creates deeply nested TryCompile paths that exceed 260 chars. MSBuild's
-      # FileTracker uses legacy Win32 APIs that ignore LongPathsEnabled, so the
-      # only fix is to keep the target dir short. tauri-action honours
-      # CARGO_TARGET_DIR for artifact discovery (see tauri-action/src/utils.ts).
+      # Keep the Windows build/target dir short (C:/t): whisper.cpp's nested
+      # CMake TryCompile paths can exceed the 260-char MAX_PATH that MSBuild's
+      # FileTracker enforces. tauri-action honours CARGO_TARGET_DIR for artifact
+      # discovery (see tauri-action/src/utils.ts).
       - name: Short CARGO_TARGET_DIR (Windows)
         if: matrix.platform == 'windows-latest'
         shell: bash
         run: echo "CARGO_TARGET_DIR=C:/t" >> $GITHUB_ENV
 
+      # The windows-latest image (mid windows-2025/2026 migration) ships VS 18
+      # 2026, but the preinstalled CMake is too old to know that generator —
+      # whisper-rs-sys's build fails with "CMake Error: generator: Visual
+      # Studio 18 2026". Install the latest CMake, which recognises it.
+      - name: Upgrade CMake (Windows)
+        if: matrix.platform == 'windows-latest'
+        uses: lukka/get-cmake@latest
+
+      - uses: pnpm/action-setup@v4
+
       - name: Setup Node.js
         uses: actions/setup-node@v6
         with:
           node-version: 24
-          cache: npm
+          cache: pnpm
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -130,8 +139,24 @@ jobs:
           workspaces: './src-tauri -> target'
           cache-directories: ${{ matrix.platform == 'windows-latest' && 'C:/t' || '' }}
 
+      # A restored Windows build cache (C:/t) may hold a CMakeCache.txt from an
+      # older VS generator (e.g. VS 17 2022). When the runner image moves to a
+      # newer VS (18 2026), CMake aborts: "generator does not match the generator
+      # used previously". Drop the stale CMake config so whisper-rs-sys
+      # reconfigures against the current toolchain (sccache still caches the
+      # actual compiles, so the rebuild cost is minimal).
+      - name: Clear stale CMake cache (Windows)
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: |
+          if (Test-Path C:/t) {
+            Get-ChildItem -Path C:/t -Recurse -Force -ErrorAction SilentlyContinue |
+              Where-Object { $_.Name -eq 'CMakeCache.txt' -or $_.Name -eq 'CMakeFiles' } |
+              Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+          }
+
       - name: Install frontend dependencies
-        run: npm ci
+        run: pnpm install --frozen-lockfile
 
       - name: Import macOS signing certificate
         if: startsWith(matrix.platform, 'macos-')
@@ -197,7 +222,7 @@ jobs:
           CMAKE_C_FLAGS: ${{ matrix.label == 'macOS-ARM' && '-march=armv8.4-a' || matrix.label == 'Linux-x64' && '-fPIC' || matrix.label == 'Windows-x64' && '/Z7' || '' }}
           CMAKE_CXX_FLAGS: ${{ matrix.label == 'macOS-ARM' && '-march=armv8.4-a' || matrix.label == 'Linux-x64' && '-fPIC' || matrix.label == 'Windows-x64' && '/Z7' || '' }}
         with:
-          tauriScript: npx tauri
+          tauriScript: pnpm tauri
           tagName: nightly
           releaseName: 'TUICommander Nightly'
           releaseBody: |
@@ -264,6 +289,38 @@ jobs:
 
           gh release edit nightly --repo "$GITHUB_REPOSITORY" --notes-file "$NOTES"
           rm -f "$NOTES"
+
+      - name: Create versioned nightly release
+        if: needs.build.result == 'success'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION=$(python3 -c "import json; print(json.load(open('src-tauri/tauri.conf.json'))['version'])")
+
+          # Only create versioned release when version contains -nightly
+          if [[ "$VERSION" != *-nightly* ]]; then
+            echo "Version $VERSION is not a nightly — skipping"
+            exit 0
+          fi
+
+          # Strip timestamp suffix to get base tag (1.2.6-nightly.20260525.t1343 → 1.2.6-nightly)
+          BASE="${VERSION%%-nightly*}-nightly"
+          TAG="v${BASE}"
+
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" &>/dev/null; then
+            echo "Release $TAG already exists — skipping"
+            exit 0
+          fi
+
+          echo "Creating versioned release: $TAG"
+          git tag -f "$TAG"
+          git push origin "$TAG" --force
+
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "TUICommander $TAG" \
+            --notes "Nightly build from \`main\`. Download the latest rolling build from the [nightly release](https://github.com/sstraus/tuicommander/releases/tag/nightly)." \
+            --prerelease
 
   retry-failed:
     needs: build

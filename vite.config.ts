@@ -9,6 +9,7 @@ import { Features } from "lightningcss";
 
 // @ts-expect-error process is a nodejs global
 const host = process.env.TAURI_DEV_HOST;
+const typescriptWatchApi = import.meta.resolve("@typescript/typescript6");
 
 // Read app version from tauri.conf.json
 const tauriConf = JSON.parse(readFileSync("./src-tauri/tauri.conf.json", "utf-8"));
@@ -20,14 +21,27 @@ const gitHash = (() => {
 })();
 
 // https://vite.dev/config/
-export default defineConfig(async () => ({
+export default defineConfig(async ({ command }) => ({
   define: {
     __APP_VERSION__: JSON.stringify(tauriConf.version),
     __BUILD_GIT_HASH__: JSON.stringify(gitHash),
   },
   plugins: [
     solid(),
-    checker({ typescript: true }),
+    // The type-check overlay is only useful in the dev server (`vite` / `tauri
+    // dev`). One-shot builds run `tsc` up front (`pnpm build` = `tsc && vite
+    // build`, and `make check` runs it too), so keeping the checker in build
+    // mode just type-checks twice — skip it. Speeds up make dev/preview/build.
+    ...(command === "serve"
+      ? [
+          checker({
+            // TypeScript 7 intentionally ships without the JavaScript compiler
+            // API. Keep the native TS7 CLI for builds and use Microsoft's TS6
+            // compatibility package for the checker's watch API.
+            typescript: { typescriptPath: typescriptWatchApi },
+          }),
+        ]
+      : []),
     visualizer({ filename: "dist/bundle-stats.html", gzipSize: true }),
     purgecss({
       // Do NOT pass `content` — the plugin auto-scans the bundled JS output.
@@ -100,7 +114,7 @@ export default defineConfig(async () => ({
   clearScreen: false,
   // 2. tauri expects a fixed port, fail if that port is not available
   server: {
-    port: 1420,
+    port: 1421,
     strictPort: true,
     host: host || "127.0.0.1",
     hmr: host
@@ -111,8 +125,14 @@ export default defineConfig(async () => ({
         }
       : undefined,
     watch: {
-      // 3. tell Vite to ignore watching `src-tauri`
-      ignored: ["**/src-tauri/**"],
+      // 3. tell Vite to ignore watching `src-tauri`, `.claude`, and `.mdkb`.
+      //    Vite already ignores `.git`/`node_modules` by default; these are the
+      //    agent/tooling dirs it would otherwise watch. Worktrees under
+      //    `.claude/worktrees/` are full checkouts incl. `src/` (double-watch +
+      //    spurious reload on create/remove), and `.mdkb/` is written constantly
+      //    by mdkb (memory writes, code index) — both would churn the dev server
+      //    or trigger spurious full reloads mid-session.
+      ignored: ["**/src-tauri/**", "**/.claude/**", "**/.mdkb/**"],
     },
   },
 }));

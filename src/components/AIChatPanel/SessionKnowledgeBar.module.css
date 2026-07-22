@@ -33,11 +33,11 @@
 }
 
 .summaryToggle:hover {
-  background: var(--bg-hover);
+  background: var(--bg-highlight);
 }
 
 .caret {
-  color: var(--fg-tertiary);
+  color: var(--fg-muted);
   font-size: 10px;
   width: 10px;
   text-align: center;
@@ -57,7 +57,7 @@
 }
 
 .errCount {
-  color: var(--err);
+  color: var(--error);
 }
 
 .tuiMode {
@@ -80,7 +80,7 @@
 }
 
 .sectionLabel {
-  color: var(--fg-tertiary);
+  color: var(--fg-muted);
   font-size: 10px;
   text-transform: uppercase;
   letter-spacing: 0.04em;
@@ -104,23 +104,23 @@
 }
 
 .badgeOk {
-  background: color-mix(in srgb, var(--ok, #2ea043) 20%, transparent);
-  color: var(--ok, #2ea043);
+  background: color-mix(in srgb, var(--success) 20%, transparent);
+  color: var(--success);
 }
 
 .badgeErr {
-  background: color-mix(in srgb, var(--err, #d73a49) 20%, transparent);
-  color: var(--err, #d73a49);
+  background: color-mix(in srgb, var(--error) 20%, transparent);
+  color: var(--error);
 }
 
 .badgeInferred {
-  background: var(--bg-hover);
-  color: var(--fg-tertiary);
+  background: var(--bg-highlight);
+  color: var(--fg-muted);
 }
 
 .badgeTui {
-  background: color-mix(in srgb, var(--accent, #3b82f6) 20%, transparent);
-  color: var(--accent, #3b82f6);
+  background: color-mix(in srgb, var(--accent) 20%, transparent);
+  color: var(--accent);
 }
 
 .cmd {
@@ -134,7 +134,7 @@
 }
 
 .exit {
-  color: var(--fg-tertiary);
+  color: var(--fg-muted);
   font-family: var(--font-mono);
 }
 
@@ -154,5 +154,5 @@
 
 .historyBtn:hover {
   color: var(--fg-primary);
-  background: var(--bg-hover);
+  background: var(--bg-highlight);
 }

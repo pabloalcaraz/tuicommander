@@ -1,10 +1,12 @@
 import { type Component, createEffect, createSignal, Show } from "solid-js";
 import { t } from "../../i18n";
+import { invoke } from "../../invoke";
 import { shortenHomePath } from "../../platform";
 import { repoDefaultsStore } from "../../stores/repoDefaults";
 import { type RepoSettings, repoSettingsStore } from "../../stores/repoSettings";
 import { repositoriesStore } from "../../stores/repositories";
 import { settingsStore } from "../../stores/settings";
+import { toastsStore } from "../../stores/toasts";
 import { uiStore } from "../../stores/ui";
 import { isTauri } from "../../transport";
 import { pathBasename } from "../../utils/pathUtils";
@@ -28,7 +30,7 @@ import {
 import { ProvidersTab } from "./tabs/ProvidersTab";
 
 /** Context for initial selection when opening the panel */
-export type SettingsContext = { kind: "global" } | { kind: "repo"; repoPath: string };
+export type SettingsContext = { kind: "global" } | { kind: "repo"; repoPath: string; connectionId?: string };
 
 export interface SettingsPanelProps {
 	visible: boolean;
@@ -64,9 +66,10 @@ function defaultTab(ctx: SettingsContext): string {
 
 /** Build the full nav from global sections + configured repos */
 function buildNavItems(): SettingsShellTab[] {
-	const repos = repositoriesStore.state.repoOrder
-		.map((path) => repositoriesStore.state.repositories[path])
-		.filter(Boolean);
+	// All repos, including those nested in groups — grouped repos live in
+	// group.repoOrder, not state.repoOrder, so iterating repoOrder alone would
+	// hide them from the Settings nav. (#64)
+	const repos = repositoriesStore.getAllReposOrdered();
 
 	const items: SettingsShellTab[] = [...getGlobalTabs()];
 
@@ -110,6 +113,11 @@ export const SettingsPanel: Component<SettingsPanelProps> = (props) => {
 		return tab.startsWith("repo:") ? tab.slice(5) : null;
 	};
 
+	const activeConnectionId = (): string | undefined => {
+		const path = activeRepoPath();
+		return path ? repositoriesStore.getConnectionId(path) : undefined;
+	};
+
 	const repoSettings = (path: string) => repoSettingsStore.getOrCreate(path, shortenHomePath(path));
 
 	const updateRepoSetting =
@@ -120,6 +128,20 @@ export const SettingsPanel: Component<SettingsPanelProps> = (props) => {
 				repositoriesStore.setDisplayName(repoPath, value as string);
 			}
 		};
+
+	/** Write this repo's UI settings into a committable `.tuic.json` at its root */
+	const copyToProject = async (repoPath: string) => {
+		try {
+			await invoke("save_repo_local_config", { repoPath });
+			toastsStore.add(
+				t("settings.copyToProject.done", "Saved .tuic.json"),
+				t("settings.copyToProject.doneHint", "Repo settings written to the project root — commit to share"),
+				"info",
+			);
+		} catch (err) {
+			toastsStore.add(t("settings.copyToProject.failed", "Failed to write .tuic.json"), String(err), "error");
+		}
+	};
 
 	const footer = () => {
 		const path = activeRepoPath();
@@ -161,6 +183,22 @@ export const SettingsPanel: Component<SettingsPanelProps> = (props) => {
 						<>
 							<RepoWorktreeTab settings={settings} defaults={repoDefaultsStore.state} onUpdate={onUpdate} />
 							<RepoScriptsTab settings={settings} defaults={repoDefaultsStore.state} onUpdate={onUpdate} />
+							<Show when={isTauri()}>
+								<div class={s.section}>
+									<h3>{t("settings.copyToProject.heading", "Share with Team")}</h3>
+									<p class={s.hint}>
+										{t(
+											"settings.copyToProject.hint",
+											"Write this repo's worktree/branch settings to a .tuic.json in the project root. Commit it so teammates inherit the same defaults. Scripts are never exported.",
+										)}
+									</p>
+									<div class={s.actions}>
+										<button onClick={() => copyToProject(path)}>
+											{t("settings.copyToProject.button", "Copy settings to .tuic.json")}
+										</button>
+									</div>
+								</div>
+							</Show>
 						</>
 					);
 				}}
@@ -192,7 +230,7 @@ export const SettingsPanel: Component<SettingsPanelProps> = (props) => {
 				<ProvidersTab />
 			</Show>
 			<Show when={activeTab() === "agents"}>
-				<AgentsTab />
+				<AgentsTab connectionId={activeConnectionId()} />
 			</Show>
 			<Show when={activeTab() === "ai-chat" && settingsStore.isAiChatEnabled()}>
 				<AiChatTab />

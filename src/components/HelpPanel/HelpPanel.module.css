@@ -13,7 +13,7 @@
   max-width: 90vw;
   max-height: 80vh;
   background: var(--bg-secondary);
-  border-radius: var(--radius-xl);
+  border-radius: var(--radius-md);
   border: 1px solid var(--border);
   box-shadow: var(--shadow-popup);
   display: flex;
@@ -82,6 +82,30 @@
   margin: 0;
   font-size: var(--font-sm);
   color: var(--fg-muted);
+}
+
+.versionRow {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+}
+
+.copyVersionBtn {
+  padding: 2px 8px;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--fg-muted);
+  font-size: var(--font-sm);
+  font-family: var(--font-ui);
+  cursor: pointer;
+  transition: background 0.1s, color 0.1s;
+}
+
+.copyVersionBtn:hover {
+  background: var(--bg-tertiary);
+  color: var(--fg-primary);
 }
 
 .section {

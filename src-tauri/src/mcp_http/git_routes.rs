@@ -168,30 +168,18 @@ pub(super) async fn repo_merged_branches(
         return e.into_response();
     }
     let path = q.path;
-    // Check cache first (same pattern as Tauri command)
-    if let Some(cached) = crate::AppState::get_cached(
-        &state.git_cache.merged_branches,
-        &path,
-        crate::state::GIT_CACHE_TTL,
-    ) {
-        return (StatusCode::OK, Json(serde_json::json!(cached))).into_response();
-    }
-    let state_clone = state.clone();
-    let path_clone = path.clone();
+    // Coalesced + cached load (same cache + TTL as the Tauri command).
+    let cache = state.git_cache.merged_branches.clone();
+    let p = path.clone();
     match tokio::task::spawn_blocking(move || {
-        crate::git::get_merged_branches_impl(std::path::Path::new(&path_clone))
+        cache.try_get_with(p.clone(), || {
+            crate::git::get_merged_branches_impl(std::path::Path::new(&p)).map(std::sync::Arc::new)
+        })
     })
     .await
     {
-        Ok(Ok(branches)) => {
-            crate::AppState::set_cached(
-                &state_clone.git_cache.merged_branches,
-                path,
-                branches.clone(),
-            );
-            (StatusCode::OK, Json(serde_json::json!(branches))).into_response()
-        }
-        Ok(Err(e)) => err_500(&e),
+        Ok(Ok(branches)) => (StatusCode::OK, Json(serde_json::json!(*branches))).into_response(),
+        Ok(Err(e)) => err_500(&e.to_string()),
         Err(e) => err_500(&format!("Task failed: {e}")),
     }
 }
@@ -225,7 +213,11 @@ pub(super) async fn remote_url(Query(q): Query<PathQuery>) -> Response {
 }
 
 pub(super) async fn list_user_plugins_http() -> impl axum::response::IntoResponse {
-    Json(serde_json::json!(crate::plugins::list_user_plugins()))
+    // list_user_plugins() scans the plugin dir off disk — keep it off the runtime.
+    match tokio::task::spawn_blocking(crate::plugins::list_user_plugins).await {
+        Ok(plugins) => Json(serde_json::json!(plugins)).into_response(),
+        Err(e) => err_500(&format!("Task failed: {e}")),
+    }
 }
 
 // --- GitPanel commands ---
@@ -238,28 +230,18 @@ pub(super) async fn git_panel_context(
         return e.into_response();
     }
     let path = q.path.clone();
-    if let Some(cached) = crate::AppState::get_cached(
-        &state.git_cache.git_panel_context,
-        &path,
-        crate::state::GIT_CACHE_TTL,
-    ) {
-        return Json(cached).into_response();
-    }
-    let state_clone = state.clone();
-    let path_clone = path.clone();
+    let cache = state.git_cache.git_panel_context.clone();
+    let p = path.clone();
     match tokio::task::spawn_blocking(move || {
-        crate::git::get_git_panel_context_impl(std::path::Path::new(&path_clone))
+        cache.get_with(p.clone(), || {
+            std::sync::Arc::new(crate::git::get_git_panel_context_impl(
+                std::path::Path::new(&p),
+            ))
+        })
     })
     .await
     {
-        Ok(ctx) => {
-            crate::AppState::set_cached(
-                &state_clone.git_cache.git_panel_context,
-                path,
-                ctx.clone(),
-            );
-            Json(ctx).into_response()
-        }
+        Ok(ctx) => Json(&*ctx).into_response(),
         Err(e) => err_500(&format!("Task failed: {e}")),
     }
 }
@@ -510,5 +492,187 @@ pub(super) async fn file_blame_http(Query(q): Query<FileBlameQuery>) -> Response
     match crate::git::get_file_blame(path, file).await {
         Ok(lines) => Json(serde_json::json!(lines)).into_response(),
         Err(e) => err_500(&e),
+    }
+}
+
+// --- Git panel (story 064; browser/remote parity) ---
+// Reads call the cfg_attr commands / *_impl fns directly; mutations call the
+// non-gated *_impl + invalidate_repo_caches (mirroring the desktop wrappers).
+// update_from_base / switch_branch / merge_and_archive_worktree / run_diff_triage
+// are intentionally NOT mapped here (see todo.md).
+
+pub(super) async fn get_gutter_changes_http(Query(q): Query<GitGutterQuery>) -> Response {
+    if let Err(e) = validate_repo_path(&q.path) {
+        return e.into_response();
+    }
+    json_result(crate::git::get_gutter_changes(q.path, q.file, q.scope).await)
+}
+
+pub(super) async fn get_branches_detail_http(
+    axum::extract::State(state): axum::extract::State<std::sync::Arc<crate::AppState>>,
+    Query(q): Query<PathQuery>,
+) -> Response {
+    if let Err(e) = validate_repo_path(&q.path) {
+        return e.into_response();
+    }
+    json_result(crate::git::branches_detail_cached(&state, q.path).await)
+}
+
+pub(super) async fn get_recent_branches_http(Query(q): Query<GitRecentBranchesQuery>) -> Response {
+    if let Err(e) = validate_repo_path(&q.path) {
+        return e.into_response();
+    }
+    json_result(crate::git::get_recent_branches(q.path, q.limit).await)
+}
+
+pub(super) async fn get_branch_base_http(Query(q): Query<GitBranchBaseQuery>) -> Response {
+    if let Err(e) = validate_repo_path(&q.path) {
+        return e.into_response();
+    }
+    // Option<String> -> 200 with JSON null on miss; the TS mapping passes null through.
+    json_result(crate::git::get_branch_base(q.path, q.branch_name).await)
+}
+
+pub(super) async fn check_worktree_dirty_http(Query(q): Query<GitWorktreeDirtyQuery>) -> Response {
+    if let Err(e) = validate_repo_path(&q.repo_path) {
+        return e.into_response();
+    }
+    let GitWorktreeDirtyQuery {
+        repo_path,
+        branch_name,
+    } = q;
+    match tokio::task::spawn_blocking(move || {
+        crate::worktree::check_worktree_dirty(repo_path, branch_name)
+    })
+    .await
+    {
+        Ok(r) => json_result(r),
+        Err(e) => err_500(&format!("Task failed: {e}")),
+    }
+}
+
+pub(super) async fn list_base_ref_options_http(Query(q): Query<GitRepoQuery>) -> Response {
+    if let Err(e) = validate_repo_path(&q.repo_path) {
+        return e.into_response();
+    }
+    let repo_path = q.repo_path;
+    match tokio::task::spawn_blocking(move || crate::worktree::list_base_ref_options(repo_path))
+        .await
+    {
+        Ok(r) => json_result(r),
+        Err(e) => err_500(&format!("Task failed: {e}")),
+    }
+}
+
+pub(super) async fn generate_clone_branch_name_http(
+    Json(body): Json<GitCloneBranchNameRequest>,
+) -> Response {
+    json_result(Ok::<String, String>(
+        crate::worktree::generate_clone_branch_name_cmd(body.source_branch, body.existing_names),
+    ))
+}
+
+pub(super) async fn get_commit_graph_http(Query(q): Query<GitCommitGraphQuery>) -> Response {
+    if let Err(e) = validate_repo_path(&q.path) {
+        return e.into_response();
+    }
+    json_result(crate::git_graph::get_commit_graph(q.path, q.count).await)
+}
+
+pub(super) async fn create_branch_http(
+    axum::extract::State(state): axum::extract::State<std::sync::Arc<crate::AppState>>,
+    Json(body): Json<GitCreateBranchRequest>,
+) -> Response {
+    if let Err(e) = validate_repo_path(&body.path) {
+        return e.into_response();
+    }
+    let GitCreateBranchRequest {
+        path,
+        name,
+        start_point,
+        checkout,
+    } = body;
+    let res = tokio::task::spawn_blocking(move || {
+        crate::git::create_branch_impl(&path, &name, start_point.as_deref(), checkout)?;
+        state.invalidate_repo_caches(&path);
+        Ok::<(), String>(())
+    })
+    .await;
+    match res {
+        Ok(Ok(())) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
+        Ok(Err(e)) => err_500(&e),
+        Err(e) => err_500(&format!("Task failed: {e}")),
+    }
+}
+
+pub(super) async fn delete_branch_http(
+    axum::extract::State(state): axum::extract::State<std::sync::Arc<crate::AppState>>,
+    Json(body): Json<GitDeleteBranchRequest>,
+) -> Response {
+    if let Err(e) = validate_repo_path(&body.path) {
+        return e.into_response();
+    }
+    let GitDeleteBranchRequest { path, name, force } = body;
+    let res = tokio::task::spawn_blocking(move || {
+        let r = crate::git::delete_branch_impl(&path, &name, force)?;
+        state.invalidate_repo_caches(&path);
+        Ok::<_, String>(r)
+    })
+    .await;
+    match res {
+        Ok(r) => json_result(r),
+        Err(e) => err_500(&format!("Task failed: {e}")),
+    }
+}
+
+pub(super) async fn delete_local_branch_http(
+    axum::extract::State(state): axum::extract::State<std::sync::Arc<crate::AppState>>,
+    Json(body): Json<GitDeleteLocalBranchRequest>,
+) -> Response {
+    if let Err(e) = validate_repo_path(&body.repo_path) {
+        return e.into_response();
+    }
+    let GitDeleteLocalBranchRequest {
+        repo_path,
+        branch_name,
+        keep_worktree,
+    } = body;
+    let res = tokio::task::spawn_blocking(move || {
+        crate::worktree::delete_local_branch_impl(
+            &repo_path,
+            &branch_name,
+            keep_worktree.unwrap_or(false),
+        )?;
+        state.invalidate_repo_caches(&repo_path);
+        Ok::<(), String>(())
+    })
+    .await;
+    match res {
+        Ok(Ok(())) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
+        Ok(Err(e)) => err_500(&e),
+        Err(e) => err_500(&format!("Task failed: {e}")),
+    }
+}
+
+pub(super) async fn update_from_base_http(
+    axum::extract::State(state): axum::extract::State<std::sync::Arc<crate::AppState>>,
+    Json(body): Json<GitUpdateFromBaseRequest>,
+) -> Response {
+    if let Err(e) = validate_repo_path(&body.path) {
+        return e.into_response();
+    }
+    let GitUpdateFromBaseRequest {
+        path,
+        branch_name,
+        strategy,
+    } = body;
+    let res = tokio::task::spawn_blocking(move || {
+        crate::git::update_from_base_impl(&state, &path, &branch_name, strategy.as_deref())
+    })
+    .await;
+    match res {
+        // Plain-string result: serialized bare so `invoke<string>` receives it directly.
+        Ok(r) => json_result(r),
+        Err(e) => err_500(&format!("Task failed: {e}")),
     }
 }

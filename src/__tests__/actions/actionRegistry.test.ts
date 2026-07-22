@@ -15,6 +15,8 @@ function createMockHandlers(): ShortcutHandlers {
 		closeTerminal: vi.fn(),
 		reopenClosedTab: vi.fn(),
 		navigateTab: vi.fn(),
+		focusLastTerminal: vi.fn(),
+		jumpWaitingTerminal: vi.fn(),
 		clearTerminal: vi.fn(),
 		terminalIds: vi.fn().mockReturnValue([]),
 		handleTerminalSelect: vi.fn(),
@@ -30,6 +32,7 @@ function createMockHandlers(): ShortcutHandlers {
 		toggleHelpPanel: vi.fn(),
 		toggleNotesPanel: vi.fn(),
 		toggleFileBrowserPanel: vi.fn(),
+		requestFileBrowserContentSearch: vi.fn(),
 		toggleOutlinePanel: vi.fn(),
 		findInTerminal: vi.fn(),
 		toggleCommandPalette: vi.fn(),
@@ -47,6 +50,7 @@ function createMockHandlers(): ShortcutHandlers {
 		scrollPageDown: vi.fn(),
 		toggleZoomPane: vi.fn(),
 		toggleFocusMode: vi.fn(),
+		closeActiveTabOrPane: vi.fn(),
 		togglePromptLibrary: vi.fn(),
 		toggleDiffScroll: vi.fn(),
 		toggleGlobalWorkspace: vi.fn(),
@@ -61,7 +65,13 @@ function createMockHandlers(): ShortcutHandlers {
 		detachActivityDashboard: vi.fn(),
 		toggleProcessManager: vi.fn(),
 		toggleGenerators: vi.fn(),
+		showRemoteQr: vi.fn(),
 		refreshTerminal: vi.fn(),
+		blockPrev: vi.fn(),
+		blockNext: vi.fn(),
+		blockFoldToggle: vi.fn(),
+		blockSearchToggle: vi.fn(),
+		runSmartPromptByCombo: vi.fn(() => false),
 	};
 }
 
@@ -144,6 +154,20 @@ describe("actionRegistry", () => {
 				execute: vi.fn(),
 			};
 			expect(entry.id).toBe("switch-repo:/some/path");
+		});
+
+		it("close-terminal delegates to the shared close-tab-or-pane handler", () => {
+			// The split-aware decision (active pane vs active terminal, cancel an
+			// empty split pane) lives in closeActiveTabOrPane so every entry point
+			// — keyboard, palette, native menu — behaves identically.
+			const handlers = createMockHandlers();
+
+			const entry = getActionEntries(handlers).find((e) => e.id === "close-terminal");
+			expect(entry).toBeDefined();
+			entry?.execute();
+
+			expect(handlers.closeActiveTabOrPane).toHaveBeenCalled();
+			expect(handlers.closeTerminal).not.toHaveBeenCalled();
 		});
 
 		it("execute calls the corresponding handler", () => {

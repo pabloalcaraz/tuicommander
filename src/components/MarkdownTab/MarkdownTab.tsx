@@ -9,10 +9,13 @@ import { diffTabsStore } from "../../stores/diffTabs";
 import { editorTabsStore } from "../../stores/editorTabs";
 import { type FileTab, type MdTabData, mdTabsStore } from "../../stores/mdTabs";
 import { repositoriesStore } from "../../stores/repositories";
+import { toastsStore } from "../../stores/toasts";
+import { writeClipboard } from "../../utils/clipboard";
 import { openFileAction } from "../../utils/filePreview";
 import { isAbsolutePath, joinPath, pathDirname } from "../../utils/pathUtils";
 import {
 	insertTweakComment,
+	OverlappingCommentError,
 	removeTweakComment,
 	type TweakComment,
 	toggleCheckbox,
@@ -21,6 +24,7 @@ import {
 import { ContextMenu, createContextMenu } from "../ContextMenu";
 import type { SearchOptions } from "../shared/DomSearchEngine";
 import { DomSearchEngine } from "../shared/DomSearchEngine";
+import { DomSearchOverview } from "../shared/DomSearchOverview";
 import e from "../shared/editor-header.module.css";
 import { SearchBar } from "../shared/SearchBar";
 import { ContentRenderer } from "../ui";
@@ -37,6 +41,13 @@ export interface MarkdownTabHandle {
 	openSearch: () => void;
 }
 
+/** True when the read failed because the file no longer exists on disk. Absolute
+ *  paths go through `read_external_file`, which throws (rather than returning "")
+ *  for a deleted file — an expected, non-warn-worthy state for a stale tab. */
+function isMissingFileError(msg: string): boolean {
+	return msg.includes("No such file") || msg.includes("os error 2");
+}
+
 export const MarkdownTab: Component<MarkdownTabProps> = (props) => {
 	const [content, setContent] = createSignal("");
 	const [loading, setLoading] = createSignal(false);
@@ -44,6 +55,8 @@ export const MarkdownTab: Component<MarkdownTabProps> = (props) => {
 	const [searchVisible, setSearchVisible] = createSignal(false);
 	const [matchIndex, setMatchIndex] = createSignal(-1);
 	const [matchCount, setMatchCount] = createSignal(0);
+	const [overviewFractions, setOverviewFractions] = createSignal<number[]>([]);
+	const [scrollEl, setScrollEl] = createSignal<HTMLElement>();
 	const repo = useRepository();
 	const contextMenu = createContextMenu();
 	let wrapperRef: HTMLDivElement | undefined;
@@ -114,12 +127,23 @@ export const MarkdownTab: Component<MarkdownTabProps> = (props) => {
 				try {
 					const fileContent = await readFileContent(fsRoot || repoPath, filePath);
 					if (!fileContent) {
-						appLogger.warn("app", "readFileContent returned empty", { repoPath, filePath, fsRoot });
+						// Empty result = genuinely-empty file OR a deleted/missing file
+						// (repo.readFile returns "" for both, no throw). Neither is
+						// warn-worthy: empty content renders fine and a deleted file is
+						// expected — matches the focus-reload effect's silent handling
+						// below. This effect re-runs on every repo-revision bump, so a
+						// stale tab on a deleted file would otherwise spam warnings.
+						appLogger.debug("app", "readFileContent returned empty", { repoPath, filePath, fsRoot });
 					}
 					setContent(fileContent);
 				} catch (err) {
 					const msg = err instanceof Error ? err.message : String(err);
-					appLogger.error("app", "readFileContent failed", { repoPath, filePath, fsRoot, error: msg });
+					// A deleted file is expected for a stale tab and this effect re-runs on
+					// every repo-revision bump, so an ERROR log here spams. Match the
+					// focus-reload effect below: silent for missing files, log anything else.
+					if (!isMissingFileError(msg)) {
+						appLogger.error("app", "readFileContent failed", { repoPath, filePath, fsRoot, error: msg });
+					}
 					setError(msg);
 					setContent("");
 				} finally {
@@ -191,7 +215,7 @@ export const MarkdownTab: Component<MarkdownTabProps> = (props) => {
 				if (cancelled) return;
 				const msg = err instanceof Error ? err.message : String(err);
 				// Silently ignore expected errors (file deleted); log anything else.
-				if (!msg.includes("No such file") && !msg.includes("os error 2")) {
+				if (!isMissingFileError(msg)) {
 					appLogger.warn("app", "focus-reload readFileContent failed", { repoPath, filePath, error: msg });
 				}
 			}
@@ -205,6 +229,8 @@ export const MarkdownTab: Component<MarkdownTabProps> = (props) => {
 		const count = engine.search(lastSearchTerm, lastSearchOpts);
 		setMatchCount(count);
 		setMatchIndex(count > 0 ? 0 : -1);
+		const el = scrollEl();
+		setOverviewFractions(el && count > 0 ? engine.matchFractions(el) : []);
 	}
 
 	const handleSearch = (term: string, opts: SearchOptions) => {
@@ -216,6 +242,7 @@ export const MarkdownTab: Component<MarkdownTabProps> = (props) => {
 			engine?.clear();
 			setMatchCount(0);
 			setMatchIndex(-1);
+			setOverviewFractions([]);
 			return;
 		}
 
@@ -241,6 +268,7 @@ export const MarkdownTab: Component<MarkdownTabProps> = (props) => {
 		setSearchVisible(false);
 		setMatchCount(0);
 		setMatchIndex(-1);
+		setOverviewFractions([]);
 		focusWrapper();
 	};
 
@@ -275,17 +303,36 @@ export const MarkdownTab: Component<MarkdownTabProps> = (props) => {
 		}
 	};
 
-	const handleTweakSave = async (comment: TweakComment) => {
+	const handleTweakSave = async (comment: TweakComment, occurrenceIndex: number) => {
 		const current = content();
 		// If the id already exists in the source, it's an edit; otherwise it's a new insert.
 		const isExisting = current.includes(`<!--tweak:begin:${comment.id}-->`);
 		try {
 			const updated = isExisting
 				? updateTweakComment(current, comment.id, comment.comment)
-				: insertTweakComment(current, comment);
+				: insertTweakComment(current, comment, occurrenceIndex);
 			await writeTweakedSource(updated);
 		} catch (err) {
 			appLogger.error("app", `handleTweakSave failed: ${err instanceof Error ? err.message : String(err)}`);
+			if (err instanceof OverlappingCommentError) {
+				toastsStore.add(
+					t("markdownTab.commentOverlap", "Couldn't add comment"),
+					t(
+						"markdownTab.commentOverlapMsg",
+						"That text already has a comment. Click the highlight to edit it, or select different text.",
+					),
+					"error",
+				);
+			} else {
+				toastsStore.add(
+					t("markdownTab.commentAnchorFailed", "Couldn't add comment"),
+					t(
+						"markdownTab.commentAnchorFailedMsg",
+						"The selected text couldn't be located in the file source. Try selecting within a single formatted span.",
+					),
+					"error",
+				);
+			}
 		}
 	};
 
@@ -339,9 +386,7 @@ export const MarkdownTab: Component<MarkdownTabProps> = (props) => {
 	const handleCopyPath = () => {
 		const path = fullPath();
 		if (!path) return;
-		navigator.clipboard
-			.writeText(shortenHomePath(path))
-			.catch((err) => appLogger.error("app", "Failed to copy path", err));
+		writeClipboard(shortenHomePath(path)).catch((err) => appLogger.error("app", "Failed to copy path", err));
 	};
 
 	const handleHeaderContextMenu = (ev: MouseEvent) => {
@@ -360,7 +405,7 @@ export const MarkdownTab: Component<MarkdownTabProps> = (props) => {
 					<button class={e.btn} onClick={handleEdit} title={t("markdownTab.edit", "Edit file")}>
 						<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
 							<path d="M11.13 1.47a1.5 1.5 0 0 1 2.12 0l1.28 1.28a1.5 1.5 0 0 1 0 2.12L5.9 13.5a1 1 0 0 1-.5.27l-3.5.87a.5.5 0 0 1-.6-.6l.87-3.5a1 1 0 0 1 .27-.5L11.13 1.47ZM12.2 2.53l-8.46 8.47-.58 2.34 2.34-.58 8.47-8.46-1.77-1.77Z" />
-						</svg>{" "}
+						</svg>
 						{t("markdownTab.editBtn", "Edit")}
 					</button>
 					<Show when={(props.tab as FileTab).repoPath}>
@@ -382,7 +427,7 @@ export const MarkdownTab: Component<MarkdownTabProps> = (props) => {
 								/>
 								<path d="M4 12l-2 2 2 2" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
 								<path d="M12 12l2 2-2 2" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
-							</svg>{" "}
+							</svg>
 							{t("markdownTab.diffBtn", "Diff")}
 						</button>
 					</Show>
@@ -399,7 +444,10 @@ export const MarkdownTab: Component<MarkdownTabProps> = (props) => {
 				matchCount={matchCount()}
 			/>
 
-			<div class={s.content}>
+			<div class={s.content} ref={(el) => setScrollEl(el)}>
+				<Show when={searchVisible()}>
+					<DomSearchOverview scrollEl={scrollEl} fractions={overviewFractions} />
+				</Show>
 				<ContentRenderer
 					content={content()}
 					baseDir={baseDir()}
@@ -429,8 +477,8 @@ export const MarkdownTab: Component<MarkdownTabProps> = (props) => {
 				{(el) => (
 					<CommentOverlay
 						contentRef={el}
-						onSave={(c) => {
-							void handleTweakSave(c);
+						onSave={(c, occ) => {
+							void handleTweakSave(c, occ);
 						}}
 						onDelete={(id) => {
 							void handleTweakDelete(id);

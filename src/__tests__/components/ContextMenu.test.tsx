@@ -66,14 +66,68 @@ describe("ContextMenu", () => {
 		expect(action).not.toHaveBeenCalled();
 	});
 
-	it("renders separator when item has separator flag", () => {
+	it("renders the item AND a trailing divider when a real item sets separator", () => {
 		const items: ContextMenuItem[] = [
 			{ label: "Above", action: vi.fn(), separator: true },
 			{ label: "Below", action: vi.fn() },
 		];
 		const { container } = render(() => <ContextMenu items={items} x={0} y={0} visible={true} onClose={() => {}} />);
-		const separators = container.querySelectorAll(".separator");
-		expect(separators.length).toBe(1);
+		// `separator` on a real item is a trailing-divider MODIFIER — "Above"
+		// must still render its button, not be replaced by the divider.
+		const labels = Array.from(container.querySelectorAll(".label")).map((el) => el.textContent);
+		expect(labels).toEqual(["Above", "Below"]);
+		expect(container.querySelectorAll(".separator").length).toBe(1);
+	});
+
+	it("separator renders only a divider — no selectable button row", () => {
+		const items: ContextMenuItem[] = [
+			{ label: "Top", action: vi.fn() },
+			{ label: "", action: vi.fn(), separator: true },
+			{ label: "Bottom", action: vi.fn() },
+		];
+		const { container } = render(() => <ContextMenu items={items} x={0} y={0} visible={true} onClose={() => {}} />);
+		// Two real items only — the separator must NOT produce a hoverable .item button.
+		expect(container.querySelectorAll(".item").length).toBe(2);
+		expect(container.querySelectorAll(".itemWrap").length).toBe(2);
+		expect(container.querySelectorAll(".separator").length).toBe(1);
+	});
+
+	it("a real item with separator renders its label plus a trailing divider", () => {
+		// Regression guard: commit 2f032261 treated `separator` as exclusive
+		// (divider OR item), silently dropping every FileBrowser item that
+		// requested a trailing divider — New File, Paste, Delete, Add to
+		// .gitignore all vanished. A non-empty label must ALWAYS render.
+		const items: ContextMenuItem[] = [
+			{ label: "Delete", action: vi.fn(), separator: true },
+			{ label: "Reveal", action: vi.fn() },
+		];
+		const { container } = render(() => <ContextMenu items={items} x={0} y={0} visible={true} onClose={() => {}} />);
+		const labels = Array.from(container.querySelectorAll(".label")).map((el) => el.textContent);
+		expect(labels).toEqual(["Delete", "Reveal"]);
+		expect(container.querySelectorAll(".separator").length).toBe(1);
+	});
+
+	it("suppresses a trailing separator on the LAST item (no dangling divider)", () => {
+		// Every context menu renders through this component; a modifier separator
+		// on the final item must NOT paint a divider with nothing after it.
+		const items: ContextMenuItem[] = [
+			{ label: "First", action: vi.fn() },
+			{ label: "Last", action: vi.fn(), separator: true },
+		];
+		const { container } = render(() => <ContextMenu items={items} x={0} y={0} visible={true} onClose={() => {}} />);
+		const labels = Array.from(container.querySelectorAll(".label")).map((el) => el.textContent);
+		expect(labels).toEqual(["First", "Last"]);
+		expect(container.querySelectorAll(".separator").length).toBe(0);
+	});
+
+	it("suppresses a pure separator row when it is the LAST item", () => {
+		const items: ContextMenuItem[] = [
+			{ label: "Only", action: vi.fn() },
+			{ label: "", action: vi.fn(), separator: true },
+		];
+		const { container } = render(() => <ContextMenu items={items} x={0} y={0} visible={true} onClose={() => {}} />);
+		expect(container.querySelectorAll(".item").length).toBe(1);
+		expect(container.querySelectorAll(".separator").length).toBe(0);
 	});
 
 	it("closes on Escape key", () => {
@@ -114,6 +168,32 @@ describe("ContextMenu", () => {
 		// Restore
 		Object.defineProperty(window, "innerWidth", { value: 1024, writable: true, configurable: true });
 		Object.defineProperty(window, "innerHeight", { value: 768, writable: true, configurable: true });
+	});
+
+	it("constrains an oversized menu to the visible viewport", async () => {
+		Object.defineProperty(window, "innerWidth", { value: 120, writable: true, configurable: true });
+		Object.defineProperty(window, "innerHeight", { value: 80, writable: true, configurable: true });
+
+		try {
+			const items: ContextMenuItem[] = Array.from({ length: 20 }, (_, i) => ({
+				label: `Item ${i}`,
+				action: vi.fn(),
+			}));
+			const { container } = render(() => (
+				<ContextMenu items={items} x={110} y={70} visible={true} onClose={() => {}} />
+			));
+
+			await new Promise((r) => requestAnimationFrame(r));
+			const menu = container.querySelector(".menu") as HTMLElement;
+
+			expect(menu.style.left).toBe("8px");
+			expect(menu.style.top).toBe("8px");
+			expect(menu.style.maxWidth).toBe("104px");
+			expect(menu.style.maxHeight).toBe("64px");
+		} finally {
+			Object.defineProperty(window, "innerWidth", { value: 1024, writable: true, configurable: true });
+			Object.defineProperty(window, "innerHeight", { value: 768, writable: true, configurable: true });
+		}
 	});
 
 	it("positions menu at x,y coordinates", () => {
@@ -209,6 +289,65 @@ describe("ContextMenu submenus", () => {
 		const parentItem = container.querySelector(".item")!;
 		fireEvent.click(parentItem);
 		expect(parentAction).not.toHaveBeenCalled();
+	});
+
+	it("constrains oversized submenus to the visible viewport", async () => {
+		Object.defineProperty(window, "innerWidth", { value: 180, writable: true, configurable: true });
+		Object.defineProperty(window, "innerHeight", { value: 100, writable: true, configurable: true });
+		const originalRect = HTMLElement.prototype.getBoundingClientRect;
+		try {
+			HTMLElement.prototype.getBoundingClientRect = function () {
+				const el = this as HTMLElement;
+				if (el.className.includes("itemWrap")) {
+					return {
+						left: 140,
+						right: 170,
+						top: 80,
+						bottom: 104,
+						width: 30,
+						height: 24,
+						x: 140,
+						y: 80,
+						toJSON: () => ({}),
+					} as DOMRect;
+				}
+				if (el.className.includes("submenu")) {
+					return {
+						left: 0,
+						right: 220,
+						top: 0,
+						bottom: 220,
+						width: 220,
+						height: 220,
+						x: 0,
+						y: 0,
+						toJSON: () => ({}),
+					} as DOMRect;
+				}
+				return originalRect.call(this);
+			};
+
+			const items: ContextMenuItem[] = [
+				{
+					label: "Move to Group",
+					action: vi.fn(),
+					children: Array.from({ length: 20 }, (_, i) => ({ label: `Group ${i}`, action: vi.fn() })),
+				},
+			];
+			const { container } = render(() => <ContextMenu items={items} x={0} y={0} visible={true} onClose={() => {}} />);
+			fireEvent.mouseEnter(container.querySelector(".itemWrap")!);
+			await new Promise((r) => requestAnimationFrame(r));
+
+			const submenu = container.querySelector(".submenu") as HTMLElement;
+			expect(submenu.style.left).toBe("8px");
+			expect(submenu.style.top).toBe("8px");
+			expect(submenu.style.maxWidth).toBe("164px");
+			expect(submenu.style.maxHeight).toBe("84px");
+		} finally {
+			HTMLElement.prototype.getBoundingClientRect = originalRect;
+			Object.defineProperty(window, "innerWidth", { value: 1024, writable: true, configurable: true });
+			Object.defineProperty(window, "innerHeight", { value: 768, writable: true, configurable: true });
+		}
 	});
 });
 

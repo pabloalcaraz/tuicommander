@@ -1,16 +1,23 @@
 import { describe, expect, it } from "vitest";
 import {
-	applyTweakHighlights,
 	CONVENTION_HEADER,
 	ensureConventionHeader,
+	findSourceMatch,
+	injectTweakSentinels,
 	insertTweakComment,
+	OverlappingCommentError,
 	parseTweakComments,
 	removeTweakComment,
 	serializeTweakComment,
 	type TweakComment,
 	toggleCheckbox,
+	tweakBeginSentinel,
+	tweakEndSentinel,
 	updateTweakComment,
 } from "../../utils/tweakComments";
+
+/** Spread a findSourceMatch result into String.slice(start, end) arguments. */
+const offsets = (m: { start: number; end: number }): [number, number] => [m.start, m.end];
 
 describe("tweakComments parser/serializer", () => {
 	describe("serializeTweakComment", () => {
@@ -157,6 +164,193 @@ describe("tweakComments parser/serializer", () => {
 				}),
 			).toThrow();
 		});
+
+		it("rejects commenting on already-commented text (no nesting)", () => {
+			// Regression: commenting text that already carries a comment used to nest
+			// the markers; the lazy parser swallowed the inner one, so it saved to
+			// disk but never parsed/rendered again — looked like it "didn't persist".
+			let src = "The reason for this Decision is clear.";
+			src = insertTweakComment(src, {
+				id: "c_outer",
+				highlighted: "reason",
+				comment: "outer",
+				createdAt: "2026-07-15T10:00:00.000Z",
+			});
+			expect(() =>
+				insertTweakComment(src, {
+					id: "c_inner",
+					highlighted: "reason",
+					comment: "inner",
+					createdAt: "2026-07-15T10:01:00.000Z",
+				}),
+			).toThrow(OverlappingCommentError);
+			// The file still holds exactly one, parseable comment.
+			expect(parseTweakComments(src).map((c) => c.id)).toEqual(["c_outer"]);
+		});
+
+		it("rejects a sub-selection inside an existing comment", () => {
+			let src = "unique-token appears once here.";
+			src = insertTweakComment(src, {
+				id: "c_1",
+				highlighted: "unique-token",
+				comment: "a",
+				createdAt: "2026-07-15T10:00:00.000Z",
+			});
+			// "token" only exists inside the already-commented span → must be rejected.
+			expect(() =>
+				insertTweakComment(src, {
+					id: "c_2",
+					highlighted: "token",
+					comment: "b",
+					createdAt: "2026-07-15T10:01:00.000Z",
+				}),
+			).toThrow(OverlappingCommentError);
+		});
+
+		it("allows a second comment on a different, non-overlapping occurrence", () => {
+			let src = "alpha and beta and gamma.";
+			src = insertTweakComment(src, {
+				id: "c_1",
+				highlighted: "alpha",
+				comment: "a",
+				createdAt: "2026-07-15T10:00:00.000Z",
+			});
+			src = insertTweakComment(src, {
+				id: "c_2",
+				highlighted: "gamma",
+				comment: "b",
+				createdAt: "2026-07-15T10:01:00.000Z",
+			});
+			expect(parseTweakComments(src).map((c) => c.id).sort()).toEqual(["c_1", "c_2"]);
+			// Both render as independent highlight spans.
+			const rendered = injectTweakSentinels(src);
+			expect(rendered).toContain(tweakBeginSentinel("c_1"));
+			expect(rendered).toContain(tweakBeginSentinel("c_2"));
+		});
+
+		it("anchors the requested occurrence, not the first (repeated text)", () => {
+			// Regression: a word appearing many times used to always anchor to the
+			// FIRST occurrence, leaving the user's actual selection unhighlighted.
+			const src = "reason A. reason B. reason C.";
+			const out = insertTweakComment(
+				src,
+				{ id: "c_1", highlighted: "reason", comment: "x", createdAt: "2026-07-15T10:00:00.000Z" },
+				2, // the 3rd "reason"
+			);
+			const body = out.slice(CONVENTION_HEADER.length);
+			// First two "reason" stay bare; only the 3rd is wrapped.
+			expect(body).toBe("reason A. reason B. <!--tweak:begin:c_1-->reason<!--tweak:end:c_1 @2026-07-15T10:00:00.000Z\nx--> C.");
+		});
+
+		it("ignores occurrences inside the convention header and comment bodies when counting", () => {
+			// The header contains words like "comment"/"text" and bodies hold free
+			// text — both are invisible in the DOM, so they must NOT shift ordinals.
+			let src = "keep keep keep.";
+			// First comment on occurrence 0; its body deliberately contains "keep".
+			src = insertTweakComment(src, {
+				id: "c_1",
+				highlighted: "keep",
+				comment: "keep this in mind",
+				createdAt: "2026-07-15T10:00:00.000Z",
+			});
+			// Now anchor occurrence 2 (the 3rd visible "keep"). Body "keep" and any
+			// header words must not throw the count off.
+			src = insertTweakComment(
+				src,
+				{ id: "c_2", highlighted: "keep", comment: "y", createdAt: "2026-07-15T10:01:00.000Z" },
+				2,
+			);
+			const parsed = parseTweakComments(src);
+			expect(parsed.map((c) => c.id).sort()).toEqual(["c_1", "c_2"]);
+			// c_2 must wrap the LAST "keep", immediately before the period.
+			expect(src).toContain("<!--tweak:begin:c_2-->keep<!--tweak:end:c_2 @2026-07-15T10:01:00.000Z\ny-->.");
+		});
+
+		it("findSourceMatch returns null when the requested occurrence does not exist", () => {
+			expect(findSourceMatch("only one here", "one", 3)).toBeNull();
+		});
+
+		it("matches a rendered selection fully inside inline bold (markers stripped by the DOM)", () => {
+			// Source has **bold**; the DOM selection drops the asterisks. We wrap the
+			// visible inner text so the result renders as `**<span>…</span>**` (bold + highlight).
+			const src = "x **bold text** y";
+			const out = insertTweakComment(src, {
+				id: "c_1",
+				highlighted: "bold text",
+				comment: "nota",
+				createdAt: "2026-04-05T10:00:00.000Z",
+			});
+			expect(out).toContain("**<!--tweak:begin:c_1-->bold text<!--tweak:end:c_1");
+			expect(parseTweakComments(out)[0].highlighted).toBe("bold text");
+		});
+
+		it("matches a rendered selection that straddles a bold boundary (the real-world case)", () => {
+			// Boss's actual failure: selecting "This repo: notes" across the end of **…**.
+			const src = "- **This repo:** notes, plans, analysis.";
+			const out = insertTweakComment(src, {
+				id: "c_1",
+				highlighted: "This repo: notes",
+				comment: "nota",
+				createdAt: "2026-04-05T10:00:00.000Z",
+			});
+			// It no longer throws, and removal restores the byte-identical original.
+			expect(removeTweakComment(out, "c_1")).toBe(src);
+		});
+
+		it("matches a rendered selection that spans a hard line wrap", () => {
+			const src = "alpha beta\ngamma delta";
+			const out = insertTweakComment(src, {
+				id: "c_1",
+				highlighted: "beta gamma",
+				comment: "x",
+				createdAt: "2026-04-05T10:00:00.000Z",
+			});
+			expect(parseTweakComments(out)[0].highlighted).toBe("beta\ngamma");
+		});
+
+		it("removeTweakComment restores the original markdown after a fully-inside insert", () => {
+			const src = "x **bold text** y";
+			const inserted = insertTweakComment(src, {
+				id: "c_1",
+				highlighted: "bold text",
+				comment: "nota",
+				createdAt: "2026-04-05T10:00:00.000Z",
+			});
+			expect(removeTweakComment(inserted, "c_1")).toBe(src);
+		});
+	});
+
+	describe("findSourceMatch", () => {
+		it("returns exact offsets for a verbatim match (fast path)", () => {
+			expect(findSourceMatch("hello world", "world")).toEqual({ start: 6, end: 11 });
+		});
+
+		it("maps a bold-stripped selection back to the inner visible source slice", () => {
+			const src = "x **bold text** y";
+			const m = findSourceMatch(src, "bold text");
+			expect(m).not.toBeNull();
+			expect(src.slice(m!.start, m!.end)).toBe("bold text");
+		});
+
+		it("maps italic/code/strike selections back to the inner visible text", () => {
+			const src = "a *em* b `code` c ~~gone~~ d";
+			expect(src.slice(...offsets(findSourceMatch(src, "em")!))).toBe("em");
+			expect(src.slice(...offsets(findSourceMatch(src, "code")!))).toBe("code");
+			expect(src.slice(...offsets(findSourceMatch(src, "gone")!))).toBe("gone");
+		});
+
+		it("matches across a hard line wrap and collapsed whitespace", () => {
+			const src = "alpha beta\ngamma   delta";
+			expect(src.slice(...offsets(findSourceMatch(src, "beta gamma delta")!))).toBe("beta\ngamma   delta");
+		});
+
+		it("returns null when the text is genuinely absent", () => {
+			expect(findSourceMatch("hello world", "absent")).toBeNull();
+		});
+
+		it("returns null for an empty/whitespace-only selection", () => {
+			expect(findSourceMatch("hello", "   ")).toBeNull();
+		});
 	});
 
 	describe("removeTweakComment", () => {
@@ -223,38 +417,30 @@ describe("tweakComments parser/serializer", () => {
 		});
 	});
 
-	describe("applyTweakHighlights", () => {
-		it("converts tweak markers to highlight spans with plain-text data attrs", () => {
+	describe("injectTweakSentinels", () => {
+		it("replaces tweak markers with begin/end sentinels keeping the inline text", () => {
 			const src = "Hello <!--tweak:begin:c_1-->world<!--tweak:end:c_1 @2026-04-05T10:00:00.000Z\nnota-->!";
-			const out = applyTweakHighlights(src);
-			expect(out).toContain(
-				'<span class="tweak-highlight" data-tweak-id="c_1" data-tweak-at="2026-04-05T10:00:00.000Z" data-tweak-comment="nota">world</span>',
-			);
+			const out = injectTweakSentinels(src);
+			expect(out).toBe(`Hello ${tweakBeginSentinel("c_1")}world${tweakEndSentinel("c_1")}!`);
 			expect(out).not.toContain("<!--tweak:");
 		});
 
-		it('escapes `&` and `"` in the data-tweak-comment attribute', () => {
-			const src = '<!--tweak:begin:c_1-->x<!--tweak:end:c_1 @2026-04-05T10:00:00.000Z\nhas "quotes" & amp-->';
-			const out = applyTweakHighlights(src);
-			expect(out).toContain('data-tweak-comment="has &quot;quotes&quot; &amp; amp"');
-		});
-
-		it("unescapes `--&gt;` back to `-->` in the rendered span attribute", () => {
-			const src = "<!--tweak:begin:c_1-->x<!--tweak:end:c_1 @2026-04-05T10:00:00.000Z\nclose --&gt; now-->";
-			const out = applyTweakHighlights(src);
-			expect(out).toContain('data-tweak-comment="close --> now"');
+		it("preserves markdown formatting inline between the sentinels", () => {
+			const src = "<!--tweak:begin:c_1-->**bold** and `code`<!--tweak:end:c_1 @2026-04-05T10:00:00.000Z\nx-->";
+			const out = injectTweakSentinels(src);
+			expect(out).toBe(`${tweakBeginSentinel("c_1")}**bold** and \`code\`${tweakEndSentinel("c_1")}`);
 		});
 
 		it("strips the convention header", () => {
 			const src = CONVENTION_HEADER + "# Title\n\nBody text.";
-			const out = applyTweakHighlights(src);
+			const out = injectTweakSentinels(src);
 			expect(out).not.toContain(CONVENTION_HEADER);
 			expect(out).toContain("# Title");
 		});
 
 		it("is a no-op on plain markdown without markers", () => {
 			const src = "# Title\n\nSome **bold** text.";
-			expect(applyTweakHighlights(src)).toBe(src);
+			expect(injectTweakSentinels(src)).toBe(src);
 		});
 	});
 

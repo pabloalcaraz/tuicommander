@@ -46,10 +46,13 @@ export const SettingSlider: Component<{
 	label: string;
 	value: number;
 	onChange: (value: number) => void;
+	/** Fires once when the drag is released (DOM `change`), e.g. to play a preview at the committed value */
+	onCommit?: (value: number) => void;
 	min: number;
 	max: number;
 	step?: number;
 	suffix?: string;
+	formatValue?: (value: number) => string;
 	hint?: string;
 }> = (props) => (
 	<div class={s.group}>
@@ -62,11 +65,9 @@ export const SettingSlider: Component<{
 				step={props.step}
 				value={props.value}
 				onInput={(e) => props.onChange(parseInt(e.currentTarget.value, 10))}
+				onChange={(e) => props.onCommit?.(parseInt(e.currentTarget.value, 10))}
 			/>
-			<span>
-				{props.value}
-				{props.suffix ?? ""}
-			</span>
+			<span>{props.formatValue ? props.formatValue(props.value) : `${props.value}${props.suffix ?? ""}`}</span>
 		</div>
 		<Show when={props.hint}>
 			<p class={s.hint}>{props.hint}</p>

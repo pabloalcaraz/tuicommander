@@ -98,7 +98,8 @@ enum Command {
     Status,
     /// Install the tuic CLI to system PATH
     InstallCli {
-        /// Target path (default: /usr/local/bin/tuic)
+        /// Target path (default: /usr/local/bin/tuic on Unix,
+        /// %LOCALAPPDATA%\Microsoft\WindowsApps\tuic.exe on Windows)
         #[arg(long)]
         path: Option<String>,
     },
@@ -510,17 +511,37 @@ fn cmd_agent(action: AgentAction) -> Result<(), String> {
         }
         AgentAction::Send { target, message } => {
             let id = resolve_session_id(&target)?;
-            let body = serde_json::json!({ "data": format!("{message}\r") });
+            let (payload, enter) = agent_send_parts(&message);
+            let body = serde_json::json!({ "data": payload });
             let resp = ipc::post(&format!("/sessions/{id}/write"), &body.to_string())
                 .map_err(|e| e.to_string())?;
 
             if !resp.is_success() {
                 return Err(format!("Failed to send: {}", resp.body));
             }
+
+            // Raw-mode agent TUIs require Enter in a later PTY read. A combined
+            // `message\r` is commonly treated as a prefill and left unsent.
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let body = serde_json::json!({ "data": enter });
+            let resp = ipc::post(&format!("/sessions/{id}/write"), &body.to_string())
+                .map_err(|e| e.to_string())?;
+            if !resp.is_success() {
+                return Err(format!("Failed to submit agent message: {}", resp.body));
+            }
         }
     }
 
     Ok(())
+}
+
+fn agent_send_parts(message: &str) -> (String, &'static str) {
+    let payload = if message.contains('\n') {
+        format!("\x15\x1b[200~{message}\x1b[201~")
+    } else {
+        format!("\x15{message}")
+    };
+    (payload, "\r")
 }
 
 fn cmd_status() -> Result<(), String> {
@@ -552,9 +573,10 @@ fn cmd_status() -> Result<(), String> {
 
 fn cmd_install_cli(target: Option<&str>) -> Result<(), String> {
     let default_path = if cfg!(target_os = "windows") {
-        // On Windows, suggest a directory in PATH
-        let home = std::env::var("USERPROFILE").unwrap_or_default();
-        format!("{home}\\.local\\bin\\tuic.exe")
+        // %LOCALAPPDATA%\Microsoft\WindowsApps is user-writable and already in
+        // PATH on modern Windows — matches the GUI installer (tuic_cli.rs).
+        let local_app_data = std::env::var("LOCALAPPDATA").unwrap_or_default();
+        format!("{local_app_data}\\Microsoft\\WindowsApps\\tuic.exe")
     } else {
         "/usr/local/bin/tuic".to_string()
     };
@@ -621,6 +643,11 @@ fn cmd_install_cli(target: Option<&str>) -> Result<(), String> {
 
     #[cfg(windows)]
     {
+        // Create the target directory if it doesn't exist (avoids OS error 3).
+        if let Some(parent) = std::path::Path::new(target_path).parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create {}: {e}", parent.display()))?;
+        }
         std::fs::copy(&self_exe, target_path).map_err(|e| format!("Failed to copy: {e}"))?;
         println!("Installed {target_path}");
     }
@@ -633,8 +660,9 @@ fn cmd_alias(remove: bool) -> Result<(), String> {
         std::env::current_exe().map_err(|e| format!("Cannot find own executable: {e}"))?;
 
     let tmux_path = if cfg!(target_os = "windows") {
-        let home = std::env::var("USERPROFILE").unwrap_or_default();
-        format!("{home}\\.local\\bin\\tmux.exe")
+        // Same user-writable, in-PATH location as the tuic install (see cmd_install_cli).
+        let local_app_data = std::env::var("LOCALAPPDATA").unwrap_or_default();
+        format!("{local_app_data}\\Microsoft\\WindowsApps\\tmux.exe")
     } else {
         "/usr/local/bin/tmux".to_string()
     };
@@ -734,6 +762,11 @@ fn cmd_alias(remove: bool) -> Result<(), String> {
 
     #[cfg(windows)]
     {
+        // Create the target directory if it doesn't exist (avoids OS error 3).
+        if let Some(parent) = std::path::Path::new(&tmux_path).parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create {}: {e}", parent.display()))?;
+        }
         std::fs::copy(&self_exe, &tmux_path).map_err(|e| format!("Failed to copy: {e}"))?;
         println!("Created tmux alias at {tmux_path}");
     }
@@ -1030,4 +1063,24 @@ fn remove_with_elevation(path: &str) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::agent_send_parts;
+
+    #[test]
+    fn agent_send_separates_framed_payload_from_enter() {
+        let (payload, enter) = agent_send_parts("report complete");
+        assert_eq!(payload, "\x15report complete");
+        assert!(!payload.contains('\r'));
+        assert_eq!(enter, "\r");
+    }
+
+    #[test]
+    fn agent_send_bracket_pastes_multiline_before_separate_enter() {
+        let (payload, enter) = agent_send_parts("line one\nline two");
+        assert_eq!(payload, "\x15\x1b[200~line one\nline two\x1b[201~");
+        assert_eq!(enter, "\r");
+    }
 }

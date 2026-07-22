@@ -1,4 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import type {
+	effectiveActivityState as EffectiveStateFn,
+	terminalStatusLabel as LabelFn,
+	reconcileActivityOrder as ReconcileFn,
+} from "../../utils/activitySnapshot";
 
 const mockInvoke = vi.fn().mockResolvedValue(undefined);
 
@@ -8,6 +13,7 @@ vi.mock("@tauri-apps/api/core", () => ({
 
 describe("activitySnapshot", () => {
 	let buildActivitySnapshot: typeof import("../../utils/activitySnapshot").buildActivitySnapshot;
+	let snapshotToRows: typeof import("../../panelAdapters/activity").snapshotToRows;
 	let terminalsStore: typeof import("../../stores/terminals").terminalsStore;
 	let globalWorkspaceStore: typeof import("../../stores/globalWorkspace").globalWorkspaceStore;
 
@@ -22,6 +28,7 @@ describe("activitySnapshot", () => {
 		globalWorkspaceStore = gwMod.globalWorkspaceStore;
 		const snapMod = await import("../../utils/activitySnapshot");
 		buildActivitySnapshot = snapMod.buildActivitySnapshot;
+		snapshotToRows = (await import("../../panelAdapters/activity")).snapshotToRows;
 	});
 
 	it("returns empty terminals array when none exist", () => {
@@ -90,5 +97,172 @@ describe("activitySnapshot", () => {
 
 		const snap = buildActivitySnapshot();
 		expect(snap.terminals[0].isPromoted).toBe(true);
+	});
+
+	it("keeps completed snapshot rows idle-styled despite a stale busy debounce", () => {
+		const id = terminalsStore.add({
+			name: "Terminal 4",
+			sessionId: "sess4",
+			cwd: null,
+			fontSize: 14,
+			awaitingInput: null,
+			agentType: "codex",
+		});
+		terminalsStore.update(id, { shellState: "busy", agentState: "completed", backgroundWork: false });
+
+		const row = snapshotToRows(buildActivitySnapshot())[0];
+		expect(row.status.label).toBe("Completed");
+		expect(row.isWorking).toBe(false);
+	});
+
+	it("renders an omitted busy session as exited rather than working", () => {
+		const row = snapshotToRows({
+			terminals: [
+				{
+					id: "omitted-session",
+					name: "Terminal 5",
+					shellState: "exited",
+					awaitingInput: null,
+					sessionId: null,
+					agentType: "claude",
+					agentIntent: null,
+					currentTask: null,
+					lastPrompt: null,
+					activeSubTasks: 0,
+					cwd: null,
+					lastDataAt: null,
+					idleSince: null,
+					isActive: false,
+					isRateLimited: false,
+					agentState: null,
+					backgroundWork: false,
+					isBusy: true,
+					isPromoted: false,
+				},
+			],
+		})[0];
+		expect(row.status.label).toBe("—");
+		expect(row.isWorking).toBe(false);
+	});
+});
+
+describe("terminalStatusLabel", () => {
+	let terminalStatusLabel: typeof LabelFn;
+	let effectiveActivityState: typeof EffectiveStateFn;
+	beforeEach(async () => {
+		vi.resetModules();
+		vi.doMock("@tauri-apps/api/core", () => ({ invoke: mockInvoke }));
+		terminalStatusLabel = (await import("../../utils/activitySnapshot")).terminalStatusLabel;
+		effectiveActivityState = (await import("../../utils/activitySnapshot")).effectiveActivityState;
+	});
+
+	const cls = { rateLimited: "RL", error: "ERR", waiting: "WAIT", working: "WORK", idle: "IDLE" };
+
+	it("rate-limited wins over everything", () => {
+		expect(terminalStatusLabel("busy", "error", true, cls)).toEqual({ label: "Rate limited", className: "RL" });
+	});
+
+	it("labels an API error as Error, NOT Waiting for input", () => {
+		// Regression: an errored agent must not be collapsed into "Waiting for input".
+		expect(terminalStatusLabel("idle", "error", false, cls)).toEqual({ label: "Error", className: "ERR" });
+	});
+
+	it("labels a question as Waiting for input", () => {
+		expect(terminalStatusLabel("idle", "question", false, cls)).toEqual({
+			label: "Waiting for input",
+			className: "WAIT",
+		});
+	});
+
+	it("maps shellState busy/idle when no awaiting input", () => {
+		expect(terminalStatusLabel("busy", null, false, cls)).toEqual({ label: "Working", className: "WORK" });
+		expect(terminalStatusLabel("idle", null, false, cls)).toEqual({ label: "Idle", className: "IDLE" });
+		expect(terminalStatusLabel(null, null, false, cls)).toEqual({ label: "—", className: "IDLE" });
+	});
+
+	it("shows a ready composer as idle even when Codex retains a background terminal", () => {
+		expect(effectiveActivityState("idle", null, false, "working", true)).toBe("idle");
+		expect(terminalStatusLabel("idle", null, false, cls, "working", true)).toEqual({ label: "Idle", className: "IDLE" });
+	});
+
+	it("keeps background work authoritative until the composer is ready", () => {
+		expect(effectiveActivityState("busy", null, false, "working", true)).toBe("working");
+		expect(effectiveActivityState(null, null, false, "working", true)).toBe("working");
+	});
+
+	it("preserves completed instead of reviving stale shell activity", () => {
+		expect(effectiveActivityState("busy", null, false, "completed", false)).toBe("completed");
+		expect(terminalStatusLabel("busy", null, false, cls, "completed", false)).toEqual({ label: "Completed", className: "IDLE" });
+	});
+
+	it("lets live shell activity override a lagging idle lifecycle snapshot", () => {
+		expect(effectiveActivityState("busy", null, false, "idle", false)).toBe("working");
+		expect(terminalStatusLabel("busy", null, false, cls, "idle", false)).toEqual({
+			label: "Working",
+			className: "WORK",
+		});
+	});
+
+	it("uses lifecycle awaiting-input when the parsed frontend event is stale or absent", () => {
+		expect(effectiveActivityState("idle", null, false, "awaiting_input", false)).toBe("awaiting_input");
+		expect(terminalStatusLabel("idle", null, false, cls, "awaiting_input", false)).toEqual({
+			label: "Waiting for input",
+			className: "WAIT",
+		});
+	});
+
+	it("lets a fresh idle lifecycle clear a prior working lifecycle", () => {
+		expect(effectiveActivityState("busy", null, false, "working", true)).toBe("working");
+		expect(effectiveActivityState("idle", null, false, "idle", false)).toBe("idle");
+	});
+});
+
+describe("reconcileActivityOrder", () => {
+	let reconcileActivityOrder: typeof ReconcileFn;
+	beforeEach(async () => {
+		vi.resetModules();
+		vi.doMock("@tauri-apps/api/core", () => ({ invoke: mockInvoke }));
+		reconcileActivityOrder = (await import("../../utils/activitySnapshot")).reconcileActivityOrder;
+	});
+
+	const working = (set: Set<string>) => (id: string) => set.has(id);
+
+	it("partitions working-first, idle-second, each in first-seen order", () => {
+		const spine: string[] = [];
+		const order = reconcileActivityOrder(spine, ["a", "b", "c", "d"], working(new Set(["b", "d"])));
+		expect(order).toEqual(["b", "d", "a", "c"]);
+	});
+
+	it("keeps a terminal in place while its working state is unchanged", () => {
+		const spine: string[] = [];
+		const w = new Set(["a", "b"]);
+		const first = reconcileActivityOrder(spine, ["a", "b", "c"], working(w));
+		// Recompute with the SAME states — order must be identical (no avanti-e-indietro).
+		const second = reconcileActivityOrder(spine, ["a", "b", "c"], working(w));
+		expect(second).toEqual(first);
+	});
+
+	it("moves a terminal only when it crosses the working/idle boundary", () => {
+		const spine: string[] = [];
+		reconcileActivityOrder(spine, ["a", "b", "c"], working(new Set(["a"])));
+		// b flips to working — it joins the working group at its spine position.
+		const after = reconcileActivityOrder(spine, ["a", "b", "c"], working(new Set(["a", "b"])));
+		expect(after).toEqual(["a", "b", "c"]);
+	});
+
+	it("appends newly-seen terminals at the end of their group", () => {
+		const spine: string[] = [];
+		reconcileActivityOrder(spine, ["a", "b"], working(new Set(["a"])));
+		const after = reconcileActivityOrder(spine, ["a", "b", "c"], working(new Set(["a", "c"])));
+		// c is new + working → after existing working 'a'; idle 'b' stays last.
+		expect(after).toEqual(["a", "c", "b"]);
+	});
+
+	it("drops removed terminals while preserving relative order", () => {
+		const spine: string[] = [];
+		reconcileActivityOrder(spine, ["a", "b", "c"], working(new Set()));
+		const after = reconcileActivityOrder(spine, ["a", "c"], working(new Set()));
+		expect(after).toEqual(["a", "c"]);
+		expect(spine).toEqual(["a", "c"]);
 	});
 });

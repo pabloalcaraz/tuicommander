@@ -1,6 +1,7 @@
 import { type Component, createEffect, createMemo, createSignal, For, onCleanup, Show } from "solid-js";
 import type { ActionEntry } from "../../actions/actionRegistry";
 import { commandPaletteStore } from "../../stores/commandPalette";
+import { registerModal } from "../../stores/modalStack";
 import { paneLayoutStore } from "../../stores/paneLayout";
 import { repositoriesStore } from "../../stores/repositories";
 import { terminalsStore } from "../../stores/terminals";
@@ -8,6 +9,7 @@ import type { TerminalMatch } from "../../types";
 import type { ContentMatch, DirEntry } from "../../types/fs";
 import { buildIndex } from "../../utils/bm25";
 import { openFileAction } from "../../utils/filePreview";
+import { pathBasename } from "../../utils/pathUtils";
 import { FileIcon } from "../FileBrowserPanel/FileIcon";
 import shared from "../shared/dialog.module.css";
 import s from "./CommandPalette.module.css";
@@ -92,7 +94,8 @@ export const CommandPalette: Component<CommandPaletteProps> = (props) => {
 	// Focus input when opened
 	createEffect(() => {
 		if (isOpen()) {
-			requestAnimationFrame(() => inputRef?.focus());
+			const frame = requestAnimationFrame(() => inputRef?.focus());
+			onCleanup(() => cancelAnimationFrame(frame));
 		}
 	});
 
@@ -122,7 +125,8 @@ export const CommandPalette: Component<CommandPaletteProps> = (props) => {
 	};
 
 	const openContentMatch = (match: ContentMatch) => {
-		const repoPath = repositoriesStore.state.activeRepoPath ?? "";
+		// Cross-repo results carry their own repo_path; fall back to the active repo.
+		const repoPath = match.repo_path ?? repositoriesStore.state.activeRepoPath ?? "";
 		openFile(repoPath, match.path, match.line_number);
 		commandPaletteStore.close();
 	};
@@ -146,6 +150,11 @@ export const CommandPalette: Component<CommandPaletteProps> = (props) => {
 	// Keyboard navigation
 	createEffect(() => {
 		if (!isOpen()) return;
+
+		// Escape-to-close is handled centrally (stores/modalStack): registering routes
+		// Escape to close AND stops it reaching the terminal underneath. Arrow/Enter
+		// navigation is still handled by the local listener below.
+		registerModal(() => commandPaletteStore.close());
 
 		const handleKeydown = (e: KeyboardEvent) => {
 			const count = itemCount();
@@ -177,11 +186,6 @@ export const CommandPalette: Component<CommandPaletteProps> = (props) => {
 						const action = filteredActions()[selectedIndex()];
 						if (action) executeAction(action);
 					}
-					break;
-				case "Escape":
-					e.preventDefault();
-					e.stopPropagation();
-					commandPaletteStore.close();
 					break;
 			}
 		};
@@ -228,6 +232,9 @@ export const CommandPalette: Component<CommandPaletteProps> = (props) => {
 	};
 
 	const hasActiveRepo = () => !!repositoriesStore.state.activeRepoPath;
+	const allReposContent = () => commandPaletteStore.state.contentAllRepos;
+	/** Content search is runnable when scanning all repos, or with an active repo */
+	const canSearchContent = () => allReposContent() || hasActiveRepo();
 
 	return (
 		<Show when={isOpen()}>
@@ -289,15 +296,23 @@ export const CommandPalette: Component<CommandPaletteProps> = (props) => {
 
 						{/* Content search mode (? prefix) */}
 						<Show when={mode() === "content"}>
-							<Show when={!hasActiveRepo()}>
+							<label class={s.scopeToggle}>
+								<input
+									type="checkbox"
+									checked={allReposContent()}
+									onChange={(e) => commandPaletteStore.setContentAllRepos(e.currentTarget.checked)}
+								/>
+								Search all repos
+							</label>
+							<Show when={!canSearchContent()}>
 								<div class={s.empty}>No repository selected</div>
 							</Show>
-							<Show when={hasActiveRepo() && searchQuery().length < 3}>
+							<Show when={canSearchContent() && searchQuery().length < 3}>
 								<div class={s.empty}>Type at least 3 characters after ?</div>
 							</Show>
 							<Show
 								when={
-									hasActiveRepo() &&
+									canSearchContent() &&
 									searchQuery().length >= 3 &&
 									commandPaletteStore.state.contentSearching &&
 									commandPaletteStore.state.contentResults.length === 0
@@ -307,7 +322,7 @@ export const CommandPalette: Component<CommandPaletteProps> = (props) => {
 							</Show>
 							<Show
 								when={
-									hasActiveRepo() &&
+									canSearchContent() &&
 									searchQuery().length >= 3 &&
 									!commandPaletteStore.state.contentSearching &&
 									commandPaletteStore.state.contentResults.length === 0 &&
@@ -328,6 +343,9 @@ export const CommandPalette: Component<CommandPaletteProps> = (props) => {
 									>
 										<span class={s.contentPath}>
 											{match.path}:{match.line_number}
+											<Show when={match.repo_path}>
+												<span class={s.repoBadge}>{pathBasename(match.repo_path ?? "")}</span>
+											</Show>
 										</span>
 										{renderMatchLine(match)}
 									</div>

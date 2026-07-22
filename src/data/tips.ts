@@ -51,6 +51,12 @@ export const TIPS: Tip[] = [
 		shortcut: `${mod}+E`,
 	},
 	{
+		feature: "Plugin File Previews",
+		description:
+			"Install preview plugins from Settings > Plugins > Browse to open formats like DOCX directly from the File Browser.",
+		shortcut: null,
+	},
+	{
 		feature: "File Content Search",
 		description:
 			"Press C in the file browser search bar to switch to content search — searches inside files with regex, case-sensitive, and whole-word options.",
@@ -268,6 +274,12 @@ export const TIPS: Tip[] = [
 		shortcut: null,
 	},
 	{
+		feature: "GitHub Ops Proposals",
+		description:
+			"Open the GitHub Ops dashboard to scan a repo for refactor, testing, or performance proposals, then create issues only for the ones you approve.",
+		shortcut: null,
+	},
+	{
 		feature: "MCP Per-Repo",
 		description:
 			"Choose which upstream MCP servers are active for each repo. Toggle servers on/off per-repo, or share the list via .tuic.json.",
@@ -394,26 +406,29 @@ export const TIPS: Tip[] = [
 	},
 	{
 		feature: "Block-Scoped Search",
-		description:
-			"Toggle block-scoped search to restrict find-in-terminal to only the current command block's output.",
+		description: "Toggle block-scoped search to restrict find-in-terminal to only the current command block's output.",
 		shortcut: `${mod}+Shift+B`,
 	},
 	{
 		feature: "Block Timestamps",
-		description:
-			"Hold Ctrl+Cmd to reveal when each command block started, shown as relative time in the gutter.",
+		description: "Hold Ctrl+Cmd to reveal when each command block started, shown as relative time in the gutter.",
 		shortcut: null,
 	},
 	{
 		feature: "Navigate Between Blocks",
-		description:
-			"Jump between command block boundaries to quickly hop through your terminal history.",
+		description: "Jump between command block boundaries to quickly hop through your terminal history.",
 		shortcut: `${mod}+Shift+Up/Down`,
 	},
 	{
 		feature: "Secure Generators",
 		description:
 			"Generate passwords, UUIDs, JWTs, TOTP secrets, and more from the command palette. All values are generated with cryptographic randomness.",
+		shortcut: null,
+	},
+	{
+		feature: "Native Agent Hooks",
+		description:
+			"Let Claude or Gemini report status through their own hooks for precise busy/idle/waiting state — enable per agent in Settings → Agents. TUIC installs and removes the hooks cleanly and never touches your own.",
 		shortcut: null,
 	},
 ];

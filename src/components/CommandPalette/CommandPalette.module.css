@@ -4,7 +4,7 @@
   max-width: 90vw;
   max-height: 60vh;
   background: var(--bg-secondary);
-  border-radius: var(--radius-xl);
+  border-radius: var(--radius-md);
   border: 1px solid var(--border);
   box-shadow: var(--shadow-popup);
   display: flex;
@@ -21,7 +21,7 @@
   padding: 8px 12px;
   background: var(--bg-tertiary);
   border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
+  border-radius: var(--radius-sm);
   color: var(--fg-primary);
   font-size: var(--font-base);
   outline: none;
@@ -104,6 +104,39 @@
   display: flex;
   align-items: center;
   gap: 4px;
+}
+
+/* Content search scope toggle (active repo vs all repos) */
+.scopeToggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 16px;
+  border-bottom: 1px solid var(--border);
+  font-size: var(--font-sm);
+  color: var(--fg-muted);
+  cursor: pointer;
+  user-select: none;
+}
+
+.scopeToggle:hover {
+  color: var(--fg-secondary);
+}
+
+.scopeToggle input {
+  cursor: pointer;
+}
+
+/* Repo badge shown on cross-repo content results */
+.repoBadge {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 0 6px;
+  background: var(--bg-tertiary);
+  border-radius: var(--radius-sm);
+  font-size: var(--font-xs);
+  color: var(--fg-muted);
+  font-family: var(--font-ui);
 }
 
 /* Content search result items */

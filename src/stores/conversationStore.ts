@@ -12,7 +12,9 @@
 
 import type { Accessor, Setter } from "solid-js";
 import { batch, createSignal } from "solid-js";
+import { invoke } from "../invoke";
 import { isTauri } from "../transport";
+import { openChatStream, openConversationStream } from "../utils/aiStream";
 import { appLogger } from "./appLogger";
 
 // ---------------------------------------------------------------------------
@@ -84,6 +86,7 @@ export type ConversationMeta = BackendConversationMeta;
 type ConversationEvent =
 	| { type: "thinking"; iteration: number }
 	| { type: "text_chunk"; text: string }
+	| { type: "reasoning_chunk"; text: string }
 	| { type: "tool_call"; tool_name: string; args: Record<string, unknown> }
 	| { type: "tool_result"; tool_name: string; success: boolean; output: string }
 	| { type: "needs_approval"; tool_name: string; command: string; reason: string }
@@ -91,6 +94,8 @@ type ConversationEvent =
 	| { type: "paused" }
 	| { type: "resumed" }
 	| { type: "rate_limited"; wait_ms: number }
+	| { type: "retrying"; attempt: number; wait_ms: number; reason: string }
+	| { type: "compacted"; elided: number; before_tokens: number }
 	| { type: "error"; message: string }
 	| { type: "completed"; reason: string; usage: { input_tokens: number; output_tokens: number } | null };
 
@@ -99,6 +104,7 @@ type LegacyAgentEvent =
 	| { type: "started"; session_id: string }
 	| { type: "thinking"; session_id: string; iteration: number }
 	| { type: "text_chunk"; session_id: string; text: string }
+	| { type: "reasoning_chunk"; session_id: string; text: string }
 	| { type: "tool_call"; session_id: string; tool_name: string; args: Record<string, unknown> }
 	| { type: "tool_result"; session_id: string; tool_name: string; success: boolean; output: string }
 	| { type: "needs_approval"; session_id: string; tool_name: string; command: string; reason: string }
@@ -155,6 +161,8 @@ export interface PerTerminalConversationState {
 	setToolCalls: Setter<ToolCallEntry[]>;
 	textChunks: Accessor<string>;
 	setTextChunks: Setter<string>;
+	reasoningChunks: Accessor<string>;
+	setReasoningChunks: Setter<string>;
 	pendingApproval: Accessor<PendingApproval | null>;
 	setPendingApproval: Setter<PendingApproval | null>;
 	agentError: Accessor<string | null>;
@@ -171,6 +179,9 @@ export interface PerTerminalConversationState {
 	persistTimer: ReturnType<typeof setTimeout> | null;
 	initialized: boolean;
 	registrySubscription: RegistrySubscription | null;
+	// Browser/PWA only: disposer for the active conversation token-stream WS.
+	// Desktop uses a Tauri Channel (auto-cleaned), so this stays null there.
+	conversationStreamDispose: (() => void) | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -178,6 +189,7 @@ export interface PerTerminalConversationState {
 // ---------------------------------------------------------------------------
 
 const MAX_MESSAGES = 100;
+const MAX_TOOL_CALLS = 500;
 const PERSIST_DEBOUNCE_MS = 500;
 const DEFAULT_KEY = "__default__";
 
@@ -203,6 +215,7 @@ function createState(): PerTerminalConversationState {
 	const [currentIteration, setCurrentIteration] = createSignal(0);
 	const [toolCalls, setToolCalls] = createSignal<ToolCallEntry[]>([]);
 	const [textChunks, setTextChunks] = createSignal("");
+	const [reasoningChunks, setReasoningChunks] = createSignal("");
 	const [pendingApproval, setPendingApproval] = createSignal<PendingApproval | null>(null);
 	const [agentError, setAgentError] = createSignal<string | null>(null);
 	const [completionReason, setCompletionReason] = createSignal<string | null>(null);
@@ -229,6 +242,8 @@ function createState(): PerTerminalConversationState {
 		setToolCalls,
 		textChunks,
 		setTextChunks,
+		reasoningChunks,
+		setReasoningChunks,
 		pendingApproval,
 		setPendingApproval,
 		agentError,
@@ -244,7 +259,17 @@ function createState(): PerTerminalConversationState {
 		persistTimer: null,
 		initialized: false,
 		registrySubscription: null,
+		conversationStreamDispose: null,
 	};
+}
+
+/** Close the active browser conversation token-stream WS, if any. No-op on
+ * desktop (Channel transport) and when no stream is open. */
+function closeConversationStream(s: PerTerminalConversationState): void {
+	if (s.conversationStreamDispose) {
+		s.conversationStreamDispose();
+		s.conversationStreamDispose = null;
+	}
 }
 
 function getOrCreate(key: string): PerTerminalConversationState {
@@ -297,6 +322,9 @@ function toolCalls(): ToolCallEntry[] {
 }
 function textChunks(): string {
 	return activeConversation().textChunks();
+}
+function reasoningChunks(): string {
+	return activeConversation().reasoningChunks();
 }
 function pendingApproval(): PendingApproval | null {
 	return activeConversation().pendingApproval();
@@ -514,6 +542,12 @@ function applyConversationEvent(s: PerTerminalConversationState, event: Conversa
 			}
 			break;
 
+		case "reasoning_chunk":
+			// Extended-thinking stream (Opus 4.7+). Accumulate for the disclosure;
+			// reset happens at the start of each new user turn (see sendMessage).
+			s.setReasoningChunks((prev) => prev + event.text);
+			break;
+
 		case "tool_call": {
 			s.setIsThinking(false);
 			const entry: ToolCallEntry = {
@@ -522,7 +556,10 @@ function applyConversationEvent(s: PerTerminalConversationState, event: Conversa
 				args: event.args as Record<string, unknown>,
 				startedAt: Date.now(),
 			};
-			s.setToolCalls((prev) => [...prev, entry]);
+			s.setToolCalls((prev) => {
+				const next = [...prev, entry];
+				return next.length > MAX_TOOL_CALLS ? next.slice(next.length - MAX_TOOL_CALLS) : next;
+			});
 			break;
 		}
 
@@ -568,6 +605,20 @@ function applyConversationEvent(s: PerTerminalConversationState, event: Conversa
 
 		case "rate_limited":
 			appLogger.info("conversation", `Rate limited, waiting ${event.wait_ms}ms`);
+			break;
+
+		case "retrying":
+			appLogger.info(
+				"conversation",
+				`Retrying LLM call (attempt ${event.attempt}) in ${event.wait_ms}ms: ${event.reason}`,
+			);
+			break;
+
+		case "compacted":
+			appLogger.info(
+				"conversation",
+				`History compacted: elided ${event.elided} old tool result(s) at ${event.before_tokens} tokens`,
+			);
 			break;
 
 		case "error":
@@ -635,7 +686,6 @@ function accumulateUsageForState(
 // ---------------------------------------------------------------------------
 
 async function sendMessage(text: string, sessionId: string | null): Promise<void> {
-	if (!isTauri()) return;
 	const s = activeConversation();
 	if (s.isStreaming()) return;
 	if (!sessionId) {
@@ -649,15 +699,27 @@ async function sendMessage(text: string, sessionId: string | null): Promise<void
 		s.setError(null);
 		s.setIsStreaming(true);
 		s.setStreamingText("");
+		s.setReasoningChunks("");
 	});
 	s.currentMode = "assisted";
 	s.activeSessionId = sessionId;
 
 	try {
-		const { invoke, Channel } = await import("@tauri-apps/api/core");
-		const onEvent = new Channel<ConversationEvent>();
-		onEvent.onmessage = (event) => applyConversationEvent(s, event, capturedKey);
-		await invoke("start_conversation", { sessionId, message: text, autonomy: "assisted", onEvent });
+		if (isTauri()) {
+			const { invoke: coreInvoke, Channel } = await import("@tauri-apps/api/core");
+			const onEvent = new Channel<ConversationEvent>();
+			onEvent.onmessage = (event) => applyConversationEvent(s, event, capturedKey);
+			await coreInvoke("start_conversation", { sessionId, message: text, autonomy: "assisted", onEvent });
+		} else {
+			// Browser/PWA: dedicated WS carries the token stream (event-bridge plan Step 5).
+			closeConversationStream(s); // drop any orphaned prior stream first
+			s.conversationStreamDispose = openConversationStream<ConversationEvent>(
+				sessionId,
+				{ message: text, autonomy: "assisted" },
+				(event) => applyConversationEvent(s, event, capturedKey),
+				() => onConversationStreamClosed(s, capturedKey),
+			);
+		}
 	} catch (e) {
 		batch(() => {
 			s.setIsStreaming(false);
@@ -673,7 +735,8 @@ async function cancelStream(): Promise<void> {
 	if (!s.isStreaming()) return;
 	if (!s.activeSessionId) return;
 	try {
-		const { invoke } = await import("@tauri-apps/api/core");
+		// Wrapper invoke: Tauri IPC on desktop, HTTP (COMMAND_TABLE) in browser.
+		// The conversation's terminal event then arrives over the active stream.
 		await invoke("cancel_conversation", { sessionId: s.activeSessionId });
 	} catch (e) {
 		appLogger.warn("conversation", "cancel_conversation failed", { error: String(e) });
@@ -681,7 +744,6 @@ async function cancelStream(): Promise<void> {
 }
 
 async function startAgent(sessionId: string, goal: string, isUnrestricted?: boolean): Promise<void> {
-	if (!isTauri()) return;
 	const s = activeConversation();
 	const capturedKey = activeKey();
 	if (s.agentState() === "running" || s.agentState() === "paused") return;
@@ -690,6 +752,7 @@ async function startAgent(sessionId: string, goal: string, isUnrestricted?: bool
 		s.setAgentState("running");
 		s.setToolCalls([]);
 		s.setTextChunks("");
+		s.setReasoningChunks("");
 		s.setAgentError(null);
 		s.setCompletionReason(null);
 		s.setCurrentIteration(0);
@@ -702,16 +765,27 @@ async function startAgent(sessionId: string, goal: string, isUnrestricted?: bool
 	const bypassed = isUnrestricted ? ["*"] : [];
 
 	try {
-		const { invoke, Channel } = await import("@tauri-apps/api/core");
-		const onEvent = new Channel<ConversationEvent>();
-		onEvent.onmessage = (event) => applyConversationEvent(s, event, capturedKey);
-		await invoke("start_conversation", {
-			sessionId,
-			message: goal,
-			autonomy: "autonomous",
-			bypassedTools: bypassed,
-			onEvent,
-		});
+		if (isTauri()) {
+			const { invoke: coreInvoke, Channel } = await import("@tauri-apps/api/core");
+			const onEvent = new Channel<ConversationEvent>();
+			onEvent.onmessage = (event) => applyConversationEvent(s, event, capturedKey);
+			await coreInvoke("start_conversation", {
+				sessionId,
+				message: goal,
+				autonomy: "autonomous",
+				bypassedTools: bypassed,
+				onEvent,
+			});
+		} else {
+			// Browser/PWA: dedicated WS carries the agent token stream (event-bridge plan Step 5).
+			closeConversationStream(s); // drop any orphaned prior stream first
+			s.conversationStreamDispose = openConversationStream<ConversationEvent>(
+				sessionId,
+				{ message: goal, autonomy: "autonomous", bypassedTools: bypassed },
+				(event) => applyConversationEvent(s, event, capturedKey),
+				() => onConversationStreamClosed(s, capturedKey),
+			);
+		}
 	} catch (e) {
 		batch(() => {
 			s.setAgentState("error");
@@ -721,11 +795,21 @@ async function startAgent(sessionId: string, goal: string, isUnrestricted?: bool
 	}
 }
 
+/** Handle an unexpected browser WS drop: clear our disposer handle, and if the
+ * stream was still active (no Completed/Error frame arrived), surface a synthetic
+ * error so the UI doesn't wedge in a perpetual "streaming"/"running" state. A
+ * close right after a terminal frame is expected — `isStreaming`/`agentState`
+ * are already settled, so we stay quiet. */
+function onConversationStreamClosed(s: PerTerminalConversationState, ownerKey: string): void {
+	s.conversationStreamDispose = null;
+	if (s.isStreaming() || s.agentState() === "running") {
+		applyConversationEvent(s, { type: "error", message: "Stream connection lost" }, ownerKey);
+	}
+}
+
 async function cancelAgent(sessionId: string): Promise<void> {
-	if (!isTauri()) return;
 	const s = activeConversation();
 	try {
-		const { invoke } = await import("@tauri-apps/api/core");
 		await invoke("cancel_conversation", { sessionId });
 		s.setAgentState("cancelled");
 	} catch (e) {
@@ -736,10 +820,8 @@ async function cancelAgent(sessionId: string): Promise<void> {
 }
 
 async function pauseAgent(sessionId: string): Promise<void> {
-	if (!isTauri()) return;
 	const s = activeConversation();
 	try {
-		const { invoke } = await import("@tauri-apps/api/core");
 		await invoke("pause_conversation", { sessionId });
 		s.setAgentState("paused");
 	} catch (e) {
@@ -750,10 +832,8 @@ async function pauseAgent(sessionId: string): Promise<void> {
 }
 
 async function resumeAgent(sessionId: string): Promise<void> {
-	if (!isTauri()) return;
 	const s = activeConversation();
 	try {
-		const { invoke } = await import("@tauri-apps/api/core");
 		await invoke("resume_conversation", { sessionId });
 		s.setAgentState("running");
 	} catch (e) {
@@ -764,10 +844,8 @@ async function resumeAgent(sessionId: string): Promise<void> {
 }
 
 async function approveAction(sessionId: string, approved: boolean): Promise<void> {
-	if (!isTauri()) return;
 	const s = activeConversation();
 	try {
-		const { invoke } = await import("@tauri-apps/api/core");
 		await invoke("approve_conversation_action", { sessionId, approved });
 		s.setPendingApproval(null);
 	} catch (e) {
@@ -783,6 +861,7 @@ function resetAgent(): void {
 		s.setAgentState("idle");
 		s.setToolCalls([]);
 		s.setTextChunks("");
+		s.setReasoningChunks("");
 		s.setAgentError(null);
 		s.setCompletionReason(null);
 		s.setCurrentIteration(0);
@@ -813,6 +892,9 @@ function processEvent(raw: unknown): void {
 		case "text_chunk":
 			s.setTextChunks((prev) => prev + event.text);
 			break;
+		case "reasoning_chunk":
+			s.setReasoningChunks((prev) => prev + event.text);
+			break;
 		case "tool_call": {
 			const entry: ToolCallEntry = {
 				status: "pending",
@@ -820,7 +902,10 @@ function processEvent(raw: unknown): void {
 				args: event.args,
 				startedAt: Date.now(),
 			};
-			s.setToolCalls((prev) => [...prev, entry]);
+			s.setToolCalls((prev) => {
+				const next = [...prev, entry];
+				return next.length > MAX_TOOL_CALLS ? next.slice(next.length - MAX_TOOL_CALLS) : next;
+			});
 			break;
 		}
 		case "tool_result":
@@ -885,9 +970,12 @@ async function onTerminalClose(key: string): Promise<void> {
 		s.registrySubscription = null;
 	}
 
-	if ((s.isStreaming() || s.agentState() === "running") && s.activeSessionId && isTauri()) {
+	// Browser/PWA: the terminal is gone, so close the token-stream WS rather than
+	// leak it waiting for a terminal frame that no one will consume.
+	closeConversationStream(s);
+
+	if ((s.isStreaming() || s.agentState() === "running") && s.activeSessionId) {
 		try {
-			const { invoke } = await import("@tauri-apps/api/core");
 			await invoke("cancel_conversation", { sessionId: s.activeSessionId });
 		} catch (e) {
 			appLogger.warn("conversation", "onTerminalClose: cancel_conversation failed", { error: String(e) });
@@ -958,12 +1046,27 @@ function applyRegistryEvent(s: PerTerminalConversationState, event: RegistryChat
 }
 
 async function subscribeToRegistry(targetChatId: string): Promise<void> {
-	if (!isTauri()) return;
 	const s = activeConversation();
 
 	if (s.registrySubscription) {
 		await s.registrySubscription.cleanup();
 		s.registrySubscription = null;
+	}
+
+	// Browser/PWA: dedicated chat WS (event-bridge plan Step 5). First frame is
+	// the snapshot (carries kind:"snapshot"); WS close unsubscribes.
+	if (!isTauri()) {
+		try {
+			const dispose = openChatStream<RegistryChatEvent>(targetChatId, (event) => applyRegistryEvent(s, event));
+			s.registrySubscription = {
+				chatId: targetChatId,
+				subscriptionId: 0,
+				cleanup: async () => dispose(),
+			};
+		} catch (e) {
+			appLogger.warn("conversation", "subscribeToRegistry (ws) failed", { error: String(e) });
+		}
+		return;
 	}
 
 	try {
@@ -1004,7 +1107,7 @@ async function subscribeToRegistry(targetChatId: string): Promise<void> {
 				}
 			},
 		};
-		appLogger.info("conversation", `subscribed to registry: chatId=${targetChatId} subId=${subId}`);
+		appLogger.debug("conversation", `subscribed to registry: chatId=${targetChatId} subId=${subId}`);
 	} catch (e) {
 		appLogger.warn("conversation", "subscribeToRegistry failed", { error: String(e) });
 	}
@@ -1101,6 +1204,7 @@ export const conversationStore = {
 	currentIteration,
 	toolCalls,
 	textChunks,
+	reasoningChunks,
 	pendingApproval,
 	agentError,
 	completionReason,

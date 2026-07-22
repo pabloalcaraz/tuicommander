@@ -1,4 +1,4 @@
-import { type Component, createEffect, createMemo, createSignal, onCleanup, onMount, Show } from "solid-js";
+import { type Component, createEffect, createMemo, createSignal, Match, onCleanup, onMount, Show, Switch } from "solid-js";
 import { AGENT_DISPLAY } from "../../agents";
 import { useGitHub } from "../../hooks/useGitHub";
 import { t } from "../../i18n";
@@ -14,6 +14,7 @@ import { settingsStore } from "../../stores/settings";
 import { statusBarTicker } from "../../stores/statusBarTicker";
 import { terminalsStore } from "../../stores/terminals";
 import { cx } from "../../utils";
+import { writeClipboard } from "../../utils/clipboard";
 import { keyFor } from "../../utils/hotkey";
 import { activePrStatus } from "../../utils/mergedPrGrace";
 import { PrDetailPopover } from "../PrDetailPopover/PrDetailPopover";
@@ -36,6 +37,7 @@ export interface StatusBarProps {
 	onDictationStop: () => void;
 	currentRepoPath?: string;
 	cwd?: string;
+	repoRoot?: string;
 	onBranchRenamed?: (oldName: string, newName: string) => void;
 	onReviewPr?: (repoPath: string, branchName: string, command: string) => void;
 }
@@ -91,7 +93,7 @@ export const StatusBar: Component<StatusBarProps> = (props) => {
 	const handleCopyCwd = async () => {
 		if (!props.cwd) return;
 		try {
-			await navigator.clipboard.writeText(shortenHomePath(props.cwd));
+			await writeClipboard(shortenHomePath(props.cwd));
 			setCwdCopied(true);
 			setTimeout(() => setCwdCopied(false), 1500);
 		} catch (err) {
@@ -99,11 +101,18 @@ export const StatusBar: Component<StatusBarProps> = (props) => {
 		}
 	};
 
-	// Shorten path: show ~/ for home, collapse middle segments
-	const shortenedCwd = () => {
+	// Split CWD into repo-root prefix and subpath suffix for two-tone display
+	const cwdParts = () => {
 		const cwd = props.cwd;
 		if (!cwd) return null;
-		return shortenHomePath(cwd);
+		const root = props.repoRoot;
+		if (root && cwd.startsWith(root) && cwd.length > root.length) {
+			return {
+				rootPart: shortenHomePath(root),
+				subPath: cwd.slice(root.length),
+			};
+		}
+		return { rootPart: shortenHomePath(cwd), subPath: null };
 	};
 
 	// Pendulum ticker: detect overflow on notification text
@@ -220,13 +229,20 @@ export const StatusBar: Component<StatusBarProps> = (props) => {
 						<div class={s.infoBalloon}>{props.statusInfo}</div>
 					</Show>
 				</Show>
-				<Show when={shortenedCwd()}>
+				<Show when={cwdParts()}>
 					<span
 						class={s.cwd}
 						title={`${t("statusBar.clickCopy", "Click to copy:")} ${props.cwd}`}
 						onClick={handleCopyCwd}
 					>
-						{cwdCopied() ? t("statusBar.copied", "Copied!") : shortenedCwd()}
+						{cwdCopied() ? (
+							t("statusBar.copied", "Copied!")
+						) : (
+							<>
+								<span class={s.cwdRoot}>{cwdParts()!.rootPart}</span>
+								{cwdParts()!.subPath && <span class={s.cwdSub}>{cwdParts()!.subPath}</span>}
+							</>
+						)}
 					</span>
 				</Show>
 				<TickerArea />
@@ -255,33 +271,39 @@ export const StatusBar: Component<StatusBarProps> = (props) => {
 								<span style={{ color: display().color }}>
 									<AgentIcon agent={agentType()} size={12} />
 								</span>
-								{rl() ? (
-									<span class={s.agentRateLimited}> ⚠ {rl()!.remaining}</span>
-								) : claudeTicker() ? (
-									<span
-										class={cx(
-											s.agentUsage,
-											claudeTicker()!.priority >= 90 && s.agentUsageCritical,
-											claudeTicker()!.priority >= 50 && claudeTicker()!.priority < 90 && s.agentUsageWarning,
+								<Switch fallback={<span style={{ color: display().color }}> {agentType()}</span>}>
+									<Match when={rl()}>
+										{(rl) => <span class={s.agentRateLimited}> ⚠ {rl().remaining}</span>}
+									</Match>
+									<Match when={claudeTicker()}>
+										{(ticker) => (
+											<span
+												class={cx(
+													s.agentUsage,
+													ticker().priority >= 90 && s.agentUsageCritical,
+													ticker().priority >= 50 && ticker().priority < 90 && s.agentUsageWarning,
+												)}
+											>
+												{" "}
+												{ticker().text.replace(/^Claude:\s*/, "")}
+											</span>
 										)}
-									>
-										{" "}
-										{claudeTicker()!.text.replace(/^Claude:\s*/, "")}
-									</span>
-								) : ul() ? (
-									<span
-										class={cx(
-											s.agentUsage,
-											ul()!.percentage >= 90 && s.agentUsageCritical,
-											ul()!.percentage >= 70 && ul()!.percentage < 90 && s.agentUsageWarning,
+									</Match>
+									<Match when={ul()}>
+										{(ul) => (
+											<span
+												class={cx(
+													s.agentUsage,
+													ul().percentage >= 90 && s.agentUsageCritical,
+													ul().percentage >= 70 && ul().percentage < 90 && s.agentUsageWarning,
+												)}
+											>
+												{" "}
+												{ul().percentage}% {ul().limitType}
+											</span>
 										)}
-									>
-										{" "}
-										{ul()!.percentage}% {ul()!.limitType}
-									</span>
-								) : (
-									<span style={{ color: display().color }}> {agentType()}</span>
-								)}
+									</Match>
+								</Switch>
 							</span>
 						);
 					}}

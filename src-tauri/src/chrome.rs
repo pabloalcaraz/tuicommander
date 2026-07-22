@@ -87,32 +87,49 @@ pub fn is_chrome_row(text: &str) -> bool {
     false
 }
 
-/// Returns true when the row contains an animated spinner character, proving
-/// the agent is alive. This is a subset of `is_chrome_row`: mode-line prefixes
+/// Returns true when the row is an agent's animated working spinner, proving the
+/// agent is alive. This is a subset of `is_chrome_row`: mode-line prefixes
 /// (⏵ ⏸ ›), box borders (▀ ▄), and interrupt markers (■) are static chrome
 /// and return false here.
+///
+/// A spinner is matched STRUCTURALLY: the LEADING glyph of the (trimmed) line
+/// must be a spinner character. Every supported agent renders its spinner at the
+/// very start of the status row — `✻ Cogitating…`, `· Proofing…`, `⠴ Reading…`,
+/// Aider's `█░ Waiting…`. Requiring the glyph to LEAD the line (not merely appear
+/// somewhere) is what keeps a status-line HUD (`[Opus] ██░░ 17% · …`), a welcome
+/// banner (`│ ▐▛███▜▌ │ … · …`), or prose that happens to contain a `·`/block
+/// from being read as a live spinner — the regression that pinned Claude BUSY
+/// forever under a wiz status bar whose progress bar ticks every second
+/// (#446-596f). Chasing individual glyphs is whack-a-mole; the position is the
+/// invariant.
 pub fn is_spinner_row(text: &str) -> bool {
+    // junie's idle status-bar effort icon (◐◑◒◓) is static chrome, not an animated
+    // spinner — suppress it here so junie's idle state is detected (otherwise the
+    // silence/idle path treats junie as perpetually busy). See is_junie_status_bar.
+    if is_junie_status_bar(text) {
+        return false;
+    }
     if is_codex_chrome_bullet(text) {
         return true;
     }
-    for c in text.chars() {
-        match c {
-            '\u{00B7}'        // · — Claude Code middle-dot spinner prefix
-            | '\u{2591}'      // ░ — Aider Knight Rider spinner (light shade)
-            | '\u{2588}'      // █ — Aider Knight Rider spinner (full block)
-            | '\u{25D0}'      // ◐ — Claude Code tool progress spinner
-            | '\u{25D1}'      // ◑ — Claude Code tool progress spinner
-            | '\u{25D2}'      // ◒ — Claude Code tool progress spinner
-            | '\u{25D3}'      // ◓ — Claude Code tool progress spinner
-            => return true,
-            // Claude Code spinner dingbats (U+2720–U+273F): ✢✣✤...✻✼✽✾✿
-            c if ('\u{2720}'..='\u{273F}').contains(&c) => return true,
-            // Braille spinner chars (U+2800–U+28FF): ⠋⠙⠹⠸⠴⠦⠧⠇ — Gemini CLI
-            c if ('\u{2800}'..='\u{28FF}').contains(&c) => return true,
-            _ => {}
-        }
-    }
-    false
+    // The spinner must LEAD the line. `•`/`◦` (Codex) are handled above.
+    let lead = match text.trim_start().chars().next() {
+        Some(c) => c,
+        None => return false,
+    };
+    matches!(lead,
+        '\u{00B7}'        // · — Claude Code middle-dot spinner prefix
+        | '\u{2591}'      // ░ — Aider Knight Rider spinner (light shade)
+        | '\u{2588}'      // █ — Aider Knight Rider spinner (full block)
+        | '\u{25D0}'      // ◐ — Claude Code tool progress spinner
+        | '\u{25D1}'      // ◑ — Claude Code tool progress spinner
+        | '\u{25D2}'      // ◒ — Claude Code tool progress spinner
+        | '\u{25D3}'      // ◓ — Claude Code tool progress spinner
+    )
+        // Claude Code spinner dingbats (U+2720–U+273F): ✢✣✤...✻✼✽✾✿
+        || ('\u{2720}'..='\u{273F}').contains(&lead)
+        // Braille spinner chars (U+2800–U+28FF): ⠋⠙⠹⠸⠴⠦⠧⠇ — Gemini CLI
+        || ('\u{2800}'..='\u{28FF}').contains(&lead)
 }
 
 /// Codex uses `•` (U+2022) for both chrome (spinner) and real output (action results).
@@ -132,6 +149,45 @@ fn is_codex_chrome_bullet(text: &str) -> bool {
         || after.starts_with("Boot")
         || after.contains("esc to")
         || after.contains("interrupt")
+}
+
+/// True if the row is an agent "working" status line that stays on screen for
+/// the WHOLE time the agent is busy — even while a spawned subprocess runs and
+/// the TUI is frozen (no grid changes at all).
+///
+/// Codex renders `• Working (12s • esc to interrupt)` (the blink spinner
+/// alternates `•` U+2022 / `◦` U+25E6) and then FREEZES its UI while a child
+/// process (cargo, git) runs — a long `cargo build` is minutes with zero grid
+/// changes. The change-driven spinner keepalive (`is_spinner_row` over
+/// `changed_rows`) cannot see a frozen line, so the idle timer needs a
+/// PRESENCE-driven signal: while this line sits in the content zone the agent
+/// is alive, regardless of whether it changed this tick.
+///
+/// Keyed on the "esc to interrupt" hint (shown only while working) so it never
+/// matches plain `• …` output bullets or the `• Boot` startup line.
+pub fn is_working_status_row(text: &str) -> bool {
+    let t = text.trim_start();
+    // Optional Codex blink bullet (• / ◦) then the working status text.
+    let t = t
+        .strip_prefix('\u{2022}')
+        .or_else(|| t.strip_prefix('\u{25E6}'))
+        .unwrap_or(t)
+        .trim_start();
+    t.starts_with("Working") && t.contains("esc to interrupt")
+}
+
+/// junie (JetBrains) renders a persistent idle status bar whose "effort"
+/// indicator uses a partial-circle glyph (◐◑◒◓, U+25D0–U+25D3) — the SAME glyphs
+/// Claude Code uses for its animated tool-progress spinner. Without
+/// disambiguation, junie's *static* bar reads as a live spinner, so junie is
+/// treated as perpetually busy and the idle notification never fires.
+///
+/// The junie status bar has a distinctive signature, e.g.:
+///   `~ tuicommander   ⚑ Brave off ctrl + b   ⌘ Grok 4.3 OpenRouter   ◐ Medium effort`
+/// Detect it by the command/flag markers (⌘ U+2318 / ⚑ U+2691) plus the effort
+/// label so the circle glyph in this row is not classified as an animated spinner.
+fn is_junie_status_bar(text: &str) -> bool {
+    text.contains("effort") && (text.contains('\u{2318}') || text.contains('\u{2691}'))
 }
 
 /// Returns true if a row is part of Claude Code's Ink-rendered task list.
@@ -195,24 +251,18 @@ pub fn find_chrome_cutoff(rows: &[&str]) -> Option<usize> {
         (None, None) => None,
     };
 
-    let cutoff = match anchor {
-        Some(mut idx) => {
-            // Extend cutoff up past separators, empty lines, and task list
-            // rows (⎿ ◻ ✔) above the anchor. Note: is_chrome_row is NOT
-            // included here — spinners above the separator are agent output
-            // indicators (e.g. Gemini braille), not footer chrome.
-            while idx > 0 {
-                let above = rows[idx - 1].trim();
-                if above.is_empty() || is_separator_line(above) || is_task_list_row(above) {
-                    idx -= 1;
-                } else {
-                    break;
-                }
-            }
-            idx
+    let mut cutoff = anchor?;
+    // Extend cutoff up past separators, empty lines, and task list rows (⎿ ◻ ✔)
+    // above the anchor. Note: is_chrome_row is NOT included here — spinners above
+    // the separator are agent output indicators (e.g. Gemini braille), not footer chrome.
+    while cutoff > 0 {
+        let above = rows[cutoff - 1].trim();
+        if above.is_empty() || is_separator_line(above) || is_task_list_row(above) {
+            cutoff -= 1;
+        } else {
+            break;
         }
-        None => return None,
-    };
+    }
 
     Some(cutoff)
 }
@@ -220,6 +270,50 @@ pub fn find_chrome_cutoff(rows: &[&str]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- is_working_status_row (presence-driven busy keepalive) ---
+
+    #[test]
+    fn codex_working_line_is_working_status() {
+        assert!(is_working_status_row(
+            "• Working (9m 24s • esc to interrupt)"
+        ));
+    }
+
+    #[test]
+    fn codex_working_blink_frame_is_working_status() {
+        // The blink spinner alternates • (U+2022) and ◦ (U+25E6); both frames
+        // must register or the keepalive drops on every other tick.
+        assert!(is_working_status_row("◦ Working (12s • esc to interrupt)"));
+    }
+
+    #[test]
+    fn codex_working_indented_is_working_status() {
+        assert!(is_working_status_row(
+            "   • Working (1m 3s • esc to interrupt)"
+        ));
+    }
+
+    #[test]
+    fn codex_output_bullet_is_not_working_status() {
+        // Plain action-result bullets must NOT hold the agent busy forever.
+        assert!(!is_working_status_row("• Added deny.toml (+95 -0)"));
+        assert!(!is_working_status_row("• Ran cargo test -p proxy-min"));
+    }
+
+    #[test]
+    fn codex_boot_line_is_not_working_status() {
+        // Startup line has no "esc to interrupt" hint.
+        assert!(!is_working_status_row("• Boot"));
+    }
+
+    #[test]
+    fn prose_mentioning_interrupt_is_not_working_status() {
+        // Real agent text about interrupts must not be mistaken for the status.
+        assert!(!is_working_status_row(
+            "You can press esc to interrupt a running task."
+        ));
+    }
 
     // --- is_separator_line ---
 
@@ -788,7 +882,37 @@ mod tests {
 
     #[test]
     fn spinner_row_aider() {
+        // Aider's Knight Rider block spinner (░█) LEADS its row → still matched.
         assert!(is_spinner_row("░██░░░░░░░"));
+        assert!(is_spinner_row("█░  Waiting for model"));
+    }
+
+    #[test]
+    fn hud_progress_bar_not_generic_spinner() {
+        // A wiz/status-line HUD progress bar ticks every second but is not a
+        // working spinner — the regression that pinned Claude BUSY (#446-596f).
+        // The bar glyphs are mid-line (behind `[Opus] `), never leading.
+        assert!(!is_spinner_row("[Opus | Team] ██░░░░░░░░ 17% | repo"));
+        assert!(!is_spinner_row("  [Opus | Team] ░░░░░░░░░░ 0% | repo"));
+    }
+
+    #[test]
+    fn claude_welcome_banner_not_spinner() {
+        // Claude's ▐▛███▜▌ welcome banner art (boxed) does not lead with a
+        // spinner glyph, and the `·` in `context) · Claude Team` is mid-line.
+        assert!(!is_spinner_row("│   ▐▛███▜▌   │ What's new"));
+        assert!(!is_spinner_row("│  ▝▜█████▛▘  │ Forked subagents"));
+        assert!(!is_spinner_row(
+            "│ Opus 4.8 (1M context) · Claude Team · LS │"
+        ));
+    }
+
+    #[test]
+    fn footer_with_middle_dot_not_spinner() {
+        // The bypass footer carries a `·` separator mid-line — not a spinner.
+        assert!(!is_spinner_row(
+            "⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"
+        ));
     }
 
     #[test]
@@ -831,6 +955,27 @@ mod tests {
     fn not_spinner_plain_text() {
         assert!(!is_spinner_row("Hello world"));
         assert!(!is_spinner_row(""));
+    }
+
+    #[test]
+    fn not_spinner_junie_status_bar() {
+        // junie's idle effort icon (◐◑◒◓) is static chrome, not a live spinner.
+        assert!(!is_spinner_row(
+            "~ tuicommander   ⚑ Brave off ctrl + b   ⌘ Grok 4.3 OpenRouter   ◐ Medium effort"
+        ));
+        assert!(!is_spinner_row("⌘ Grok 4.3   ◑ High effort"));
+        assert!(!is_spinner_row("⚑ Brave on   ◓ Low effort"));
+    }
+
+    #[test]
+    fn junie_disambiguation_preserves_claude_spinner() {
+        // A Claude tool-progress row uses the same ◐ glyph but lacks junie's
+        // status-bar signature (⌘/⚑ + "effort"), so it stays a spinner.
+        assert!(is_spinner_row("◐ Bash: running tests"));
+        assert!(!is_junie_status_bar("◐ Bash: running tests"));
+        assert!(is_junie_status_bar(
+            "~ tuicommander   ⚑ Brave off   ⌘ Grok 4.3   ◐ Medium effort"
+        ));
     }
 
     // --- is_task_list_row ---

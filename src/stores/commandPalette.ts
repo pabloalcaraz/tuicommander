@@ -25,6 +25,8 @@ interface CommandPaletteState {
 	contentResults: ContentMatch[];
 	contentSearching: boolean;
 	contentError: string | null;
+	/** When true, content search (? prefix) spans all indexed repos, not just the active one */
+	contentAllRepos: boolean;
 	/** Filename search results (! prefix) */
 	filenameResults: DirEntry[];
 	filenameSearching: boolean;
@@ -52,6 +54,7 @@ function createCommandPaletteStore() {
 		contentResults: [],
 		contentSearching: false,
 		contentError: null,
+		contentAllRepos: false,
 		filenameResults: [],
 		filenameSearching: false,
 		terminalResults: [],
@@ -109,8 +112,11 @@ function createCommandPaletteStore() {
 
 	/** Fire a content search with streaming results */
 	async function triggerContentSearch(searchQuery: string): Promise<void> {
+		const allRepos = state.contentAllRepos;
 		const repoPath = repositoriesStore.state.activeRepoPath;
-		if (!repoPath || searchQuery.length < CONTENT_SEARCH_MIN_CHARS) return;
+		if (searchQuery.length < CONTENT_SEARCH_MIN_CHARS) return;
+		// Single-repo search needs an active repo; all-repos search does not.
+		if (!allRepos && !repoPath) return;
 
 		cancelled = false;
 		setState({ contentResults: [], contentSearching: true, contentError: null });
@@ -142,13 +148,16 @@ function createCommandPaletteStore() {
 
 		if (cancelled) return;
 
-		invoke("search_content", {
-			repoPath,
-			query: searchQuery,
-			caseSensitive: false,
-			useRegex: false,
-			wholeWord: false,
-		}).catch((err) => {
+		const invocation = allRepos
+			? invoke("search_content_all", { query: searchQuery, caseSensitive: false })
+			: invoke("search_content", {
+					repoPath,
+					query: searchQuery,
+					caseSensitive: false,
+					useRegex: false,
+					wholeWord: false,
+				});
+		invocation.catch((err) => {
 			if (!cancelled) {
 				appLogger.error("app", "Content search failed", err);
 				setState({ contentError: String(err), contentSearching: false });
@@ -161,30 +170,40 @@ function createCommandPaletteStore() {
 		cancelled = false;
 		setState({ terminalResults: [], terminalSearching: true });
 
-		const allResults: TerminalMatch[] = [];
 		const terminals = terminalsStore.state.terminals as Record<
 			string,
 			{ id: string; ref?: { searchBuffer?: (q: string) => TerminalMatch[] | Promise<TerminalMatch[]> } }
 		>;
 		const detached = terminalsStore.state.detachedWindows as Record<string, string>;
 
+		// Fire every attached terminal's searchBuffer concurrently; the cancelled
+		// check happens once at aggregation instead of per-round-trip.
+		const searchers: Array<(q: string) => TerminalMatch[] | Promise<TerminalMatch[]>> = [];
 		for (const id of Object.keys(terminals)) {
-			if (cancelled) break;
 			// Skip detached terminals
 			if (detached[id]) continue;
 			const ref = terminals[id]?.ref;
 			if (!ref?.searchBuffer) continue;
-			const matches = await ref.searchBuffer(searchQuery);
-			allResults.push(...matches);
+			searchers.push(ref.searchBuffer);
+		}
+		const settled = await Promise.allSettled(searchers.map((search) => search(searchQuery)));
+
+		if (cancelled) return;
+
+		const allResults: TerminalMatch[] = [];
+		for (const result of settled) {
+			if (result.status === "rejected") {
+				appLogger.error("app", "Terminal buffer search failed", result.reason);
+				continue;
+			}
+			allResults.push(...result.value);
 			if (allResults.length >= MAX_TERMINAL_RESULTS) break;
 		}
 
-		if (!cancelled) {
-			setState({
-				terminalResults: allResults.slice(0, MAX_TERMINAL_RESULTS),
-				terminalSearching: false,
-			});
-		}
+		setState({
+			terminalResults: allResults.slice(0, MAX_TERMINAL_RESULTS),
+			terminalSearching: false,
+		});
 	}
 
 	return {
@@ -279,6 +298,26 @@ function createCommandPaletteStore() {
 				} else {
 					setState({ terminalResults: [], terminalSearching: false });
 				}
+			}
+		},
+
+		/** Toggle content search between the active repo and all indexed repos,
+		 *  re-running the current query immediately when in content mode. */
+		setContentAllRepos(value: boolean): void {
+			if (state.contentAllRepos === value) return;
+			setState("contentAllRepos", value);
+			if (this.mode() !== "content") return;
+			const searchQuery = this.searchQuery();
+			cancelled = true;
+			unlistenBatch?.();
+			unlistenBatch = null;
+			unlistenError?.();
+			unlistenError = null;
+			if (searchQuery.length >= CONTENT_SEARCH_MIN_CHARS) {
+				setState({ contentResults: [], contentError: null });
+				triggerContentSearch(searchQuery);
+			} else {
+				setState({ contentResults: [], contentSearching: false, contentError: null });
 			}
 		},
 

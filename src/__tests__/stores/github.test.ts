@@ -69,14 +69,15 @@ describe("githubStore", () => {
 			deletions: 5,
 			checks: { passed: 2, failed: 0, pending: 0, total: 2 },
 			check_details: [
-				{ context: "build", state: "SUCCESS" },
-				{ context: "test", state: "SUCCESS" },
+				{ context: "build", state: "SUCCESS", html_url: "https://github.com/org/repo/runs/1" },
+				{ context: "test", state: "SUCCESS", html_url: "https://github.com/org/repo/runs/2" },
 			],
 			author: "alice",
 			commits: 3,
 			mergeable: "MERGEABLE",
 			merge_state_status: "CLEAN",
 			review_decision: "",
+			viewer_did_approve: false,
 			labels: [],
 			is_draft: false,
 			base_ref_name: "main",
@@ -210,6 +211,30 @@ describe("githubStore", () => {
 		it("returns empty array for unknown branch", () => {
 			testInScope(() => {
 				expect(store.getCheckDetails("/unknown", "feature/x")).toEqual([]);
+			});
+		});
+	});
+
+	describe("loadCheckDetails()", () => {
+		it("carries html_url from get_ci_checks through to CheckDetail (story 096-2ac0)", async () => {
+			await testInScopeAsync(async () => {
+				store.updateRepoData("/repo1", [makePrStatus()]);
+				mockInvoke.mockImplementation((cmd: string) =>
+					cmd === "get_ci_checks"
+						? Promise.resolve([
+								{ name: "build", status: "completed", conclusion: "success", html_url: "https://ci.example/build/1" },
+								// A provider with no URL — must map to "" so the row stays inert.
+								{ name: "legacy", status: "completed", conclusion: "success", html_url: "" },
+							])
+						: Promise.resolve(undefined),
+				);
+
+				await store.loadCheckDetails("/repo1", "feature/x", 42);
+
+				const details = store.getCheckDetails("/repo1", "feature/x");
+				expect(details).toHaveLength(2);
+				expect(details[0]).toEqual({ context: "build", state: "success", html_url: "https://ci.example/build/1" });
+				expect(details[1].html_url).toBe("");
 			});
 		});
 	});
@@ -363,6 +388,61 @@ describe("githubStore", () => {
 				expect(cb).toHaveBeenCalledWith("/repo1", "feature/x", 42);
 				store.setOnCiRecovered(null);
 				store.stopPolling();
+			});
+		});
+
+		it("fires conflict callback on blocked transition event", async () => {
+			await testInScopeAsync(async () => {
+				const cb = vi.fn();
+				store.setOnConflict(cb);
+				store.startPolling();
+				await vi.advanceTimersByTimeAsync(0);
+
+				emitEvent("github-transition", {
+					type: "blocked",
+					repo_path: "/repo1",
+					branch: "feature/x",
+					pr_number: 42,
+					title: "Add feature",
+				});
+
+				expect(cb).toHaveBeenCalledWith("/repo1", "feature/x", 42);
+				store.setOnConflict(null);
+				store.stopPolling();
+			});
+		});
+
+		it("triggerConflictHeal fires the registered conflict callback on demand", () => {
+			testInScope(() => {
+				const cb = vi.fn();
+				store.setOnConflict(cb);
+				store.triggerConflictHeal("/repo1", "feature/x", 42);
+				expect(cb).toHaveBeenCalledWith("/repo1", "feature/x", 42);
+				store.setOnConflict(null);
+			});
+		});
+
+		it("triggerConflictHeal is a no-op when no conflict callback is registered", () => {
+			testInScope(() => {
+				store.setOnConflict(null);
+				expect(() => store.triggerConflictHeal("/repo1", "feature/x", 42)).not.toThrow();
+			});
+		});
+
+		it("triggerCiHeal fires the registered ciFailed callback on demand", () => {
+			testInScope(() => {
+				const cb = vi.fn();
+				store.setOnCiFailed(cb);
+				store.triggerCiHeal("/repo1", "feature/x", 42);
+				expect(cb).toHaveBeenCalledWith("/repo1", "feature/x", 42);
+				store.setOnCiFailed(null);
+			});
+		});
+
+		it("triggerCiHeal is a no-op when no ciFailed callback is registered", () => {
+			testInScope(() => {
+				store.setOnCiFailed(null);
+				expect(() => store.triggerCiHeal("/repo1", "feature/x", 42)).not.toThrow();
 			});
 		});
 

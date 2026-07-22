@@ -4,10 +4,13 @@ use axum::response::{IntoResponse, Response};
 use std::sync::Arc;
 
 use super::types::{
-    CiChecksQuery, IssueActionRequest, IssuesQuery, PathQuery, PollRepoRequest, PrDiffQuery,
-    SetVisibilityRequest, StartPollingRequest, UpdatePathsRequest,
+    ChangelogQuery, CiChecksQuery, CiFailureLogsQuery, GithubAddAccountRequest,
+    GithubBindRepoRequest, GithubPollLoginRequest, GithubRemoveAccountRequest, GithubRepoPathBody,
+    GithubResolveRepoQuery, GithubResolveReposRequest, GithubSetHideDraftsRequest,
+    IssueActionRequest, IssuesQuery, PathQuery, PollRepoRequest, PrDiffQuery, SetVisibilityRequest,
+    StartPollingRequest, UpdatePathsRequest,
 };
-use super::{err_500, validate_repo_path};
+use super::{err_500, json_result, upstream_json_result, validate_repo_path};
 use crate::github_poller::PollerCmd;
 use crate::state::AppState;
 
@@ -30,12 +33,8 @@ pub(super) async fn repo_pr_statuses(
         return e.into_response();
     }
     let path = q.path;
-    if let Some(cached) = crate::state::AppState::get_cached(
-        &state.git_cache.github_status,
-        &path,
-        crate::state::GITHUB_CACHE_TTL,
-    ) {
-        return Json(cached).into_response();
+    if let Some(cached) = state.git_cache.github_status.get(&path) {
+        return Json(&*cached).into_response();
     }
     match crate::github::get_repo_pr_statuses_impl(&path, false, &state).await {
         Ok(statuses) => Json(statuses).into_response(),
@@ -76,14 +75,64 @@ pub(super) async fn repo_approve_pr(
     }
     let path = body.repo_path;
     let pr = body.pr_number;
-    match crate::github::approve_pr_impl(&path, pr, &state).await {
-        Ok(()) => Json(serde_json::json!({"ok": true})).into_response(),
-        Err(e) => (
-            axum::http::StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({"error": e})),
-        )
-            .into_response(),
+    upstream_json_result(
+        crate::github::approve_pr_impl(&path, pr, &state)
+            .await
+            .map(|()| serde_json::json!({"ok": true})),
+    )
+}
+
+pub(super) async fn repo_create_pr(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<super::types::CreatePrRequest>,
+) -> Response {
+    if let Err(e) = validate_repo_path(&body.repo_path) {
+        return e.into_response();
     }
+    upstream_json_result(
+        crate::github::create_pr_impl(
+            &body.repo_path,
+            &body.title,
+            &body.body,
+            &body.base,
+            &body.head,
+            body.draft,
+            &state,
+        )
+        .await,
+    )
+}
+
+pub(super) async fn repo_create_issue(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<super::types::CreateIssueRequest>,
+) -> Response {
+    if let Err(e) = validate_repo_path(&body.repo_path) {
+        return e.into_response();
+    }
+    upstream_json_result(
+        crate::github::create_issue_impl(&body.repo_path, &body.title, &body.body, &state).await,
+    )
+}
+
+pub(super) async fn repo_post_pr_review(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<super::types::PostPrReviewRequest>,
+) -> Response {
+    if let Err(e) = validate_repo_path(&body.repo_path) {
+        return e.into_response();
+    }
+    upstream_json_result(
+        crate::github::post_pr_review_impl(
+            &body.repo_path,
+            body.pr_number,
+            &body.body,
+            body.event.as_deref(),
+            &body.comments,
+            &state,
+        )
+        .await,
+    )
 }
 
 pub(super) async fn repo_pr_diff(
@@ -99,6 +148,43 @@ pub(super) async fn repo_pr_diff(
         Ok(diff) => diff.into_response(),
         Err(e) => (axum::http::StatusCode::BAD_GATEWAY, e).into_response(),
     }
+}
+
+pub(super) async fn repo_merged_prs(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<ChangelogQuery>,
+) -> Response {
+    if let Err(e) = validate_repo_path(&q.path) {
+        return e.into_response();
+    }
+    upstream_json_result(
+        crate::github::get_merged_prs_impl(&q.path, q.since_tag.as_deref(), &state).await,
+    )
+}
+
+pub(super) async fn repo_generate_changelog(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<ChangelogQuery>,
+) -> Response {
+    if let Err(e) = validate_repo_path(&q.path) {
+        return e.into_response();
+    }
+    upstream_json_result(
+        crate::changelog::generate_changelog_impl(&q.path, q.since_tag.as_deref(), &state).await,
+    )
+}
+
+pub(super) async fn repo_conflict_assist(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<super::types::ConflictAssistRequest>,
+) -> Response {
+    if let Err(e) = validate_repo_path(&body.repo_path) {
+        return e.into_response();
+    }
+    upstream_json_result(
+        crate::conflict_assist::start_conflict_assist_impl(body.repo_path, body.pr_number, &state)
+            .await,
+    )
 }
 
 pub(super) async fn repo_issues(
@@ -119,6 +205,16 @@ pub(super) async fn repo_issues(
     }
 }
 
+pub(super) async fn repo_issue_detail(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<super::types::IssueDetailQuery>,
+) -> Response {
+    if let Err(e) = validate_repo_path(&q.repo_path) {
+        return e.into_response();
+    }
+    json_result(crate::github::get_issue_detail_impl(&q.repo_path, q.issue_number, &state).await)
+}
+
 pub(super) async fn repo_close_issue(
     State(state): State<Arc<AppState>>,
     Json(body): Json<IssueActionRequest>,
@@ -126,14 +222,11 @@ pub(super) async fn repo_close_issue(
     if let Err(e) = validate_repo_path(&body.repo_path) {
         return e.into_response();
     }
-    match crate::github::close_issue_impl(&body.repo_path, body.issue_number, &state).await {
-        Ok(()) => Json(serde_json::json!({"ok": true})).into_response(),
-        Err(e) => (
-            axum::http::StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({"error": e})),
-        )
-            .into_response(),
-    }
+    upstream_json_result(
+        crate::github::close_issue_impl(&body.repo_path, body.issue_number, &state)
+            .await
+            .map(|()| serde_json::json!({"ok": true})),
+    )
 }
 
 pub(super) async fn repo_reopen_issue(
@@ -143,14 +236,11 @@ pub(super) async fn repo_reopen_issue(
     if let Err(e) = validate_repo_path(&body.repo_path) {
         return e.into_response();
     }
-    match crate::github::reopen_issue_impl(&body.repo_path, body.issue_number, &state).await {
-        Ok(()) => Json(serde_json::json!({"ok": true})).into_response(),
-        Err(e) => (
-            axum::http::StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({"error": e})),
-        )
-            .into_response(),
-    }
+    upstream_json_result(
+        crate::github::reopen_issue_impl(&body.repo_path, body.issue_number, &state)
+            .await
+            .map(|()| serde_json::json!({"ok": true})),
+    )
 }
 
 // --- GitHub poller HTTP handlers ---
@@ -159,12 +249,33 @@ pub(super) async fn poller_start(
     State(state): State<Arc<AppState>>,
     Json(body): Json<StartPollingRequest>,
 ) -> Response {
-    let guard = state.github_poller.lock();
-    if let Some(poller) = guard.as_ref() {
-        let _ = poller.cmd_tx.try_send(PollerCmd::UpdatePaths(body.paths));
-        let _ = poller
-            .cmd_tx
-            .try_send(PollerCmd::SetIssueFilter(body.issue_filter));
+    let StartPollingRequest {
+        paths,
+        issue_filter,
+        pr_hide_drafts,
+    } = body;
+    // Desktop: cold-start the poller (or reconfigure a running one) via the same
+    // helper the Tauri `github_start_polling` command uses — this is the parity
+    // fix: the old route no-op'd when no poller was running, so a browser/PWA
+    // client could never start polling.
+    #[cfg(feature = "desktop")]
+    if let Some(app) = state.app_handle.read().clone() {
+        crate::github_poller::ensure_polling(&state, app, paths, issue_filter, pr_hide_drafts);
+        return Json(serde_json::json!({"ok": true})).into_response();
+    }
+    // No AppHandle (or non-desktop build): can't spawn a poller, but still push
+    // config + resync to one that is already running.
+    #[cfg(not(feature = "desktop"))]
+    {
+        if let Some(poller) = state.github_poller.lock().as_ref() {
+            crate::github_poller::send_poller_config(
+                poller,
+                paths,
+                issue_filter,
+                pr_hide_drafts,
+                true,
+            );
+        }
     }
     Json(serde_json::json!({"ok": true})).into_response()
 }
@@ -229,4 +340,125 @@ pub(super) async fn poller_set_issue_filter(
             .try_send(PollerCmd::SetIssueFilter(body.filter));
     }
     Json(serde_json::json!({"ok": true})).into_response()
+}
+
+pub(super) async fn github_viewer_login(State(state): State<Arc<AppState>>) -> Response {
+    json_result(crate::github::get_viewer_login(&state).await)
+}
+
+pub(super) async fn ci_failure_logs(Query(q): Query<CiFailureLogsQuery>) -> Response {
+    if let Err(e) = validate_repo_path(&q.repo_path) {
+        return e.into_response();
+    }
+    json_result(crate::github::fetch_ci_failure_logs(q.repo_path, q.branch).await)
+}
+
+pub(super) async fn github_set_hide_drafts(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<GithubSetHideDraftsRequest>,
+) -> Response {
+    json_result(crate::github_poller::github_set_pr_hide_drafts_impl(
+        &state, body.hide,
+    ))
+}
+
+pub(super) async fn github_start_login(State(state): State<Arc<AppState>>) -> Response {
+    json_result(crate::github_auth::start_device_flow(&state.http_client).await)
+}
+
+pub(super) async fn github_poll_login(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<GithubPollLoginRequest>,
+) -> Response {
+    json_result(crate::github_auth::github_poll_login_impl(&state, body.device_code).await)
+}
+
+pub(super) async fn github_logout(State(state): State<Arc<AppState>>) -> Response {
+    json_result(crate::github_auth::github_logout_impl(&state).await)
+}
+
+pub(super) async fn github_disconnect(State(state): State<Arc<AppState>>) -> Response {
+    json_result(crate::github_auth::github_disconnect_impl(&state).await)
+}
+
+pub(super) async fn github_auth_status(State(state): State<Arc<AppState>>) -> Response {
+    json_result(crate::github_auth::github_auth_status_impl(&state).await)
+}
+
+pub(super) async fn github_diagnostics(State(state): State<Arc<AppState>>) -> Response {
+    json_result(crate::github_auth::github_diagnostics_impl(&state).await)
+}
+
+// --- Multi-account: accounts + repo bindings (IPC/HTTP parity) ---
+
+pub(super) async fn github_list_accounts() -> Response {
+    Json(
+        crate::github_account::GitHubAccountRegistry::load()
+            .list()
+            .to_vec(),
+    )
+    .into_response()
+}
+
+// Desktop-only: the add/remove/resolve impls in github_account.rs are
+// #[cfg(feature = "desktop")] (keychain-backed). The remote daemon never serves
+// GitHub routes (build_remote_router omits them), so gate these handlers to match
+// their impls and keep the always-compiled lib building for tuic-remote (#094-ec55).
+#[cfg(feature = "desktop")]
+pub(super) async fn github_add_account(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<GithubAddAccountRequest>,
+) -> Response {
+    json_result(crate::github_account::github_add_account_impl(&state, body.host, body.pat).await)
+}
+
+#[cfg(feature = "desktop")]
+pub(super) async fn github_remove_account(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<GithubRemoveAccountRequest>,
+) -> Response {
+    json_result(crate::github_account::github_remove_account_impl(
+        &state, body.id,
+    ))
+}
+
+pub(super) async fn github_list_bindings() -> Response {
+    Json(crate::github_account::RepoBindingStore::load().entries()).into_response()
+}
+
+pub(super) async fn github_bind_repo(Json(body): Json<GithubBindRepoRequest>) -> Response {
+    json_result(crate::github_account::bind_repo_to_account(
+        std::path::Path::new(&body.repo_path),
+        &body.account_id,
+        &body.remote_name,
+    ))
+}
+
+pub(super) async fn github_unbind_repo(Json(body): Json<GithubRepoPathBody>) -> Response {
+    json_result(crate::github_account::unbind_repo(std::path::Path::new(
+        &body.repo_path,
+    )))
+}
+
+#[cfg(feature = "desktop")]
+pub(super) async fn github_resolve_repo(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<GithubResolveRepoQuery>,
+) -> Response {
+    json_result(crate::github_account::github_resolve_repo_impl(
+        &state,
+        q.repo_path,
+    ))
+}
+
+#[cfg(feature = "desktop")]
+pub(super) async fn github_resolve_repos(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<GithubResolveReposRequest>,
+) -> Response {
+    Json(crate::github_account::github_resolve_repos_impl(
+        &state,
+        body.repo_paths,
+    ))
+    .into_response()
 }

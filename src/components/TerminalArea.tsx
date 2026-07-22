@@ -9,7 +9,8 @@ import { repoSettingsStore } from "../stores/repoSettings";
 import { repositoriesStore } from "../stores/repositories";
 import { settingsStore } from "../stores/settings";
 import { terminalsStore } from "../stores/terminals";
-import { rpc } from "../transport";
+import { shouldAutoSubmitSuggestion } from "../utils/sendCommand";
+import { sendTextToSession } from "../utils/sendToActiveTerminal";
 import { CodeEditorTab } from "./CodeEditorPanel";
 import { DiffTab } from "./DiffTab";
 import { PaneNodeView } from "./PaneTree/PaneTree";
@@ -47,8 +48,12 @@ const SuggestOverlayContainer: Component = () => {
 						onSelect={async (text) => {
 							terminalsStore.dismissSuggestedActions(capturedId);
 							if (capturedSid) {
-								await rpc("write_pty", { sessionId: capturedSid, data: text });
-								await rpc("write_pty", { sessionId: capturedSid, data: "\r" });
+								// OSC 7770 `suggest=` is emittable by any (untrusted) output; withhold
+								// auto-Enter for metacharacter-bearing chips on a SHELL so a click cannot
+								// silently execute a chained/redirected command. On an AGENT a chip is
+								// just prompt text and must submit — see shouldAutoSubmitSuggestion.
+								const agentType = terminalsStore.getAgentTypeForSession(capturedSid);
+								await sendTextToSession(capturedSid, text, shouldAutoSubmitSuggestion(agentType, text));
 							}
 						}}
 						onDismiss={() => {

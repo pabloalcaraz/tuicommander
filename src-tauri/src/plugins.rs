@@ -137,6 +137,8 @@ const KNOWN_CAPABILITIES: &[&str] = &[
     "fs:watch",
     "fs:write",
     "fs:rename",
+    "fs:scan",
+    "fs:delete",
     "net:http",
     "credentials:read",
     "ui:panel",
@@ -420,6 +422,14 @@ pub fn register_loaded_plugin(
     capabilities: Vec<String>,
     state: tauri::State<'_, std::sync::Arc<crate::AppState>>,
 ) -> Result<(), String> {
+    register_loaded_plugin_impl(&state, plugin_id, capabilities)
+}
+
+pub(crate) fn register_loaded_plugin_impl(
+    state: &crate::AppState,
+    plugin_id: String,
+    capabilities: Vec<String>,
+) -> Result<(), String> {
     // Ground truth is the on-disk manifest, not the frontend-supplied capabilities.
     // Read only the specific plugin's manifest instead of scanning the entire dir.
     let manifest = read_single_manifest(&plugin_id)?;
@@ -458,7 +468,11 @@ pub fn unregister_loaded_plugin(
     plugin_id: String,
     state: tauri::State<'_, std::sync::Arc<crate::AppState>>,
 ) {
-    state.loaded_plugins.remove(&plugin_id);
+    unregister_loaded_plugin_impl(&state, &plugin_id);
+}
+
+pub(crate) fn unregister_loaded_plugin_impl(state: &crate::AppState, plugin_id: &str) {
+    state.loaded_plugins.remove(plugin_id);
 }
 
 // ---------------------------------------------------------------------------
@@ -524,6 +538,7 @@ pub fn write_plugin_data(plugin_id: String, path: String, content: String) -> Re
     std::fs::write(&file_path, &content).map_err(|e| format!("Failed to write plugin data: {e}"))
 }
 
+// DESKTOP-ONLY (HTTP parity): no frontend caller
 #[cfg_attr(feature = "desktop", tauri::command)]
 pub fn delete_plugin_data(plugin_id: String, path: String) -> Result<(), String> {
     let file_path = resolve_data_path(&plugin_id, &path)?;
@@ -545,6 +560,7 @@ pub fn delete_plugin_data(plugin_id: String, path: String) -> Result<(), String>
 /// the `data/` subdirectory is preserved across the overwrite.
 ///
 /// Returns the validated manifest on success.
+// DESKTOP-ONLY (HTTP parity): takes AppHandle; local-FS install/emit
 #[cfg(feature = "desktop")]
 #[tauri::command]
 pub async fn install_plugin_from_zip(
@@ -560,6 +576,7 @@ pub async fn install_plugin_from_zip(
 }
 
 /// Install a plugin from an HTTPS URL: download to a temp file, then extract.
+// DESKTOP-ONLY (HTTP parity): takes AppHandle; local-FS install/emit
 #[cfg(feature = "desktop")]
 #[tauri::command]
 pub async fn install_plugin_from_url(
@@ -685,6 +702,7 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
 
 /// Install a plugin from a local folder. Validates manifest, copies files to
 /// the plugins directory, preserves existing data/, and emits a reload event.
+// DESKTOP-ONLY (HTTP parity): takes AppHandle; local-FS install/emit
 #[cfg(feature = "desktop")]
 #[tauri::command]
 pub async fn install_plugin_from_folder(
@@ -838,20 +856,42 @@ fn find_manifest_in_zip(archive: &zip::ZipArchive<std::fs::File>) -> Result<Stri
 // Plugin uninstall
 // ---------------------------------------------------------------------------
 
+/// Dispose of a plugin's live runtime state on uninstall. Without this the
+/// process leaks, for its whole lifetime: an OS thread + fs watcher per
+/// registered watch (the `debounce_loop`), the capability grant, and the
+/// exec:cli rate-limiter history.
+pub(crate) fn dispose_plugin_runtime_state(state: &crate::AppState, id: &str) {
+    // Drop every watcher this plugin registered. Dropping the `RecommendedWatcher`
+    // closes its notify channel, so the matching `debounce_loop` thread exits.
+    state.plugin_watchers.retain(|_, (pid, _)| pid != id);
+    // Revoke the capability grant so a re-install starts clean.
+    state.loaded_plugins.remove(id);
+    // Clear the exec:cli sliding-window rate-limiter entry for this id.
+    crate::plugin_exec::clear_rate_limit(id);
+}
+
 /// Remove a plugin and all its files (including data/).
+// DESKTOP-ONLY (HTTP parity): takes AppHandle; local-FS install/emit
 #[cfg(feature = "desktop")]
 #[tauri::command]
-pub fn uninstall_plugin(id: String, app_handle: AppHandle) -> Result<(), String> {
+pub fn uninstall_plugin(
+    id: String,
+    app_handle: AppHandle,
+    state: tauri::State<'_, std::sync::Arc<crate::AppState>>,
+) -> Result<(), String> {
     if id.is_empty() || is_path_escape(&id) {
         return Err("Invalid plugin ID".into());
     }
 
     let dir = plugins_dir().join(&id);
     if !dir.exists() {
+        dispose_plugin_runtime_state(&state, &id); // Sweep any lingering runtime state
         return Ok(()); // Already gone
     }
 
     std::fs::remove_dir_all(&dir).map_err(|e| format!("Failed to remove plugin directory: {e}"))?;
+
+    dispose_plugin_runtime_state(&state, &id);
 
     let _ = app_handle.emit("plugin-changed", vec![id.clone()]);
     crate::app_logger::log_via_handle(
@@ -886,6 +926,38 @@ fn is_plugin_code_change(relative: &std::path::Path) -> bool {
         relative.extension().and_then(|e| e.to_str()),
         Some("js" | "mjs" | "json")
     )
+}
+
+#[cfg(feature = "desktop")]
+/// Decide whether a watcher-event path should trigger (re)discovery, returning
+/// the top-level plugin id if so.
+///
+/// Two cases produce an id:
+/// 1. A code file (`.js`/`.mjs`/`.json`, not under `data/`) inside a plugin dir
+///    — the existing hot-reload path for edits to already-loaded plugins.
+/// 2. A brand-new top-level plugin **directory or symlink** created after boot.
+///    `notify`'s recursive watch does not descend into symlink targets, so a
+///    plugin added via `ln -s` never emits events for its inner `manifest.json`;
+///    the only signal is the single-component create of the link/dir itself.
+///    We surface that as the id so the frontend re-scans and loads the plugin.
+///
+/// Hidden entries (dotfiles) never match.
+fn plugin_id_for_change(path: &std::path::Path, dir: &std::path::Path) -> Option<String> {
+    let relative = path.strip_prefix(dir).ok()?;
+    let first = relative.components().next()?;
+    let id = first.as_os_str().to_string_lossy().to_string();
+    if id.starts_with('.') {
+        return None;
+    }
+
+    // Nested path (plugin_id/file/...) — only code changes trigger.
+    if relative.components().count() >= 2 {
+        return is_plugin_code_change(relative).then_some(id);
+    }
+
+    // Single component = a top-level entry in the plugins dir. Only treat new
+    // directories/symlinks as plugins; ignore stray top-level files.
+    (path.is_dir() || path.is_symlink()).then_some(id)
 }
 
 #[cfg(feature = "desktop")]
@@ -942,12 +1014,30 @@ pub fn start_plugin_watcher(app_handle: &AppHandle) {
             &format!("[plugins] Watching {dir:?} for changes"),
         );
 
-        // Simple debounce: collect events for 500ms of quiet, then emit
         let debounce = Duration::from_millis(500);
         let mut changed_ids: Vec<String> = Vec::new();
 
+        let collect_changes =
+            |event: &notify::Event, dir: &std::path::Path, ids: &mut Vec<String>| {
+                if !matches!(
+                    event.kind,
+                    notify::EventKind::Create(_)
+                        | notify::EventKind::Modify(notify::event::ModifyKind::Data(_))
+                        | notify::EventKind::Modify(notify::event::ModifyKind::Name(_))
+                        | notify::EventKind::Remove(_)
+                ) {
+                    return;
+                }
+                for path in &event.paths {
+                    if let Some(id) = plugin_id_for_change(path, dir)
+                        && !ids.contains(&id)
+                    {
+                        ids.push(id);
+                    }
+                }
+            };
+
         loop {
-            // Wait for first event or channel close
             let event = match rx.recv() {
                 Ok(Ok(e)) => e,
                 Ok(Err(err)) => {
@@ -962,43 +1052,14 @@ pub fn start_plugin_watcher(app_handle: &AppHandle) {
                 Err(_) => break,
             };
 
-            // Process this event — only JS code and manifest changes
-            // trigger hot-reload. Data files (stats, caches, config)
-            // written at runtime must not cause a reload.
-            for path in &event.paths {
-                if let Ok(relative) = path.strip_prefix(&dir) {
-                    if !is_plugin_code_change(relative) {
-                        continue;
-                    }
-                    if let Some(first) = relative.components().next() {
-                        let id = first.as_os_str().to_string_lossy().to_string();
-                        if !id.starts_with('.') && !changed_ids.contains(&id) {
-                            changed_ids.push(id);
-                        }
-                    }
-                }
-            }
+            collect_changes(&event, &dir, &mut changed_ids);
 
-            // Drain any additional events within the debounce window
             while let Ok(result) = rx.recv_timeout(debounce) {
                 if let Ok(event) = result {
-                    for path in &event.paths {
-                        if let Ok(relative) = path.strip_prefix(&dir) {
-                            if !is_plugin_code_change(relative) {
-                                continue;
-                            }
-                            if let Some(first) = relative.components().next() {
-                                let id = first.as_os_str().to_string_lossy().to_string();
-                                if !id.starts_with('.') && !changed_ids.contains(&id) {
-                                    changed_ids.push(id);
-                                }
-                            }
-                        }
-                    }
+                    collect_changes(&event, &dir, &mut changed_ids);
                 }
             }
 
-            // Debounce window expired — emit
             if !changed_ids.is_empty() {
                 crate::app_logger::log_via_handle(
                     &handle,
@@ -1161,6 +1222,21 @@ mod tests {
         let mut m = valid_manifest("test");
         m.capabilities = vec!["pty:write".into(), "ui:markdown".into(), "ui:sound".into()];
         assert!(validate_manifest(&m, "test").is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_build_cleaner_capabilities() {
+        // fs:scan (read-only) and fs:delete (destructive) are the build-cleaner
+        // plugin's capabilities — must be in KNOWN_CAPABILITIES so an external
+        // manifest declaring them loads instead of being rejected as unknown.
+        let mut m = valid_manifest("build-cleaner");
+        m.capabilities = vec![
+            "fs:scan".into(),
+            "fs:delete".into(),
+            "ui:panel".into(),
+            "ui:ticker".into(),
+        ];
+        assert!(validate_manifest(&m, "build-cleaner").is_ok());
     }
 
     // -- Binary validation --
@@ -1406,7 +1482,7 @@ mod tests {
 
     #[cfg(feature = "desktop")]
     mod plugin_code_change {
-        use super::super::is_plugin_code_change;
+        use super::super::{is_plugin_code_change, plugin_id_for_change};
         use std::path::Path;
 
         #[test]
@@ -1466,5 +1542,236 @@ mod tests {
             // dist/ subfolder is code, not data
             assert!(is_plugin_code_change(Path::new("my-plugin/dist/bundle.js")));
         }
+
+        // -- plugin_id_for_change: the top-level dir/symlink discovery path --
+
+        #[test]
+        fn change_id_for_code_file_inside_plugin() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = dir.path().join("my-plugin").join("main.js");
+            assert_eq!(
+                plugin_id_for_change(&path, dir.path()),
+                Some("my-plugin".to_string())
+            );
+        }
+
+        #[test]
+        fn change_id_ignores_runtime_data_file() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = dir.path().join("my-plugin").join("data").join("stats.json");
+            assert_eq!(plugin_id_for_change(&path, dir.path()), None);
+        }
+
+        #[test]
+        fn change_id_for_new_top_level_dir() {
+            // A brand-new plugin directory created after boot must surface its id
+            // so the frontend re-scans — even before any inner file event.
+            let dir = tempfile::TempDir::new().unwrap();
+            let plugin_dir = dir.path().join("fresh-plugin");
+            std::fs::create_dir(&plugin_dir).unwrap();
+            assert_eq!(
+                plugin_id_for_change(&plugin_dir, dir.path()),
+                Some("fresh-plugin".to_string())
+            );
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn change_id_for_new_top_level_symlink() {
+            // The reported bug: a plugin added via `ln -s` after boot. notify does
+            // not descend into the symlink target, so the single-component create
+            // of the link itself is the only signal we get.
+            let dir = tempfile::TempDir::new().unwrap();
+            let target = dir.path().join("target");
+            std::fs::create_dir(&target).unwrap();
+            let link = dir.path().join("linked-plugin");
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            assert_eq!(
+                plugin_id_for_change(&link, dir.path()),
+                Some("linked-plugin".to_string())
+            );
+        }
+
+        #[test]
+        fn change_id_ignores_stray_top_level_file() {
+            // A loose file at the plugins root (e.g. .DS_Store sibling) is not a plugin.
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = dir.path().join("notes.txt");
+            std::fs::write(&path, "x").unwrap();
+            assert_eq!(plugin_id_for_change(&path, dir.path()), None);
+        }
+
+        #[test]
+        fn change_id_ignores_hidden_top_level_dir() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let hidden = dir.path().join(".git");
+            std::fs::create_dir(&hidden).unwrap();
+            assert_eq!(plugin_id_for_change(&hidden, dir.path()), None);
+        }
+    }
+
+    // -- uninstall runtime-state disposal --
+
+    #[cfg(feature = "desktop")]
+    #[test]
+    fn dispose_sweeps_watchers_and_capabilities_for_id_only() {
+        use notify::{Config, RecommendedWatcher, Watcher};
+
+        let state = crate::state::tests_support::make_test_app_state();
+
+        let make_watcher = || {
+            let (tx, _rx) = std::sync::mpsc::channel::<notify::Result<notify::Event>>();
+            RecommendedWatcher::new(tx, Config::default()).unwrap()
+        };
+
+        // Two watch handles for the plugin being uninstalled, one for another.
+        state
+            .plugin_watchers
+            .insert("w1".into(), ("victim".into(), make_watcher()));
+        state
+            .plugin_watchers
+            .insert("w2".into(), ("victim".into(), make_watcher()));
+        state
+            .plugin_watchers
+            .insert("w3".into(), ("survivor".into(), make_watcher()));
+
+        state
+            .loaded_plugins
+            .insert("victim".into(), vec!["exec:cli".into()]);
+        state
+            .loaded_plugins
+            .insert("survivor".into(), vec!["ui:panel".into()]);
+
+        dispose_plugin_runtime_state(&state, "victim");
+
+        // The victim's watchers are dropped (their debounce threads exit); the
+        // unrelated plugin's watcher survives.
+        assert!(
+            !state
+                .plugin_watchers
+                .iter()
+                .any(|e| e.value().0 == "victim")
+        );
+        assert!(state.plugin_watchers.contains_key("w3"));
+        assert_eq!(state.plugin_watchers.len(), 1);
+
+        // The capability grant is revoked for the victim only.
+        assert!(!state.loaded_plugins.contains_key("victim"));
+        assert!(state.loaded_plugins.contains_key("survivor"));
+    }
+
+    // -- register_loaded_plugin manifest-capability gate --
+
+    /// register_loaded_plugin trusts the on-disk manifest, not the caller's
+    /// capability list: it accepts declared capabilities and rejects any that
+    /// the manifest does not list (so the frontend cannot self-grant).
+    #[test]
+    fn register_gates_capabilities_on_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = crate::config::set_config_dir_override(dir.path().to_path_buf());
+
+        let plugin_dir = dir.path().join("plugins").join("gate-plugin");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        std::fs::write(
+            plugin_dir.join("manifest.json"),
+            r#"{
+                "id": "gate-plugin",
+                "name": "Gate Plugin",
+                "version": "1.0.0",
+                "minAppVersion": "0.0.0",
+                "main": "main.js",
+                "capabilities": ["pty:read"]
+            }"#,
+        )
+        .unwrap();
+
+        let state = crate::state::tests_support::make_test_app_state();
+
+        // Declared capability → registered.
+        register_loaded_plugin_impl(&state, "gate-plugin".into(), vec!["pty:read".into()]).unwrap();
+        assert_eq!(
+            state.loaded_plugins.get("gate-plugin").map(|c| c.clone()),
+            Some(vec!["pty:read".to_string()])
+        );
+
+        // Undeclared capability → rejected, and NOT recorded.
+        state.loaded_plugins.remove("gate-plugin");
+        let err =
+            register_loaded_plugin_impl(&state, "gate-plugin".into(), vec!["exec:cli".into()])
+                .unwrap_err();
+        assert!(err.contains("not declared in manifest"), "got: {err}");
+        assert!(!state.loaded_plugins.contains_key("gate-plugin"));
+    }
+
+    // -- install data/ preservation (AppHandle-free seam) --
+
+    /// A reinstall wipes the plugin dir but must NOT lose the user's data/.
+    /// prepare_plugin_target backs data/ out before the clean and hands back the
+    /// backup for finalize_plugin_install to restore. (The full install fns take
+    /// an AppHandle and can't run in a unit test without a Tauri mock runtime, so
+    /// we exercise the preservation seam directly, including the restore rename.)
+    #[test]
+    fn prepare_plugin_target_preserves_existing_data_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = crate::config::set_config_dir_override(dir.path().to_path_buf());
+
+        let target = dir.path().join("plugins").join("dp-plugin");
+        std::fs::create_dir_all(target.join("data")).unwrap();
+        std::fs::write(target.join("data").join("state.json"), "keepme").unwrap();
+        std::fs::write(target.join("old.js"), "stale code").unwrap();
+
+        let prepared = prepare_plugin_target(&valid_manifest("dp-plugin")).unwrap();
+
+        // data/ was moved out to the backup (contents intact), the stale file is
+        // gone, and a fresh empty target dir exists.
+        let backup = prepared.data_backup.expect("data/ must be backed up");
+        assert_eq!(
+            std::fs::read_to_string(backup.join("state.json")).unwrap(),
+            "keepme"
+        );
+        assert!(
+            !prepared.path.join("old.js").exists(),
+            "stale file must be wiped"
+        );
+        assert!(
+            !prepared.path.join("data").exists(),
+            "data/ moved to backup"
+        );
+        assert!(prepared.path.is_dir(), "fresh target dir must exist");
+
+        // The restore rename (as finalize_plugin_install performs) round-trips it.
+        std::fs::rename(&backup, prepared.path.join("data")).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(prepared.path.join("data").join("state.json")).unwrap(),
+            "keepme"
+        );
+    }
+
+    /// A first install (no prior dir) has nothing to back up.
+    #[test]
+    fn prepare_plugin_target_first_install_has_no_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = crate::config::set_config_dir_override(dir.path().to_path_buf());
+
+        let prepared = prepare_plugin_target(&valid_manifest("fresh-plugin")).unwrap();
+        assert!(prepared.data_backup.is_none());
+        assert!(prepared.path.is_dir());
+    }
+
+    // -- uninstall runtime-state disposal is idempotent --
+
+    /// uninstall_plugin's early-return path (dir already gone) and its cleanup
+    /// both call dispose_plugin_runtime_state; it must be a safe no-op when
+    /// there is nothing to sweep, so a repeated uninstall cannot panic.
+    #[cfg(feature = "desktop")]
+    #[test]
+    fn dispose_runtime_state_is_idempotent() {
+        let state = crate::state::tests_support::make_test_app_state();
+        // Disposing an id with no registered state is a no-op…
+        dispose_plugin_runtime_state(&state, "never-loaded");
+        // …and doing it again is still safe.
+        dispose_plugin_runtime_state(&state, "never-loaded");
+        assert!(state.loaded_plugins.is_empty());
+        assert!(state.plugin_watchers.is_empty());
     }
 }

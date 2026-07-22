@@ -23,7 +23,6 @@ const BROWSER_RESERVED_COMBOS = new Set([
 	normalizeCombo("Cmd+L"), // address bar
 	normalizeCombo("Cmd+Shift+T"), // reopen closed tab
 	normalizeCombo("Cmd+P"), // print dialog
-	normalizeCombo("Cmd+Shift+P"), // private/incognito window
 	normalizeCombo("Cmd+Shift+A"), // search tabs (Chrome)
 ]);
 
@@ -39,6 +38,8 @@ export interface ShortcutHandlers {
 	closeTerminal: (id: string, skipConfirm?: boolean) => void;
 	reopenClosedTab: () => void;
 	navigateTab: (direction: "prev" | "next") => void;
+	focusLastTerminal: () => void;
+	jumpWaitingTerminal: () => void;
 	clearTerminal: () => void;
 	refreshTerminal: () => void;
 	terminalIds: () => string[];
@@ -55,6 +56,7 @@ export interface ShortcutHandlers {
 	toggleHelpPanel: () => void;
 	toggleNotesPanel: () => void;
 	toggleFileBrowserPanel: () => void;
+	requestFileBrowserContentSearch: () => void;
 	toggleOutlinePanel: () => void;
 	findInTerminal: () => void;
 	toggleCommandPalette: () => void;
@@ -73,6 +75,7 @@ export interface ShortcutHandlers {
 	toggleZoomPane: () => void;
 	toggleFocusMode: () => void;
 	closeActivePane?: () => void;
+	closeActiveTabOrPane: () => void;
 	togglePromptLibrary: () => void;
 	toggleDiffScroll: () => void;
 	toggleGlobalWorkspace: () => void;
@@ -87,6 +90,14 @@ export interface ShortcutHandlers {
 	detachActivityDashboard: () => void;
 	toggleProcessManager: () => void;
 	toggleGenerators: () => void;
+	showRemoteQr: () => void;
+	blockPrev: () => void;
+	blockNext: () => void;
+	blockFoldToggle: () => void;
+	blockSearchToggle: () => void;
+	/** Fire a smart prompt whose configured shortcut matches `combo`. Returns
+	 *  true if a prompt was found and triggered. Built-in actions take precedence. */
+	runSmartPromptByCombo: (combo: string) => boolean;
 }
 
 /** Keys that are modifiers only — not real shortcut targets */
@@ -192,12 +203,7 @@ function dispatchAction(action: ActionName, handlers: ShortcutHandlers): boolean
 			handlers.createNewTerminal();
 			return true;
 		case "close-terminal": {
-			if (paneLayoutStore.isSplit()) {
-				handlers.closeActivePane?.();
-			} else {
-				const activeId = terminalsStore.state.activeId;
-				if (activeId) handlers.closeTerminal(activeId);
-			}
+			handlers.closeActiveTabOrPane();
 			return true;
 		}
 		case "reopen-closed-tab":
@@ -235,6 +241,9 @@ function dispatchAction(action: ActionName, handlers: ShortcutHandlers): boolean
 			return true;
 		case "toggle-file-browser":
 			handlers.toggleFileBrowserPanel();
+			return true;
+		case "toggle-file-browser-content-search":
+			handlers.requestFileBrowserContentSearch();
 			return true;
 		case "toggle-outline":
 			handlers.toggleOutlinePanel();
@@ -338,6 +347,18 @@ function dispatchAction(action: ActionName, handlers: ShortcutHandlers): boolean
 		case "detach-activity-dashboard":
 			handlers.detachActivityDashboard();
 			return true;
+		case "block-fold-toggle":
+			handlers.blockFoldToggle();
+			return true;
+		case "block-prev":
+			handlers.blockPrev();
+			return true;
+		case "block-next":
+			handlers.blockNext();
+			return true;
+		case "block-search-toggle":
+			handlers.blockSearchToggle();
+			return true;
 
 		// Tab navigation
 		case "prev-tab":
@@ -345,6 +366,12 @@ function dispatchAction(action: ActionName, handlers: ShortcutHandlers): boolean
 			return true;
 		case "next-tab":
 			handlers.navigateTab("next");
+			return true;
+		case "focus-last-terminal":
+			handlers.focusLastTerminal();
+			return true;
+		case "jump-waiting-terminal":
+			handlers.jumpWaitingTerminal();
 			return true;
 
 		default: {
@@ -461,6 +488,12 @@ export function useKeyboardShortcuts(handlers: ShortcutHandlers): () => void {
 			} else if (dispatchAction(action as ActionName, handlers)) {
 				e.preventDefault();
 			}
+		} else if (handlers.runSmartPromptByCombo?.(combo)) {
+			// No built-in/plugin action — try a user-configured smart prompt shortcut.
+			// Optional-chained so a stale HMR handlers object (dev hot-reload of this
+			// module before App's handlers are recreated) can't hard-crash the session;
+			// the field stays required in the interface so real callers must provide it.
+			e.preventDefault();
 		}
 	};
 

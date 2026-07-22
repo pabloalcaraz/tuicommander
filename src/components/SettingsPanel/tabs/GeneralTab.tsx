@@ -1,18 +1,19 @@
-import { type Component, createSignal, onMount, Show } from "solid-js";
+import { type Component, createSignal, For, onMount, Show } from "solid-js";
 import { t } from "../../../i18n";
 import { invoke } from "../../../invoke";
 import { appLogger } from "../../../stores/appLogger";
-import type { IdeType, UpdateChannel } from "../../../stores/settings";
+import type { CustomLauncher, IdeType, UpdateChannel } from "../../../stores/settings";
 import { IDE_NAMES, settingsStore } from "../../../stores/settings";
 import { updaterStore } from "../../../stores/updater";
 import { isTauri } from "../../../transport";
-import { SettingInput, SettingSelect, SettingToggle } from "../SettingFields";
+import { SettingInput, SettingSelect, SettingSlider, SettingToggle } from "../SettingFields";
 import s from "../Settings.module.css";
 
 interface CliStatus {
 	installed: boolean;
 	path: string | null;
 	version_match: boolean;
+	auto_updatable: boolean;
 	prompt_dismissed: boolean;
 }
 
@@ -102,6 +103,17 @@ export const GeneralTab: Component = () => {
 
 	const ideOptions = Object.entries(IDE_NAMES).map(([value, label]) => ({ value, label }));
 
+	// --- Custom launchers (GH #71) ---
+	const launchers = (): CustomLauncher[] => settingsStore.state.customLaunchers;
+	const updateLauncher = (id: string, patch: Partial<CustomLauncher>) =>
+		settingsStore.setCustomLaunchers(launchers().map((l) => (l.id === id ? { ...l, ...patch } : l)));
+	const addLauncher = () =>
+		settingsStore.setCustomLaunchers([
+			...launchers(),
+			{ id: crypto.randomUUID(), name: "New tool", executable: "", args: [], enabled: true },
+		]);
+	const removeLauncher = (id: string) => settingsStore.setCustomLaunchers(launchers().filter((l) => l.id !== id));
+
 	const updateChannelOptions = [
 		{ value: "stable", label: t("general.channel.stable", "Stable") },
 		{ value: "nightly", label: t("general.channel.nightly", "Nightly") },
@@ -163,13 +175,22 @@ export const GeneralTab: Component = () => {
 							})}
 							{!cliStatus()!.version_match && (
 								<span style={{ color: "var(--warning, #e5c07b)", "margin-left": "8px" }}>
-									{t("general.hint.cliOutdated", "(update pending — restart to apply)")}
+									{cliStatus()!.auto_updatable
+										? t("general.hint.cliOutdated", "(update pending — restart to apply)")
+										: t("general.hint.cliUpdateAvailable", "(update available)")}
 								</span>
 							)}
 						</p>
-						<button class={s.testBtn} onClick={handleUninstallCli} style={{ "margin-top": "8px" }}>
-							{t("general.btn.uninstallCli", "Uninstall")}
-						</button>
+						<div style={{ display: "flex", gap: "8px", "margin-top": "8px" }}>
+							<Show when={!cliStatus()!.version_match}>
+								<button class={s.testBtn} onClick={handleInstallCli} disabled={cliInstalling()}>
+									{cliInstalling() ? t("general.btn.updating", "Updating...") : t("general.btn.updateCli", "Update")}
+								</button>
+							</Show>
+							<button class={s.testBtn} onClick={handleUninstallCli}>
+								{t("general.btn.uninstallCli", "Uninstall")}
+							</button>
+						</div>
 					</Show>
 				</div>
 			</Show>
@@ -258,6 +279,16 @@ export const GeneralTab: Component = () => {
 			/>
 
 			<SettingToggle
+				checked={settingsStore.state.osc52Clipboard}
+				onChange={(v) => settingsStore.setOsc52Clipboard(v)}
+				label={t("general.toggle.osc52Clipboard", "Allow OSC 52 clipboard writes")}
+				hint={t(
+					"general.hint.osc52Clipboard",
+					"Let terminal programs set the system clipboard (OSC 52). A notice appears on each write. Disable to ignore clipboard writes from terminal output.",
+				)}
+			/>
+
+			<SettingToggle
 				checked={settingsStore.state.showLastPrompt}
 				onChange={(v) => settingsStore.setShowLastPrompt(v)}
 				label="Show last prompt bar"
@@ -271,6 +302,32 @@ export const GeneralTab: Component = () => {
 				onChange={(v) => settingsStore.setPreventSleepWhenBusy(v)}
 				label={t("general.toggle.preventSleepWhenBusy", "Prevent sleep when busy")}
 				hint={t("general.hint.preventSleepWhenBusy", "Keep the system awake while scripts are running")}
+			/>
+
+			<SettingSlider
+				label="Auto-Standby Timeout"
+				value={settingsStore.state.standbyTimeoutMinutes}
+				onChange={(v) => settingsStore.setStandbyTimeoutMinutes(v)}
+				min={0}
+				max={60}
+				step={1}
+				formatValue={(v) => (v === 0 ? "Off" : `${v} min`)}
+				hint="Pause idle background sessions after this duration to save resources. 0 = disabled."
+			/>
+
+			<SettingSelect
+				label="Content Indexing"
+				value={settingsStore.state.indexStrategy}
+				onChange={(v) =>
+					settingsStore.setIndexStrategy(v as "active_only" | "active_and_switch" | "all_sequential" | "disabled")
+				}
+				options={[
+					{ value: "disabled", label: "Disabled" },
+					{ value: "active_only", label: "Active repo only" },
+					{ value: "active_and_switch", label: "Active + on switch" },
+					{ value: "all_sequential", label: "All repos at boot" },
+				]}
+				hint="When to build search indexes. Set to Disabled to turn off background indexing entirely."
 			/>
 
 			<h3>{t("general.heading.updates", "Updates")}</h3>
@@ -345,6 +402,67 @@ export const GeneralTab: Component = () => {
 				options={ideOptions}
 				hint={t("general.hint.defaultIde", "IDE used to open repositories")}
 			/>
+
+			<Show when={isTauri()}>
+				<h3>{t("general.heading.customLaunchers", "Custom Launchers")}</h3>
+				<div class={s.group}>
+					<p class={s.hint}>
+						{t(
+							"general.hint.customLaunchers",
+							'Define your own tools for the "Open in" menu. Each argument may use {path}, {file}, {fileDir}, {repo}, {cwd}, {home}, {line}, {column} placeholders. One argument per line.',
+						)}
+					</p>
+					<For each={launchers()}>
+						{(launcher) => (
+							<div
+								class={s.group}
+								style={{
+									border: "1px solid var(--border)",
+									"border-radius": "var(--radius-md)",
+									padding: "8px",
+									"margin-bottom": "8px",
+								}}
+							>
+								<div style={{ display: "flex", gap: "8px", "align-items": "center", "margin-bottom": "6px" }}>
+									<input
+										type="checkbox"
+										checked={launcher.enabled}
+										title={t("general.label.launcherEnabled", "Enabled")}
+										onChange={(e) => updateLauncher(launcher.id, { enabled: e.currentTarget.checked })}
+									/>
+									<input
+										type="text"
+										value={launcher.name}
+										placeholder={t("general.placeholder.launcherName", "Name")}
+										onInput={(e) => updateLauncher(launcher.id, { name: e.currentTarget.value })}
+										style={{ flex: "1" }}
+									/>
+									<button class={s.testBtn} onClick={() => removeLauncher(launcher.id)}>
+										{t("general.btn.remove", "Remove")}
+									</button>
+								</div>
+								<input
+									type="text"
+									value={launcher.executable}
+									placeholder={t("general.placeholder.launcherExec", "Executable (e.g. code, or /usr/local/bin/code)")}
+									onInput={(e) => updateLauncher(launcher.id, { executable: e.currentTarget.value })}
+									style={{ width: "100%", "margin-bottom": "6px" }}
+								/>
+								<textarea
+									value={launcher.args.join("\n")}
+									placeholder={"--goto\n{file}:{line}:{column}"}
+									rows={3}
+									onInput={(e) => updateLauncher(launcher.id, { args: e.currentTarget.value.split("\n") })}
+									style={{ width: "100%", "font-family": "var(--font-mono)", "font-size": "var(--font-sm)" }}
+								/>
+							</div>
+						)}
+					</For>
+					<button class={s.testBtn} onClick={addLauncher}>
+						{t("general.btn.addLauncher", "Add launcher")}
+					</button>
+				</div>
+			</Show>
 
 			<h3>{t("general.heading.experimental", "Experimental Features")}</h3>
 

@@ -5,6 +5,7 @@ import { editorTabsStore } from "../../stores/editorTabs";
 import { mdTabsStore } from "../../stores/mdTabs";
 import { paneLayoutStore, resetGroupCounter } from "../../stores/paneLayout";
 import { repositoriesStore } from "../../stores/repositories";
+import { settingsStore } from "../../stores/settings";
 import { terminalsStore } from "../../stores/terminals";
 import { makeTerminal } from "../helpers/store";
 import { mockInvoke } from "../mocks/tauri";
@@ -41,6 +42,7 @@ describe("useTerminalLifecycle", () => {
 
 	const mockDialogs = {
 		confirmCloseTerminal: vi.fn().mockResolvedValue(true),
+		confirmSaveChanges: vi.fn().mockResolvedValue("discard"),
 		confirm: vi.fn().mockResolvedValue(true),
 	};
 
@@ -54,6 +56,7 @@ describe("useTerminalLifecycle", () => {
 		mockPty.canSpawn.mockReset().mockResolvedValue(true);
 		mockPty.close.mockReset().mockResolvedValue(undefined);
 		mockDialogs.confirmCloseTerminal.mockReset().mockResolvedValue(true);
+		mockDialogs.confirmSaveChanges.mockReset().mockResolvedValue("discard");
 		mockDialogs.confirm.mockReset().mockResolvedValue(true);
 		mockSetStatusInfo.mockReset();
 		// Default: no foreground process (plain shell)
@@ -433,31 +436,47 @@ describe("useTerminalLifecycle", () => {
 			expect(terminalsStore.state.activeId).toBe(termId);
 		});
 
-		it("asks for confirmation when closing a dirty editor tab", async () => {
+		it("prompts to save a dirty editor tab and saves before closing on Save", async () => {
 			editorTabsStore.add("/repo/file.ts", "file.ts");
 			const editId = editorTabsStore.getIds()[0];
 			editorTabsStore.setDirty(editId, true);
+			const save = vi.fn().mockResolvedValue(undefined);
+			editorTabsStore.setHandle(editId, { save });
 
-			mockDialogs.confirm.mockResolvedValueOnce(true);
+			mockDialogs.confirmSaveChanges.mockResolvedValueOnce("confirm");
 			await lifecycle.closeTerminal(editId);
 
-			expect(mockDialogs.confirm).toHaveBeenCalledTimes(1);
-			expect(mockDialogs.confirm.mock.calls[0][0]).toMatchObject({
-				title: "Unsaved changes",
-				kind: "warning",
-			});
+			expect(mockDialogs.confirmSaveChanges).toHaveBeenCalledWith("file.ts");
+			expect(save).toHaveBeenCalledTimes(1);
 			expect(editorTabsStore.getIds().length).toBe(0);
 		});
 
-		it("keeps the dirty editor tab when the user cancels", async () => {
+		it("closes a dirty editor tab without saving on Don't Save", async () => {
 			editorTabsStore.add("/repo/file.ts", "file.ts");
 			const editId = editorTabsStore.getIds()[0];
 			editorTabsStore.setDirty(editId, true);
+			const save = vi.fn().mockResolvedValue(undefined);
+			editorTabsStore.setHandle(editId, { save });
 
-			mockDialogs.confirm.mockResolvedValueOnce(false);
+			mockDialogs.confirmSaveChanges.mockResolvedValueOnce("discard");
 			await lifecycle.closeTerminal(editId);
 
-			expect(mockDialogs.confirm).toHaveBeenCalledTimes(1);
+			expect(save).not.toHaveBeenCalled();
+			expect(editorTabsStore.getIds().length).toBe(0);
+		});
+
+		it("keeps the dirty editor tab and does not save when the user cancels", async () => {
+			editorTabsStore.add("/repo/file.ts", "file.ts");
+			const editId = editorTabsStore.getIds()[0];
+			editorTabsStore.setDirty(editId, true);
+			const save = vi.fn().mockResolvedValue(undefined);
+			editorTabsStore.setHandle(editId, { save });
+
+			mockDialogs.confirmSaveChanges.mockResolvedValueOnce("cancel");
+			await lifecycle.closeTerminal(editId);
+
+			expect(mockDialogs.confirmSaveChanges).toHaveBeenCalledTimes(1);
+			expect(save).not.toHaveBeenCalled();
 			expect(editorTabsStore.getIds()).toContain(editId);
 		});
 
@@ -467,11 +486,18 @@ describe("useTerminalLifecycle", () => {
 
 			await lifecycle.closeTerminal(editId);
 
-			expect(mockDialogs.confirm).not.toHaveBeenCalled();
+			expect(mockDialogs.confirmSaveChanges).not.toHaveBeenCalled();
 			expect(editorTabsStore.getIds().length).toBe(0);
 		});
 
 		it("selects sibling diff tab when closing one of multiple diff tabs", async () => {
+			// Repo context is required: diff tabs are repo-scoped, and sibling selection
+			// only considers tabs visible for the current branch key.
+			repositoriesStore.add({ path: "/repo", displayName: "Repo" });
+			repositoriesStore.setBranch("/repo", "main", { worktreePath: "/repo" });
+			repositoriesStore.setActive("/repo");
+			repositoriesStore.setActiveBranch("/repo", "main");
+
 			diffTabsStore.add("/repo", "a.ts", "M");
 			diffTabsStore.add("/repo", "b.ts", "A");
 			const ids = diffTabsStore.getIds();
@@ -482,6 +508,27 @@ describe("useTerminalLifecycle", () => {
 			expect(diffTabsStore.getIds().length).toBe(1);
 			// Should activate the remaining diff tab, not fall back to terminal
 			expect(diffTabsStore.state.activeId).toBe(ids[1]);
+		});
+
+		it("does not activate a branch-hidden md tab when closing the last visible one (ghost tab)", async () => {
+			repositoriesStore.add({ path: "/repo", displayName: "Repo" });
+			repositoriesStore.setBranch("/repo", "main", { worktreePath: "/repo" });
+			repositoriesStore.setBranch("/repo", "feature", { worktreePath: "/repo" });
+			repositoriesStore.setActive("/repo");
+			repositoriesStore.setActiveBranch("/repo", "main");
+
+			const hiddenId = mdTabsStore.add("/repo", "CLAUDE.md"); // scoped to /repo|main
+
+			repositoriesStore.setActiveBranch("/repo", "feature");
+			const visibleId = mdTabsStore.add("/repo", "README.md"); // scoped to /repo|feature
+			lifecycle.handleTerminalSelect(visibleId);
+
+			await lifecycle.closeTerminal(visibleId);
+
+			// The main-scoped tab is absent from the tab bar on feature — activating it
+			// would render a full-screen panel with no visible tab to close it from.
+			expect(mdTabsStore.get(hiddenId)).toBeDefined();
+			expect(mdTabsStore.state.activeId).toBeNull();
 		});
 	});
 
@@ -543,6 +590,57 @@ describe("useTerminalLifecycle", () => {
 			lifecycle.navigateTab("next");
 			expect(terminalsStore.state.activeId).toBe(id1);
 		});
+
+		it("excludes non-terminal tabs by default (terminals only)", () => {
+			repositoriesStore.add({ path: "/repo", displayName: "Repo" });
+			repositoriesStore.setBranch("/repo", "main", { worktreePath: "/repo" });
+			repositoriesStore.setActive("/repo");
+			repositoriesStore.setActiveBranch("/repo", "main");
+
+			const id1 = terminalsStore.add(makeTerminal({ name: "T1" }));
+			const id2 = terminalsStore.add(makeTerminal({ name: "T2" }));
+			repositoriesStore.addTerminalToBranch("/repo", "main", id1);
+			repositoriesStore.addTerminalToBranch("/repo", "main", id2);
+
+			// Opening a diff tab makes it active and deactivates terminals
+			diffTabsStore.add("/repo", "/repo/file.ts", "M");
+			terminalsStore.setActive(id1);
+			diffTabsStore.setActive(null);
+
+			// Default: tabCyclingAllTypes is false → diff tab is not in the cycle
+			lifecycle.navigateTab("next");
+			expect(terminalsStore.state.activeId).toBe(id2);
+		});
+
+		it("includes diff tabs in the cycle when tabCyclingAllTypes is enabled", () => {
+			repositoriesStore.add({ path: "/repo", displayName: "Repo" });
+			repositoriesStore.setBranch("/repo", "main", { worktreePath: "/repo" });
+			repositoriesStore.setActive("/repo");
+			repositoriesStore.setActiveBranch("/repo", "main");
+
+			const id1 = terminalsStore.add(makeTerminal({ name: "T1" }));
+			const id2 = terminalsStore.add(makeTerminal({ name: "T2" }));
+			repositoriesStore.addTerminalToBranch("/repo", "main", id1);
+			repositoriesStore.addTerminalToBranch("/repo", "main", id2);
+
+			const diffId = diffTabsStore.add("/repo", "/repo/file.ts", "M");
+			expect(diffTabsStore.state.activeId).toBe(diffId);
+
+			settingsStore.setTabCyclingAllTypes(true);
+			try {
+				// Cycle order is [id1, id2, diffId]; from the diff (last) → wraps to first terminal
+				lifecycle.navigateTab("next");
+				expect(terminalsStore.state.activeId).toBe(id1);
+				expect(diffTabsStore.state.activeId).toBe(null);
+
+				// From the first terminal, prev wraps back to the diff tab
+				lifecycle.navigateTab("prev");
+				expect(diffTabsStore.state.activeId).toBe(diffId);
+				expect(terminalsStore.state.activeId).toBe(null);
+			} finally {
+				settingsStore.setTabCyclingAllTypes(false);
+			}
+		});
 	});
 
 	describe("clearTerminal", () => {
@@ -555,6 +653,7 @@ describe("useTerminalLifecycle", () => {
 					clear: mockClear,
 					fit: vi.fn(),
 					write: vi.fn(),
+					paste: vi.fn(),
 					writeln: vi.fn(),
 					input: vi.fn(),
 					focus: vi.fn(),
@@ -694,21 +793,45 @@ describe("useTerminalLifecycle", () => {
 
 			expect(mdTabsStore.getIds().length).toBe(1);
 		});
+
+		it("reselects the anchor md tab when the active tab was to its right", async () => {
+			mdTabsStore.add("/repo", "a.md");
+			mdTabsStore.add("/repo", "b.md");
+			mdTabsStore.add("/repo", "c.md");
+			const ids = mdTabsStore.getIds();
+			lifecycle.handleTerminalSelect(ids[2]);
+
+			await lifecycle.closeTabsToRight(ids[0]);
+
+			expect(mdTabsStore.getIds()).toEqual([ids[0]]);
+			expect(mdTabsStore.state.activeId).toBe(ids[0]);
+		});
+
+		it("keeps the anchor md tab active when tabs to its right were not active", async () => {
+			mdTabsStore.add("/repo", "a.md");
+			mdTabsStore.add("/repo", "b.md");
+			const ids = mdTabsStore.getIds();
+			lifecycle.handleTerminalSelect(ids[0]);
+
+			await lifecycle.closeTabsToRight(ids[0]);
+
+			expect(mdTabsStore.state.activeId).toBe(ids[0]);
+		});
 	});
 
 	describe("copyFromTerminal", () => {
 		it("copies selection to clipboard", async () => {
-			const mockWriteText = vi.fn().mockResolvedValue(undefined);
-			Object.defineProperty(navigator, "clipboard", {
-				value: { writeText: mockWriteText, readText: vi.fn() },
-				writable: true,
-				configurable: true,
-			});
+			// In Tauri mode the copy routes through the native clipboard-manager plugin
+			// (see utils/clipboard.ts) rather than navigator.clipboard, which WKWebView
+			// rejects when the document isn't focused / user activation has lapsed.
 			vi.spyOn(window, "getSelection").mockReturnValue({ toString: () => "selected text" } as Selection);
 
 			await lifecycle.copyFromTerminal();
 
-			expect(mockWriteText).toHaveBeenCalledWith("selected text");
+			expect(mockInvoke).toHaveBeenCalledWith("plugin:clipboard-manager|write_text", {
+				text: "selected text",
+				label: undefined,
+			});
 			expect(mockSetStatusInfo).toHaveBeenCalledWith("Copied to clipboard");
 		});
 
@@ -722,43 +845,63 @@ describe("useTerminalLifecycle", () => {
 	});
 
 	describe("pasteToTerminal", () => {
-		it("pastes clipboard text to active terminal", async () => {
-			const mockWrite = vi.fn();
-			Object.defineProperty(navigator, "clipboard", {
-				value: { readText: vi.fn().mockResolvedValue("pasted text"), writeText: vi.fn() },
-				writable: true,
-				configurable: true,
-			});
+		function makeRef(overrides: Partial<Record<string, unknown>> = {}) {
+			return {
+				write: vi.fn(),
+				paste: vi.fn(),
+				clear: vi.fn(),
+				fit: vi.fn(),
+				writeln: vi.fn(),
+				input: vi.fn(),
+				focus: vi.fn(),
+				getSessionId: vi.fn(),
+				getSelection: vi.fn(() => ""),
+				openSearch: vi.fn(),
+				closeSearch: vi.fn(),
+				toggleCompose: vi.fn(),
+				openComposeWithText: vi.fn(),
+				searchBuffer: vi.fn(() => []),
+				scrollToLine: vi.fn(),
+				scrollToTop: vi.fn(),
+				scrollToBottom: vi.fn(),
+				scrollPages: vi.fn(),
+				getBufferLines: vi.fn(() => []),
+				refresh: vi.fn(),
+				...overrides,
+			};
+		}
+
+		it("delegates to ref.paste(), not ref.write()", async () => {
+			const ref = makeRef();
+			// In Tauri mode the read routes through the native clipboard-manager plugin
+			// (see utils/clipboard.ts) rather than navigator.clipboard.readText(), which on
+			// macOS Sequoia surfaces a floating "Paste" system pill over our context menu.
+			mockInvoke.mockResolvedValue("pasted text");
 
 			const id = terminalsStore.add(makeTerminal({ name: "T1" }));
 			terminalsStore.setActive(id);
-			terminalsStore.update(id, {
-				ref: {
-					write: mockWrite,
-					clear: vi.fn(),
-					fit: vi.fn(),
-					writeln: vi.fn(),
-					input: vi.fn(),
-					focus: vi.fn(),
-					getSessionId: vi.fn(),
-					getSelection: vi.fn(() => ""),
-					openSearch: vi.fn(),
-					closeSearch: vi.fn(),
-					toggleCompose: vi.fn(),
-					openComposeWithText: vi.fn(),
-					searchBuffer: vi.fn(() => []),
-					scrollToLine: vi.fn(),
-					scrollToTop: vi.fn(),
-					scrollToBottom: vi.fn(),
-					scrollPages: vi.fn(),
-					getBufferLines: vi.fn(() => []),
-					refresh: vi.fn(),
-				},
-			});
+			terminalsStore.update(id, { ref });
 
 			await lifecycle.pasteToTerminal();
 
-			expect(mockWrite).toHaveBeenCalledWith("pasted text");
+			expect(mockInvoke).toHaveBeenCalledWith("plugin:clipboard-manager|read_text");
+			expect(ref.paste).toHaveBeenCalledWith("pasted text");
+			expect(ref.write).not.toHaveBeenCalled();
+		});
+
+		it("passes multi-line text to ref.paste() unchanged", async () => {
+			const ref = makeRef();
+			mockInvoke.mockResolvedValue("line1\nline2\nline3");
+
+			const id = terminalsStore.add(makeTerminal({ name: "T1" }));
+			terminalsStore.setActive(id);
+			terminalsStore.update(id, { ref });
+
+			await lifecycle.pasteToTerminal();
+
+			// Bracketed paste wrapping is the responsibility of ref.paste() (Terminal/CanvasTerminal),
+			// which has access to the current bracketedPaste terminal state.
+			expect(ref.paste).toHaveBeenCalledWith("line1\nline2\nline3");
 		});
 	});
 

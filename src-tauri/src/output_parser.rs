@@ -52,9 +52,15 @@ pub enum ParsedEvent {
     /// Plan file detected in terminal output (e.g. plans/foo.md, .claude/plans/bar.md)
     #[serde(rename = "plan-file")]
     PlanFile { path: String },
-    /// User submitted a line of input via the PTY (reconstructed from keystrokes)
+    /// User submitted a line of input via the PTY.
+    ///
+    /// `line` is the absolute prompt row (`history_size + cursor row`, the same
+    /// coordinate space as AgentBlock/OSC133) captured at the OSC 7770
+    /// `state=busy` transition — i.e. the row the cursor sat on when the agent
+    /// resumed work after the user submitted, which is the user's prompt line.
+    /// `-1` when the event has no grid context (keystroke-reconstructed path).
     #[serde(rename = "user-input")]
-    UserInput { content: String },
+    UserInput { content: String, line: i64 },
     /// API error from an agent (5xx server error, auth failure, etc.)
     #[serde(rename = "api-error")]
     ApiError {
@@ -180,24 +186,14 @@ pub struct OutputParser {
     api_error_patterns: &'static [ApiErrorPattern],
     /// Dedup: last emitted suggest items to suppress re-emission on scroll.
     last_suggest_items: Option<Vec<String>>,
+    /// Input-turn epoch whose real working evidence reopened suggest dedup.
+    /// A submission alone is insufficient because the previous suggest row can
+    /// repaint while it is still visible; fresh work proves a new response has
+    /// actually started and may legitimately end with identical suggestions.
+    suggest_working_turn_epoch: Option<u64>,
     /// Dedup: last emitted api-error matched text to suppress re-emission
     /// when the same error remains visible in the terminal buffer.
     last_api_error_match: Option<String>,
-    /// Cross-chunk suggest tail recovery. When a `suggest:` line was parsed
-    /// in a prior chunk but the final item may have been a wrap-tail still
-    /// in-flight, we remember the raw "suggest: …" line so a later chunk
-    /// bringing only the wrapped continuation (e.g. the naked word "CSS" on
-    /// its own row) can be re-joined and re-parsed. Without this the first
-    /// parse emits truncated items and no subsequent chunk re-triggers
-    /// `parse_suggest` because the keyword `suggest:` is absent from the
-    /// changed-rows subset.
-    pending_suggest_line: Option<String>,
-    /// Timestamp when `pending_suggest_line` was set. Terminal wrap tails
-    /// always arrive in the immediately-following chunk; any later "looks
-    /// like a continuation" row is unrelated output and must not revive the
-    /// stale suggest. A short TTL bounds the window of ambiguity without
-    /// requiring cross-thread reset plumbing from the PTY input handler.
-    pending_suggest_at: Option<std::time::Instant>,
     /// Dedup: true after first session conflict detected — suppresses re-emission
     /// when the same error text remains visible in the VT log buffer.
     session_conflict_fired: bool,
@@ -237,18 +233,11 @@ impl OutputParser {
             rate_limit_patterns: &RATE_LIMIT_PATTERNS,
             api_error_patterns: &API_ERROR_PATTERNS,
             last_suggest_items: None,
+            suggest_working_turn_epoch: None,
             last_api_error_match: None,
-            pending_suggest_line: None,
-            pending_suggest_at: None,
             session_conflict_fired: false,
         }
     }
-
-    /// Max age for `pending_suggest_line` to stay eligible as a continuation
-    /// target. Wrap tails land in the same render cycle (tens of ms); 2s is
-    /// generous enough to tolerate a slow PTY flush while short enough to
-    /// prevent unrelated output minutes later from reviving a stale suggest.
-    const PENDING_SUGGEST_TTL: std::time::Duration = std::time::Duration::from_secs(2);
 
     /// Parse a chunk of PTY output and return any detected events.
     ///
@@ -421,43 +410,16 @@ impl OutputParser {
         if let Some(evt) = parse_intent(&joined, agent_active) {
             events.push(evt);
         }
-        // Cross-chunk suggest recovery: if a prior chunk emitted a suggest but
-        // a late-arriving wrap-tail (e.g. last item's last word alone on its
-        // own row) lands in this chunk, the `joined` slice lacks `suggest:`
-        // and parse_suggest would bail. Prepend the remembered canonical
-        // line so the continuation logic can re-evaluate with full context.
-        // A short TTL prevents unrelated output minutes later from reviving
-        // a stale suggest line.
-        let pending_still_fresh = self
-            .pending_suggest_at
-            .is_some_and(|t| t.elapsed() < Self::PENDING_SUGGEST_TTL);
-        if !pending_still_fresh {
-            self.pending_suggest_line = None;
-            self.pending_suggest_at = None;
-        }
-        let suggest_input: std::borrow::Cow<'_, str> =
-            if !joined.contains("suggest:") && self.pending_suggest_line.is_some() {
-                let pending = self.pending_suggest_line.as_deref().unwrap();
-                std::borrow::Cow::Owned(format!("{pending}\n{joined}"))
-            } else {
-                std::borrow::Cow::Borrowed(joined.as_str())
-            };
-        if let Some((evt, canonical)) =
-            parse_suggest_with_line(suggest_input.as_ref(), agent_active)
+        // Suggest follow-up actions: `suggest: [ A | B | C ]` on one bounded
+        // logical line. The token is fully self-contained (bounded by `[ … ]`),
+        // so there is no parser-owned cross-chunk buffer — dedup against the last
+        // emission to avoid re-firing while the same suggest stays on screen.
+        if let Some((evt, _canonical)) = parse_suggest_with_line(&joined, agent_active)
+            && let ParsedEvent::Suggest { ref items } = evt
+            && self.last_suggest_items.as_ref() != Some(items)
         {
-            if let ParsedEvent::Suggest { ref items } = evt {
-                // Always remember the canonical line so future wrap-tails can
-                // attach — even when the items match the dedup cache (we still
-                // need to re-parse if a continuation arrives).
-                self.pending_suggest_line = Some(canonical);
-                self.pending_suggest_at = Some(std::time::Instant::now());
-                if self.last_suggest_items.as_ref() != Some(items) {
-                    self.last_suggest_items = Some(items.clone());
-                    events.push(evt);
-                }
-            } else {
-                events.push(evt);
-            }
+            self.last_suggest_items = Some(items.clone());
+            events.push(evt);
         }
 
         if !self.session_conflict_fired
@@ -476,12 +438,26 @@ impl OutputParser {
             .any(|e| matches!(e, ParsedEvent::UserInput { .. }))
         {
             self.last_api_error_match = None;
-            self.pending_suggest_line = None;
-            self.pending_suggest_at = None;
             self.session_conflict_fired = false;
         }
 
         events
+    }
+
+    /// Whether the existing suggest grammar accepts a complete token.
+    /// This deliberately does not touch emission deduplication state.
+    pub(crate) fn is_complete_suggest(&self, text: &str, agent_active: bool) -> bool {
+        parse_suggest_with_line(text, agent_active).is_some()
+    }
+
+    /// Reopen suggest emission once for a turn that has produced real working
+    /// evidence. Keeping this separate from user submission prevents a stale
+    /// previous-turn row repaint from recreating completed chips.
+    pub(crate) fn begin_suggest_working_turn(&mut self, turn_epoch: u64) {
+        if self.suggest_working_turn_epoch != Some(turn_epoch) {
+            self.suggest_working_turn_epoch = Some(turn_epoch);
+            self.last_suggest_items = None;
+        }
     }
 
     fn parse_rate_limit(&self, text: &str) -> Option<ParsedEvent> {
@@ -490,6 +466,8 @@ impl OutputParser {
             && !text.contains("RateLimit") && !text.contains("429")
             && !text.contains("RESOURCE_EXHAUSTED") && !text.contains("etry") // Retry/retry
             && !text.contains("Rate Limit") && !text.contains("per minute")
+            // Claude Code friendly overload message ("temporarily limiting requests")
+            && !text.contains("limiting requests")
         {
             return None;
         }
@@ -638,6 +616,16 @@ fn build_rate_limit_patterns() -> Vec<RateLimitPattern> {
         rl(
             "claude-overloaded",
             r"(?i)overloaded_error",
+            Some(30000),
+            false,
+        ),
+        // Claude Code: user-facing friendly overload message (Claude auto-retries
+        // internally; we only record the rate-limit, never inject — see AGENTS.md).
+        // Full UI string: "API Error: Server is temporarily limiting requests
+        // (not your usage limit) · Rate limited".
+        rl(
+            "claude-overloaded-friendly",
+            r"temporarily limiting requests",
             Some(30000),
             false,
         ),
@@ -1161,7 +1149,14 @@ fn parse_question(clean: &str) -> Option<ParsedEvent> {
         static ref INK_FOOTER_RE: regex::Regex =
             regex::Regex::new(r"Enter to select").unwrap();
         // cliclack interactive prompt: "◆  Do you allow this tool call?"
-        // ◆ (U+25C6) is the cliclack prompt marker — ultra-specific, no false positives.
+        // ◆ (U+25C6) is Goose's cliclack active-prompt marker. It is NOT unique to
+        // interactive prompts, though: grok reuses ◆ as a decorative timeline bullet
+        // ("◆ Thought for 1.3s", "◆ user_prompt_submit", tool-call labels). Those
+        // repaint every frame with a changing duration, so matching them emits an
+        // endless stream of (confident) Question events that never dedup — a
+        // notification storm. Goose's real prompts are all questions, so the match
+        // also requires the captured text to end with '?'. grok's decorative labels
+        // never do, so this cleanly separates the two.
         static ref CLICLACK_PROMPT_RE: regex::Regex =
             regex::Regex::new(r"^\s*\u{25C6}\s+(.+)").unwrap();
     }
@@ -1175,7 +1170,11 @@ fn parse_question(clean: &str) -> Option<ParsedEvent> {
         }
         if let Some(caps) = CLICLACK_PROMPT_RE.captures(line) {
             let text = caps[1].trim();
-            if text.len() >= 5 {
+            // Require a question mark: Goose's cliclack prompts are all questions
+            // ("…do you allow?", "Are you sure…?"). grok's decorative ◆ timeline
+            // bullets ("Thought for 1.3s", "user_prompt_submit") never end in '?',
+            // so this excludes them and kills the notification storm.
+            if text.len() >= 5 && text.ends_with('?') {
                 return Some(ParsedEvent::Question {
                     prompt_text: text.to_string(),
                     confident: true,
@@ -1304,6 +1303,41 @@ fn parse_plan_file(clean: &str) -> Option<ParsedEvent> {
 }
 
 /// Regex matching any CSI escape sequence (SGR colors, cursor movement, erase,
+/// Bullet glyphs an agent may prefix the first line of an assistant message
+/// with, before a column-0 protocol token (`intent:` / `suggest:`). Ink-hosted
+/// agents (Claude Code) decorate with ● U+25CF / ⏺ U+23FA; Codex uses
+/// • U+2022 / ◦ U+25E6. Single source of truth for the four token anchors below
+/// — they MUST stay in sync, and they drifted once: the Codex bullet was known
+/// to the spinner detector (`CODEX_BULLET_RE`) but not to these token regexes,
+/// so a Codex-emitted `• intent:` / `• suggest:` (first message line) never
+/// parsed. Char-class body only (no surrounding `[ ]`) so callers write `[{…}]`.
+const AGENT_LINE_BULLETS: &str = r"\x{25CF}\x{23FA}\x{2022}\x{25E6}";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StructuredTokenAnchor {
+    Intent,
+    Suggest,
+}
+
+/// Identify a structured token at the start of a logical terminal line.
+/// Keep this shared with the parser grammar so grid filtering accepts exactly
+/// the same optional agent bullets as the authoritative token regexes.
+pub(crate) fn structured_token_anchor(clean: &str) -> Option<StructuredTokenAnchor> {
+    lazy_static::lazy_static! {
+        static ref STRUCTURED_TOKEN_ANCHOR_RE: regex::Regex = regex::Regex::new(&format!(
+            r"^[\t ]*(?:[{b}][\t ]+)?(intent|suggest):",
+            b = AGENT_LINE_BULLETS
+        ))
+        .unwrap();
+    }
+    let captures = STRUCTURED_TOKEN_ANCHOR_RE.captures(clean)?;
+    match captures.get(1)?.as_str() {
+        "intent" => Some(StructuredTokenAnchor::Intent),
+        "suggest" => Some(StructuredTokenAnchor::Suggest),
+        _ => None,
+    }
+}
+
 /// Detect agent-declared intent tokens: `intent: <text>` or `intent: <text> (<title>)`
 /// at column 0. Only parsed when an agent is active — prevents false positives from
 /// prose like "The intent: of this code".
@@ -1313,15 +1347,19 @@ fn parse_intent(clean: &str, agent_active: bool) -> Option<ParsedEvent> {
     }
     lazy_static::lazy_static! {
         // Plain prefix: `intent:` at line start, with optional leading
-        // horizontal whitespace and/or an Ink bullet glyph (● U+25CF /
-        // ⏺ U+23FA). Ink-hosted agents (Claude Code) decorate the first
-        // line of an assistant message with `● ` and indent every
+        // horizontal whitespace and/or a leading bullet glyph (see
+        // AGENT_LINE_BULLETS). Ink-hosted agents (Claude Code) decorate the
+        // first line of an assistant message with `● ` and indent every
         // continuation line by the bullet width, so plain-prefix tokens
-        // emitted after the first line arrive as `  intent: ...`. The
-        // leading whitespace must be horizontal only — any non-whitespace
-        // character before the keyword is rejected.
-        static ref INTENT_PLAIN_RE: regex::Regex =
-            regex::Regex::new(r"(?m)^[\t ]*(?:[\x{25CF}\x{23FA}][\t ]+)?intent:[\t ]+(.+)$").unwrap();
+        // emitted after the first line arrive as `  intent: ...`; Codex
+        // decorates the first line with `• ` instead. The leading whitespace
+        // must be horizontal only — any non-whitespace character before the
+        // keyword (other than an allowed bullet) is rejected.
+        static ref INTENT_PLAIN_RE: regex::Regex = regex::Regex::new(&format!(
+            r"(?m)^[\t ]*(?:[{b}][\t ]+)?intent:[\t ]+(.+)$",
+            b = AGENT_LINE_BULLETS
+        ))
+        .unwrap();
         // Separate regex to split out the optional (title) suffix from the captured text
         static ref TITLE_RE: regex::Regex =
             regex::Regex::new(r"^(.*?)\(([^)]+)\)\s*$").unwrap();
@@ -1363,125 +1401,192 @@ fn build_intent_event(raw_match: Option<String>, title_re: &regex::Regex) -> Opt
     })
 }
 
-/// Detect suggested follow-up actions: `suggest: A | B | C` at column 0.
-/// Requires at least 2 pipe-separated items (TUIC protocol: 2–4 items).
-/// The `|` requirement prevents false positives on prose containing "suggest:"
-/// that happens to wrap to column 0 in Ink's \r-segment rendering.
-/// Only parsed when an agent is active.
-///
-/// Handles terminal line-wrap: when the suggest text is wider than the terminal,
-/// vt100 splits it across multiple `ChangedRow`s. The regex matches the first
-/// line, then continuation lines are joined until a line without `|` or starting
-/// with a known token prefix is reached.
+lazy_static::lazy_static! {
+    /// Bracketed suggest token, anchored at column 0 (optional leading
+    /// whitespace and a bullet glyph — see AGENT_LINE_BULLETS). Two constraints
+    /// make a false capture impossible:
+    ///   1. the capture excludes `\r`/`\n`, so it matches a single logical row,
+    ///   2. the content contains NO nested `[`/`]`.
+    /// A token wider than the terminal wraps across physical rows; that case is
+    /// rejoined upstream by [`dewrap_suggest_brackets`] (bounded by the closing
+    /// `]`, a small row window, and the same nested-bracket rejection) before
+    /// this regex runs. A mermaid edge (`EP["…"] -->|x|`) or markdown table
+    /// still fails to match — it lacks the column-0 `suggest: [` anchor or
+    /// carries a nested `[`. Capture group 1 is the item list.
+    static ref SUGGEST_RE: regex::Regex = regex::Regex::new(&format!(
+        r"(?m)^[\t ]*(?:[{b}][\t ]+)?suggest:[\t ]*\[([^\[\]\r\n]*)\]",
+        b = AGENT_LINE_BULLETS
+    ))
+    .unwrap();
+}
+
+/// Detect suggested follow-up actions: `suggest: [ A | B | C ]` at column 0.
+/// The whole token lives on one bounded logical line and its bracketed content
+/// holds no nested brackets, so stray pipes/brackets in surrounding output
+/// (mermaid, markdown tables, prose) can never be captured. Inner items are
+/// pipe-separated, 2–4 per the TUIC protocol. Only parsed when an agent is active.
 #[cfg(test)]
 fn parse_suggest(clean: &str, agent_active: bool) -> Option<ParsedEvent> {
     parse_suggest_with_line(clean, agent_active).map(|(evt, _)| evt)
 }
 
-/// Like [`parse_suggest`] but also returns the canonical `suggest: …` line that
-/// started the match. The caller can persist this line across chunks so a
-/// later PTY chunk that only carries a wrapped continuation (e.g. a naked
-/// last-item tail word) can be re-joined and re-parsed into complete items.
+/// Like [`parse_suggest`] but also returns the canonical `suggest: …` line.
 fn parse_suggest_with_line(clean: &str, agent_active: bool) -> Option<(ParsedEvent, String)> {
     if !agent_active {
         return None;
     }
-    // First pass: dewrap mid-word wrap of the keyword `suggest:` itself.
+    // Pass 1: dewrap mid-word wrap of the keyword `suggest:` itself.
     // On very narrow terminals the VT buffer can split the word across two
     // physical rows (e.g. `sugges\nt:` or `suggest\n:`). We rejoin these so
     // the downstream regex can match at column 0.
-    let cow = dewrap_suggest_keyword(clean);
-    let clean = cow.as_ref();
+    let kw_cow = dewrap_suggest_keyword(clean);
+    // Pass 2: when the terminal is so narrow that `suggest: ` fills the row
+    // entirely (≤9 cols for a plain prefix), the content lands on the next
+    // physical row.  Remove the stray newline so SUGGEST_START_RE can see it.
+    let content_cow = dewrap_suggest_content(kw_cow.as_ref());
+    // Pass 3: the bracketed list itself wrapped across physical rows because the
+    // token is wider than the terminal (e.g. a ~78-col `suggest: [ … ]` on a
+    // 76-col window). Rejoin the newlines inside the first `[ … ]` so the
+    // single-row SUGGEST_RE can match. Bounded by the closing `]`, a small row
+    // window, and nested-bracket rejection so surrounding output is never
+    // absorbed.
+    let bracket_cow = dewrap_suggest_brackets(content_cow.as_ref());
+    let clean = bracket_cow.as_ref();
     if !clean.contains("suggest:") {
         return None;
     }
-    lazy_static::lazy_static! {
-        // Match the suggest: prefix line. Captures everything after `suggest: `.
-        static ref SUGGEST_START_RE: regex::Regex =
-            regex::Regex::new(r"(?m)^[\t ]*(?:[\x{25CF}\x{23FA}][\t ]+)?suggest:[\t ]+(.+)$").unwrap();
-    }
-
-    let caps = SUGGEST_START_RE.captures(clean)?;
-    let first_line = caps[1].trim();
-    let match_end = caps.get(0).unwrap().end();
-    // Canonical suggest line (leading whitespace/bullet trimmed) — used by the
-    // caller to remember this parse across chunks when a continuation tail
-    // may still arrive on its own row.
-    let canonical_line = format!("suggest: {first_line}");
-
-    // Collect continuation lines: text after the matched line that is part of
-    // the same suggest token (wrapped by the terminal). A continuation line
-    // must not start with a recognized token prefix and should contain `|`
-    // (unless it's the tail of the last item).
-    // Skip past the newline that `$` matched before.
-    let remainder = clean[match_end..]
-        .strip_prefix('\n')
-        .unwrap_or(&clean[match_end..]);
-    let mut full = first_line.to_string();
-    let mut pipe_count = first_line.matches('|').count();
-    let mut tail_started = false;
-    for line in remainder.lines() {
-        let trimmed = line.trim();
-        // Empty line ends the suggest block — Claude Code separates suggest
-        // from following content (status spinner, prompt, prose) with a blank.
-        if trimmed.is_empty() {
-            break;
-        }
-        // Stop at lines that look like a new token or a shell prompt. The
-        // static glyphs (●, ⏺, ❯, etc.) are enumerated here; animated spinner
-        // glyphs vary per agent and per frame, so they delegate to
-        // `chrome::is_spinner_row`.
-        if trimmed.starts_with("intent:")
-            || trimmed.starts_with("suggest:")
-            || trimmed.starts_with("●")
-            || trimmed.starts_with("⏺")
-            || trimmed.starts_with("❯")
-            || trimmed.starts_with(">")
-            || trimmed.starts_with("›")
-            || trimmed.starts_with('*')
-            || trimmed.starts_with('$')
-            || trimmed.starts_with('#')
-            || crate::chrome::is_spinner_row(trimmed)
-        {
-            break;
-        }
-        if trimmed.contains('|') {
-            // Continuation with pipe — part of the pipe-separated list.
-            // A pipe row after a pipeless tail row is unusual; treat the prior
-            // tail as terminating and stop here.
-            if tail_started {
-                break;
-            }
-            pipe_count += trimmed.matches('|').count();
-            full.push(' ');
-            full.push_str(trimmed);
-        } else if pipe_count >= 2 || full.len() >= 40 {
-            // Pipeless tails (last item wrapped onto subsequent rows). Allow
-            // multiple consecutive tail rows — Claude Code wraps long final
-            // items across several physical rows on narrow terminals. We rely
-            // on the empty/token/spinner terminators above to bound this walk.
-            full.push(' ');
-            full.push_str(trimmed);
-            tail_started = true;
-        } else {
-            break;
-        }
-    }
-
-    // Must have at least one `|` separator
-    if !full.contains('|') {
-        return None;
-    }
-
-    let items: Vec<String> = full
+    // Single match: column-0 `suggest: [ … ]` on one row, no nested brackets.
+    let caps = SUGGEST_RE.captures(clean)?;
+    let items: Vec<String> = caps[1]
         .split('|')
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
-    if items.len() < 2 {
+    // Protocol: 2–4 short actions (spec says exactly 3; the overlay binds number
+    // keys 1–4). Reject anything outside that range.
+    if items.len() < 2 || items.len() > 4 {
         return None;
     }
+
+    // Canonical, normalized form for callers that need the matched token text.
+    let canonical_line = format!("suggest: [ {} ]", items.join(" | "));
     Some((ParsedEvent::Suggest { items }, canonical_line))
+}
+
+/// Rejoin a `suggest:` line when the terminal is so narrow that the keyword
+/// plus its trailing space/tab fills the entire physical row, pushing the
+/// item content onto the next line.
+///
+/// Example (9-col terminal):
+/// ```text
+/// suggest: \nA | B | C
+/// ```
+/// → `suggest: A | B | C`
+///
+/// Returns `Cow::Borrowed` when no such split is detected.
+fn dewrap_suggest_content(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains("suggest:") || !text.contains('\n') {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    lazy_static::lazy_static! {
+        // Matches a `suggest:` prefix line (with optional whitespace/bullet)
+        // that ends with only whitespace before the newline — no item content.
+        // Capture group 1: everything up to (but not including) trailing space+\n.
+        static ref SUGGEST_TRAILING_RE: regex::Regex = regex::Regex::new(&format!(
+            r"(?m)^([\t ]*(?:[{b}][\t ]+)?suggest:[\t ]+)[ \t]*\n",
+            b = AGENT_LINE_BULLETS
+        ))
+        .unwrap();
+    }
+    if !SUGGEST_TRAILING_RE.is_match(text) {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    // Replace `suggest: <trailing spaces>\n` with `suggest: ` so the next
+    // physical row's content is treated as the first item line.
+    std::borrow::Cow::Owned(SUGGEST_TRAILING_RE.replace_all(text, "$1").to_string())
+}
+
+/// Rejoin a `suggest: [ … ]` token whose bracketed content wrapped across
+/// physical terminal rows. The single-row [`SUGGEST_RE`] cannot match once the
+/// VT buffer has split the list with `\n` (a token wider than the terminal,
+/// e.g. ~78 cols of items on a 76-col window), so the overlay never fires.
+/// We reconstruct the logical line by collapsing newlines (and the horizontal
+/// whitespace the wrap leaves behind) inside the first `[ … ]` into single
+/// spaces.
+///
+/// Because a terminal hard-wrap is column-based, it may break mid-word; the
+/// space-collapse is therefore a best-effort rejoin (correct when the break
+/// lands on a separator, slightly off mid-word). That is strictly better than
+/// the prior behaviour of not rendering the overlay at all.
+///
+/// The same safety invariants the single-row regex relies on are preserved:
+///   - we only act on a column-0 `suggest: [` anchor,
+///   - we bail if a nested `[` appears before the closing `]` (mermaid/table),
+///   - we scan at most [`MAX_WRAP_ROWS`] rows after the anchor, so a stray
+///     `suggest: [` with no closing `]` cannot swallow unbounded output.
+///
+/// Returns `Cow::Borrowed` when no wrapped suggest is detected.
+fn dewrap_suggest_brackets(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains("suggest:") || !text.contains('\n') {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    lazy_static::lazy_static! {
+        // Column-0 `suggest:` anchor up to and including the opening `[`.
+        static ref SUGGEST_OPEN_RE: regex::Regex = regex::Regex::new(&format!(
+            r"(?m)^[\t ]*(?:[{b}][\t ]+)?suggest:[\t ]*\[",
+            b = AGENT_LINE_BULLETS
+        ))
+        .unwrap();
+        // A newline plus the horizontal whitespace surrounding it.
+        static ref WRAP_WS_RE: regex::Regex = regex::Regex::new(r"[\t ]*\n[\t ]*").unwrap();
+    }
+    // 4 physical rows comfortably hold a max-size token (4 items × ≤40 chars +
+    // separators + brackets ≈ 170 cols ≈ 3 wraps at a typical narrow width).
+    const MAX_WRAP_ROWS: usize = 4;
+
+    let Some(m) = SUGGEST_OPEN_RE.find(text) else {
+        return std::borrow::Cow::Borrowed(text);
+    };
+    let content_start = m.end(); // byte index just after the opening `[`
+
+    // Scan forward for the closing `]`, bailing on a nested `[` (preserve the
+    // mermaid/table rejection) or after the row window is exhausted.
+    let mut newline_count = 0usize;
+    let mut close_idx = None;
+    for (off, ch) in text[content_start..].char_indices() {
+        match ch {
+            ']' => {
+                close_idx = Some(content_start + off);
+                break;
+            }
+            '[' => return std::borrow::Cow::Borrowed(text),
+            '\n' => {
+                newline_count += 1;
+                if newline_count > MAX_WRAP_ROWS {
+                    return std::borrow::Cow::Borrowed(text);
+                }
+            }
+            _ => {}
+        }
+    }
+    let Some(close_idx) = close_idx else {
+        // No closing `]` within reach — leave untouched so an incomplete token
+        // does not parse.
+        return std::borrow::Cow::Borrowed(text);
+    };
+
+    let content = &text[content_start..close_idx];
+    if !content.contains('\n') {
+        // Already single-row; the regex handles it without a rewrite.
+        return std::borrow::Cow::Borrowed(text);
+    }
+
+    let collapsed = WRAP_WS_RE.replace_all(content, " ");
+    let mut out = String::with_capacity(text.len());
+    out.push_str(&text[..content_start]);
+    out.push_str(&collapsed);
+    out.push_str(&text[close_idx..]);
+    std::borrow::Cow::Owned(out)
 }
 
 /// Rejoin a `suggest:` keyword that got split across a newline by terminal
@@ -3118,6 +3223,29 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
         assert!(has_rate_limit(&parser.parse("Retry-After: 60")));
     }
 
+    #[test]
+    fn test_claude_friendly_overload_message_detected() {
+        let mut parser = OutputParser::new();
+        // Claude Code's user-facing transient-overload message (Claude auto-retries
+        // internally). Must be classified as rate-limit so TUIC records it without
+        // injecting a competing retry.
+        assert!(has_rate_limit(&parser.parse(
+            "API Error: Server is temporarily limiting requests (not your usage limit) · Rate limited"
+        )));
+    }
+
+    #[test]
+    fn test_no_false_positive_friendly_overload_in_code() {
+        let mut parser = OutputParser::new();
+        // Same phrase inside source/markdown context must NOT fire.
+        assert!(!has_rate_limit(&parser.parse(
+            r#"        rl("claude-overloaded-friendly", r"temporarily limiting requests", Some(30000), false),"#
+        )));
+        assert!(!has_rate_limit(&parser.parse(
+            "// handles \"temporarily limiting requests\" from Claude"
+        )));
+    }
+
     // --- Source code false-positive guard tests ---
 
     #[test]
@@ -3615,9 +3743,56 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
     }
 
     #[test]
+    fn test_intent_plain_prefix_with_codex_bullet() {
+        // Codex decorates the first line of an assistant message with `• `
+        // (U+2022), so an intent emitted as the opening line arrives bulleted.
+        // Regression: this glyph was excluded from the token anchor, so Codex
+        // intent capture silently never fired.
+        let mut parser = OutputParser::new();
+        let events = parser.parse("\u{2022} intent: avvio watcher upstream (Upstream Watcher)");
+        assert_eq!(
+            get_intent(&events),
+            Some("avvio watcher upstream".to_string())
+        );
+        assert_eq!(
+            get_intent_title(&events),
+            Some("Upstream Watcher".to_string())
+        );
+    }
+
+    #[test]
+    fn test_intent_plain_prefix_with_codex_hollow_bullet() {
+        // Codex alternates • (U+2022) with ◦ (U+25E6) as a blink; both anchor.
+        let mut parser = OutputParser::new();
+        let events = parser.parse("\u{25E6} intent: ricostruisco il modello");
+        assert_eq!(
+            get_intent(&events),
+            Some("ricostruisco il modello".to_string())
+        );
+    }
+
+    #[test]
+    fn test_suggest_plain_prefix_with_codex_bullet() {
+        let mut parser = OutputParser::new();
+        let events = parser.parse("\u{2022} suggest: [ Rebuild | Retry | Abort ]");
+        let items = events.iter().find_map(|e| match e {
+            ParsedEvent::Suggest { items } => Some(items.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            items,
+            Some(vec![
+                "Rebuild".to_string(),
+                "Retry".to_string(),
+                "Abort".to_string()
+            ])
+        );
+    }
+
+    #[test]
     fn test_suggest_plain_prefix_with_ink_bullet() {
         let mut parser = OutputParser::new();
-        let events = parser.parse("\u{25CF} suggest: Rebuild | Retry | Abort");
+        let events = parser.parse("\u{25CF} suggest: [ Rebuild | Retry | Abort ]");
         let items = events.iter().find_map(|e| match e {
             ParsedEvent::Suggest { items } => Some(items.clone()),
             _ => None,
@@ -3787,18 +3962,36 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
     #[test]
     fn test_suggest_plain_prefix_basic() {
         let mut parser = OutputParser::new();
-        let events = parser.parse("suggest: Run tests | Check logs | Push changes");
+        let events = parser.parse("suggest: [ Run tests | Check logs | Push changes ]");
         let items = get_suggest(&events).expect("should parse plain-prefix suggest");
         assert_eq!(items, vec!["Run tests", "Check logs", "Push changes"]);
     }
 
     #[test]
+    fn test_suggest_brackets_bound_stray_pipes() {
+        // Regression: a `suggest:` followed by mermaid / markdown pipe content
+        // (||--o{, table rows) was greedily collected into 20+ garbage chips.
+        // The `[ … ]` bracket bounds the token — the closing `]` terminates the
+        // walk, so pipes in the surrounding output are ignored entirely.
+        let mut parser = OutputParser::new();
+        let events = parser.parse(
+            "suggest: [ A | B | C ]\n\
+             software_product ||--o{ software_signature | product_id\n\
+             file_artifact ||--o{ software_instance | sha256\n",
+        );
+        assert_eq!(
+            get_suggest(&events),
+            Some(vec!["A".to_string(), "B".to_string(), "C".to_string()]),
+            "only the bracketed items count; trailing pipe content is ignored"
+        );
+    }
+
+    #[test]
     fn test_suggest_plain_prefix_single_item_rejected() {
         // Single item (no `|` separator) must NOT match — prevents false
-        // positives on prose like "suggest: we should refactor" that wraps
-        // to column 0 in Ink's \r-segment rendering.
+        // positives on prose that happens to be bracketed.
         let mut parser = OutputParser::new();
-        let events = parser.parse("suggest: Single option");
+        let events = parser.parse("suggest: [ Single option ]");
         assert!(
             get_suggest(&events).is_none(),
             "single item without | must not parse as suggest"
@@ -3809,33 +4002,33 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
     fn test_suggest_plain_prefix_indented_matches() {
         // See test_intent_plain_prefix_indented_matches.
         let mut parser = OutputParser::new();
-        let items =
-            get_suggest(&parser.parse("  suggest: A | B")).expect("indented suggest must match");
+        let items = get_suggest(&parser.parse("  suggest: [ A | B ]"))
+            .expect("indented suggest must match");
         assert_eq!(items, vec!["A", "B"]);
     }
 
     #[test]
     fn test_suggest_plain_prefix_midline_no_match() {
         let mut parser = OutputParser::new();
-        assert!(get_suggest(&parser.parse("I suggest: we should refactor")).is_none());
+        assert!(get_suggest(&parser.parse("I suggest: [ A | B ]")).is_none());
     }
 
     #[test]
     fn test_suggest_prose_at_column_zero_no_match() {
-        // Prose containing "suggest:" that wraps to column 0 in a VtLogBuffer row
-        // must NOT be parsed as a suggest event.
+        // A column-0 `suggest:` WITHOUT the bracketed list must NOT parse — prose
+        // like "suggest: we should investigate ..." has no `[ … ]` token.
         let mut parser = OutputParser::new();
         assert!(
             get_suggest(&parser.parse("suggest: we should investigate the streaming issue"))
                 .is_none(),
-            "prose at column 0 without | must not match"
+            "prose at column 0 without a bracketed list must not match"
         );
     }
 
     #[test]
     fn test_suggest_plain_prefix_trims_whitespace() {
         let mut parser = OutputParser::new();
-        let events = parser.parse("suggest:   Fix test  |  Refactor  |  Add docs  ");
+        let events = parser.parse("suggest: [   Fix test  |  Refactor  |  Add docs   ]");
         let items = get_suggest(&events).expect("should parse");
         assert_eq!(items, vec!["Fix test", "Refactor", "Add docs"]);
     }
@@ -3843,54 +4036,100 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
     #[test]
     fn test_suggest_plain_prefix_in_multiline() {
         let mut parser = OutputParser::new();
-        let events = parser.parse("some output\r\nsuggest: Option A | Option B\r\nmore output");
+        let events = parser.parse("some output\r\nsuggest: [ Option A | Option B ]\r\nmore output");
         let items = get_suggest(&events).expect("should parse in multiline");
         assert_eq!(items, vec!["Option A", "Option B"]);
     }
 
     #[test]
-    fn test_suggest_terminal_line_wrap() {
-        // When the suggest text is wider than the terminal, vt100 splits it
-        // across multiple rows. The parser must join continuation lines.
-        let input = "suggest: 1) Screenshot overview panel | 2) Fix suggest scroll flicker | 3) Fix\n\
-                      Cmd+Shift+M keybinding collision | 4) Manual test OSC 133";
-        let items = parse_suggest(input, true);
-        let items = match items {
+    fn test_suggest_dewraps_multiline_content() {
+        // A token wider than the terminal wraps its `[ … ]` across physical
+        // rows. `dewrap_suggest_brackets` rejoins the newline (plus the wrap's
+        // leading whitespace) so the four items parse. The closing `]` still
+        // bounds the token, so it cannot run into surrounding output.
+        let input = "suggest: [ 1) Screenshot overview panel | 2) Fix scroll flicker | 3) Fix\n\
+                      Cmd+Shift+M collision | 4) Manual test ]";
+        let items = match parse_suggest(input, true) {
             Some(ParsedEvent::Suggest { items }) => items,
-            _ => panic!("should parse wrapped suggest"),
+            _ => panic!("wrapped suggest content must dewrap and parse"),
         };
-        assert_eq!(items.len(), 4);
-        assert_eq!(items[0], "1) Screenshot overview panel");
-        assert_eq!(items[3], "4) Manual test OSC 133");
+        assert_eq!(
+            items,
+            vec![
+                "1) Screenshot overview panel",
+                "2) Fix scroll flicker",
+                "3) Fix Cmd+Shift+M collision",
+                "4) Manual test"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_suggest_dewraps_realistic_wrap() {
+        // The exact shape that failed in practice: a ~78-col token on a ~76-col
+        // terminal, wrapping between (here) the second and third item.
+        let input =
+            "suggest: [ Crea v1.3.1-nightly | Lascia solo\nrolling | Indaga il gap versionato ]";
+        let items = match parse_suggest(input, true) {
+            Some(ParsedEvent::Suggest { items }) => items,
+            _ => panic!("realistic wrapped suggest must parse"),
+        };
+        assert_eq!(
+            items,
+            vec![
+                "Crea v1.3.1-nightly",
+                "Lascia solo rolling",
+                "Indaga il gap versionato"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_suggest_wrapped_without_closing_bracket_no_match() {
+        // An opening `suggest: [` whose `]` never arrives (truncated/streaming)
+        // must NOT parse — the dewrap bails without a closing bracket, so it
+        // cannot absorb the unbounded output that follows.
+        let input = "suggest: [ A | B\nthis is just more terminal output, not a list";
+        assert!(
+            parse_suggest(input, true).is_none(),
+            "wrapped suggest with no closing `]` must not parse"
+        );
+    }
+
+    #[test]
+    fn test_suggest_wrapped_nested_bracket_no_match() {
+        // A nested `[` before the closing `]` invalidates the match even when
+        // wrapped, so a mermaid label split across rows can never be captured.
+        let input = "suggest: [ A | EP[\"node\"\n] | C ]";
+        assert!(
+            parse_suggest(input, true).is_none(),
+            "a nested bracket must invalidate the wrapped suggest match"
+        );
+    }
+
+    #[test]
+    fn test_suggest_rejects_nested_bracket() {
+        // Condition 2: a `[` inside the content invalidates the match, so a
+        // mermaid node label like `EP["…"]` sharing the suggest line can never
+        // be captured as items.
+        let input = "suggest: [ A | EP[\"node\"] | C ]";
+        assert!(
+            parse_suggest(input, true).is_none(),
+            "a nested bracket must invalidate the suggest match"
+        );
     }
 
     #[test]
     fn test_suggest_wrap_stops_at_new_token() {
-        // Continuation must stop when a new token prefix appears.
-        let input = "suggest: A | B | C\nintent: doing something";
+        // The `]` terminator bounds the token — content after it (here a new
+        // `intent:` token) is never absorbed into the item list.
+        let input = "suggest: [ A | B | C ]\nintent: doing something";
         let items = parse_suggest(input, true);
         let items = match items {
             Some(ParsedEvent::Suggest { items }) => items,
             _ => panic!("should parse"),
         };
         assert_eq!(items, vec!["A", "B", "C"]);
-    }
-
-    #[test]
-    fn test_suggest_wrap_tail_without_pipe() {
-        // When the last item wraps to a new line without a `|`, the continuation
-        // must still be joined — it's the tail of the last option.
-        let input = "suggest: 1) Avviare subito /wiz:work su 1180-f055 | 2) Marcarla ready e lavorarci dopo | 3) Ignorarla per ora e andare avanti con\naltra roba";
-        let items = parse_suggest(input, true);
-        let items = match items {
-            Some(ParsedEvent::Suggest { items }) => items,
-            _ => panic!("should parse suggest with tail wrap"),
-        };
-        assert_eq!(items.len(), 3);
-        assert_eq!(
-            items[2],
-            "3) Ignorarla per ora e andare avanti con altra roba"
-        );
     }
 
     #[test]
@@ -3907,7 +4146,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
             "sugges\nt:",
             "suggest\n:",
         ] {
-            let input = format!("{split} A | B | C");
+            let input = format!("{split} [ A | B | C ]");
             let items = parse_suggest(&input, true);
             let items = match items {
                 Some(ParsedEvent::Suggest { items }) => items,
@@ -3962,25 +4201,10 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
     }
 
     #[test]
-    fn test_suggest_narrow_wrap_three_items_short_first_line() {
-        // When the terminal is narrow (zoomed window) and `suggest:` is
-        // short but clearly complete (3 items → 2 pipes), the pipeless
-        // wrapped tail must still be joined even when total length < 70.
-        let input = "suggest: A | B | C\ntail wrap";
-        let items = parse_suggest(input, true);
-        let items = match items {
-            Some(ParsedEvent::Suggest { items }) => items,
-            _ => panic!("should parse narrow-wrap 3-item suggest"),
-        };
-        assert_eq!(items.len(), 3);
-        assert_eq!(items[2], "C tail wrap");
-    }
-
-    #[test]
     fn test_suggest_short_two_items_does_not_grab_tail() {
-        // A short 2-item suggest followed by unrelated prose must NOT grab
-        // the next line as wrap — the length/pipe-count thresholds reject it.
-        let input = "suggest: A | B\nsome unrelated prose here";
+        // The closing `]` ends the token — unrelated prose on the next row is
+        // never grabbed as a continuation.
+        let input = "suggest: [ A | B ]\nsome unrelated prose here";
         let items = parse_suggest(input, true);
         let items = match items {
             Some(ParsedEvent::Suggest { items }) => items,
@@ -3990,95 +4214,46 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
     }
 
     #[test]
-    fn test_suggest_wrap_tail_stops_at_terminator() {
-        // Pipeless tails are joined until a strong terminator (empty line,
-        // token boundary, status spinner `*`, shell prompt `$`/`#`).
-        // Claude Code always emits a blank line before the status spinner,
-        // so prose-after-suggest is never adjacent in practice.
-        let input = "suggest: 1) First long option text here | 2) Second long option text here | 3) Third option that wraps to the next\ntail of third\n\nunrelated output on another line";
-        let items = parse_suggest(input, true);
-        let items = match items {
-            Some(ParsedEvent::Suggest { items }) => items,
-            _ => panic!("should parse"),
+    fn test_suggest_canonical_roundtrips() {
+        // The returned canonical line must re-parse to the same items, so a
+        // re-render of the same suggest row dedups instead of re-firing.
+        let input = "suggest: [ A | B | C ]";
+        let (evt, canonical) = parse_suggest_with_line(input, true).expect("should parse");
+        let items = match evt {
+            ParsedEvent::Suggest { items } => items,
+            _ => panic!("expected Suggest event"),
         };
-        assert_eq!(items.len(), 3);
-        assert_eq!(
-            items[2],
-            "3) Third option that wraps to the next tail of third"
+        assert_eq!(items, vec!["A", "B", "C"]);
+        let roundtrip = parse_suggest(&canonical, true).expect("canonical must re-parse");
+        assert!(
+            matches!(roundtrip, ParsedEvent::Suggest { items } if items == vec!["A", "B", "C"]),
+            "canonical must roundtrip to the same items"
         );
     }
 
     #[test]
-    fn test_suggest_wrap_tail_multiline_joins_all() {
-        // Reported bug: long final item wraps across multiple physical rows
-        // (no `|` in any of them). Single-tail-only logic dropped trailing
-        // words like "app", showing them as orphans in the terminal.
-        let input = "suggest: 1) A | 2) B | 3) Questo cambia completamente la diagnosi del fix.\napp\n\n* Cooked for 3m 30s";
+    fn test_suggest_keyword_alone_on_narrow_row() {
+        // Terminal so narrow (≤9 cols) that `suggest: ` fills the row entirely;
+        // item content lands on the next physical row.
+        let input = "suggest: \n[ A | B | C ]";
         let items = parse_suggest(input, true);
         let items = match items {
             Some(ParsedEvent::Suggest { items }) => items,
-            _ => panic!("should parse"),
+            _ => panic!("should parse when suggest: fills its row"),
         };
-        assert_eq!(items.len(), 3);
-        assert_eq!(
-            items[2],
-            "3) Questo cambia completamente la diagnosi del fix. app"
-        );
+        assert_eq!(items, vec!["A", "B", "C"]);
     }
 
     #[test]
-    fn test_suggest_wrap_tail_stops_at_status_spinner() {
-        // CC status line `* Cooked for ...` immediately after a tail row
-        // must terminate the walk even without an empty line buffer.
-        let input = "suggest: 1) A | 2) B | 3) Long item that wraps and lands on next row\nrest of item three\n* Cooked for 3m 30s";
+    fn test_suggest_bullet_keyword_alone_on_narrow_row() {
+        // With bullet prefix (⏺): `⏺ suggest: ` takes ~12 cols; content on next row.
+        let input = "⏺ suggest: \n[ A | B | C ]";
         let items = parse_suggest(input, true);
         let items = match items {
             Some(ParsedEvent::Suggest { items }) => items,
-            _ => panic!("should parse"),
+            _ => panic!("should parse with bullet when suggest: fills row"),
         };
-        assert_eq!(items.len(), 3);
-        assert_eq!(
-            items[2],
-            "3) Long item that wraps and lands on next row rest of item three"
-        );
-    }
-
-    #[test]
-    fn test_suggest_wrap_tail_stops_at_cc_dingbat_spinner() {
-        // Reported bug: CC uses `✻` (U+273B) as one of its spinner frames.
-        // Previous ASCII-only `*` guard missed it and chip 3 absorbed the
-        // status row, showing as "Tag release v1.1.0 ✻ Cogitated for 2m 32s".
-        // Note: the empty row between suggest and status is often absent in
-        // `joined` (parse_clean_lines skips unchanged rows), so relying on an
-        // empty-line terminator alone is insufficient.
-        let input = "suggest: 1) Riavvio la sessione | 2) Aggiungo uno stub | 3) Tag release\nv1.1.0\n\u{273B} Cogitated for 2m 32s";
-        let items = parse_suggest(input, true);
-        let items = match items {
-            Some(ParsedEvent::Suggest { items }) => items,
-            _ => panic!("should parse"),
-        };
-        assert_eq!(items.len(), 3);
-        assert_eq!(items[2], "3) Tag release v1.1.0");
-    }
-
-    #[test]
-    fn test_suggest_short_last_item_wrapped_alone() {
-        // Reported bug: assistant emitted
-        //   "suggest: 1) tutti stessa size, minimo 11px, implemento | 2) diverso, spiegami | 3) prima fix Bug 1 (parser), poi CSS"
-        // On a narrow terminal the third item wrapped so its last word "CSS"
-        // landed alone on a new line. The overlay either showed only "CSS" or
-        // failed to render at all. The parser must still emit 3 items, with
-        // the tail joined onto item 3.
-        let input = "suggest: 1) tutti stessa size, minimo 11px, implemento | 2) diverso, spiegami | 3) prima fix Bug 1 (parser), poi\nCSS";
-        let items = parse_suggest(input, true);
-        let items = match items {
-            Some(ParsedEvent::Suggest { items }) => items,
-            _ => panic!("should parse 3-item suggest with short tail wrap"),
-        };
-        assert_eq!(items.len(), 3, "expected 3 items, got {items:?}");
-        assert_eq!(items[0], "1) tutti stessa size, minimo 11px, implemento");
-        assert_eq!(items[1], "2) diverso, spiegami");
-        assert_eq!(items[2], "3) prima fix Bug 1 (parser), poi CSS");
+        assert_eq!(items, vec!["A", "B", "C"]);
     }
 
     // --- Agent-gating tests for parse_intent / parse_suggest ---
@@ -4103,7 +4278,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
     #[test]
     fn test_suggest_not_parsed_without_agent() {
         assert!(
-            parse_suggest("suggest: Run tests | Check logs", false).is_none(),
+            parse_suggest("suggest: [ Run tests | Check logs ]", false).is_none(),
             "suggest should not parse when agent_active=false"
         );
     }
@@ -4111,7 +4286,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
     #[test]
     fn test_suggest_parsed_with_agent() {
         assert!(
-            parse_suggest("suggest: Run tests | Check logs", true).is_some(),
+            parse_suggest("suggest: [ Run tests | Check logs ]", true).is_some(),
             "suggest should parse when agent_active=true"
         );
     }
@@ -4122,7 +4297,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
         let mut parser = OutputParser::new();
         let rows = vec![ChangedRow {
             row_index: 0,
-            text: "suggest: A | B | C".into(),
+            text: "suggest: [ A | B | C ]".into(),
         }];
 
         // Without agent: should NOT be parsed
@@ -4184,7 +4359,7 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
     #[test]
     fn test_parse_clean_lines_suggest() {
         let mut parser = OutputParser::new();
-        let rows = vec![row(0, "suggest: Run tests | Review diff | Deploy")];
+        let rows = vec![row(0, "suggest: [ Run tests | Review diff | Deploy ]")];
         let events = parser.parse_clean_lines(&rows, true);
         assert!(
             events
@@ -4195,94 +4370,34 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
         );
     }
 
-    /// Cross-chunk bug: a suggest emission arrives in two consecutive PTY
-    /// chunks — chunk A carries the `suggest:` line with the final item
-    /// truncated (wrap about to happen), chunk B carries only the tail word.
-    /// The parser must emit corrected items on chunk B, not leave the
-    /// truncated emission as the last-known state.
     #[test]
-    fn test_parse_clean_lines_suggest_cross_chunk_tail() {
+    fn test_parse_clean_lines_suggest_dedups_on_rerender() {
+        // The same suggest row re-rendered in a later frame must NOT re-fire —
+        // dedup against the last emitted items.
         let mut parser = OutputParser::new();
+        let rows = vec![row(0, "suggest: [ A | B | C ]")];
 
-        // Chunk A: suggest with a third item whose last word hasn't arrived yet.
-        let rows_a = vec![row(
-            0,
-            "suggest: 1) alpha beta | 2) gamma delta | 3) prima fix Bug 1 (parser), poi",
-        )];
-        let events_a = parser.parse_clean_lines(&rows_a, true);
-        let items_a: Vec<String> = events_a
-            .iter()
-            .find_map(|e| match e {
-                ParsedEvent::Suggest { items } => Some(items.clone()),
-                _ => None,
-            })
-            .expect("chunk A should emit a Suggest event");
-        assert_eq!(
-            items_a.len(),
-            3,
-            "chunk A should see 3 items (last truncated): {items_a:?}"
-        );
-        assert_eq!(items_a[2], "3) prima fix Bug 1 (parser), poi");
-
-        // Chunk B: wrap-tail lands on its own row. `suggest:` keyword is not
-        // present in this row slice — without pending-line recovery the
-        // parser would bail and leave the truncated items as the last state.
-        let rows_b = vec![row(1, "CSS")];
-        let events_b = parser.parse_clean_lines(&rows_b, true);
-        let items_b: Vec<String> = events_b
-            .iter()
-            .find_map(|e| match e {
-                ParsedEvent::Suggest { items } => Some(items.clone()),
-                _ => None,
-            })
-            .expect("chunk B should emit a corrected Suggest event after tail wrap");
-        assert_eq!(
-            items_b.len(),
-            3,
-            "chunk B should still produce 3 items: {items_b:?}"
-        );
-        assert_eq!(
-            items_b[2], "3) prima fix Bug 1 (parser), poi CSS",
-            "tail word must be joined onto item 3"
-        );
-    }
-
-    /// Cross-chunk recovery is time-bounded — unrelated output arriving long
-    /// after the original suggest must not revive the stale pending line.
-    /// We simulate staleness by back-dating `pending_suggest_at`.
-    #[test]
-    fn test_parse_clean_lines_suggest_pending_expires() {
-        let mut parser = OutputParser::new();
-        let rows_a = vec![row(0, "suggest: 1) alpha | 2) beta | 3) gamma,")];
-        let _ = parser.parse_clean_lines(&rows_a, true);
+        let first = parser.parse_clean_lines(&rows, true);
         assert!(
-            parser.pending_suggest_line.is_some(),
-            "pending line should be set"
+            first
+                .iter()
+                .any(|e| matches!(e, ParsedEvent::Suggest { items } if items.len() == 3)),
+            "first render emits the suggest"
         );
 
-        // Age the pending timestamp past the TTL.
-        parser.pending_suggest_at =
-            Some(std::time::Instant::now() - std::time::Duration::from_secs(10));
-
-        // A continuation-looking word must NOT revive the expired pending line.
-        let rows_tail = vec![row(1, "delta")];
-        let events = parser.parse_clean_lines(&rows_tail, true);
+        let second = parser.parse_clean_lines(&rows, true);
         assert!(
-            !events
+            !second
                 .iter()
                 .any(|e| matches!(e, ParsedEvent::Suggest { .. })),
-            "expired pending suggest line must not produce a Suggest event, got: {events:?}"
-        );
-        assert!(
-            parser.pending_suggest_line.is_none(),
-            "expired pending should be cleared"
+            "re-render of the identical suggest must be deduped"
         );
     }
 
     #[test]
     fn test_parse_clean_lines_suggest_filters_empty_items() {
         let mut parser = OutputParser::new();
-        let rows = vec![row(0, "suggest: Run tests |  | Deploy")];
+        let rows = vec![row(0, "suggest: [ Run tests |  | Deploy ]")];
         let events = parser.parse_clean_lines(&rows, true);
         let items = events.iter().find_map(|e| match e {
             ParsedEvent::Suggest { items } => Some(items.clone()),
@@ -5191,6 +5306,25 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
         let input = "\u{25C6}  hi";
         let evt = parse_question(input);
         assert!(evt.is_none(), "Short cliclack text should be ignored");
+    }
+
+    #[test]
+    fn test_grok_decorative_bullet_not_a_question() {
+        // grok reuses ◆ as a decorative timeline bullet, NOT a cliclack prompt.
+        // Its text repaints every frame with a changing duration, so detecting it
+        // emits an endless stream of confident Questions that never dedup — the
+        // notification storm. Only ◆ lines ending in '?' are real prompts.
+        for input in [
+            "\u{25C6} Thought for 1.3s",
+            "\u{25C6} Thought for 12.7s",
+            "\u{25C6} user_prompt_submit",
+            "\u{25C6} Run Shell Command echo hello",
+        ] {
+            assert!(
+                parse_question(input).is_none(),
+                "grok decorative bullet must not be a question: {input:?}"
+            );
+        }
     }
 
     // --- parse_choice_prompt fixture-driven golden tests ---

@@ -90,12 +90,13 @@ Agent Teams is an experimental Claude Code feature. Current limitations:
 ## Inter-Agent Messaging
 
 TUICommander includes a built-in messaging system that lets agents in different terminal tabs communicate directly. This works alongside (and independently from) Claude Code's native Agent Teams messaging.
+There is no separate `swarm` action: callers compose the `agent` and `session` primitives documented below.
 
 ### How It Works
 
 Every PTY session gets a stable `TUIC_SESSION` UUID injected as an environment variable. Agents use this as their identity to register, discover peers, and exchange messages through TUICommander's MCP `messaging` tool.
 
-When both sender and recipient are connected via SSE (the default for Claude Code agents), messages are **pushed in real-time** as MCP channel notifications (`notifications/claude/channel`). They also land in a buffered inbox as a fallback.
+When a channel-enabled Claude Code recipient is connected via SSE and already working, messages are **pushed in real-time** into that turn as MCP channel notifications (`notifications/claude/channel`). Idle or completed managed agents use terminal submission to start a real next turn; managed non-Claude agents do the same even when their MCP bridge has an SSE stream. Every message also lands in a buffered inbox as a fallback.
 
 ### What Gets Injected Automatically
 
@@ -109,27 +110,58 @@ TUICommander injects these into every Claude Code PTY session — no manual conf
 
 ### Messaging Flow
 
-1. **Register** — The agent reads its `$TUIC_SESSION` and registers as a peer:
+> **Identity is automatic.** The bridge asserts your `$TUIC_SESSION` at connect
+> (`x-tuic-session` header → server auto-bind), so an agent spawned inside TUICommander
+> is already a registered peer. `agent action=register` is only needed to set a friendly
+> name/project, or from a standalone/external session where the env-var route is unavailable.
+> External MCP clients do not need a plain-shell identity tab: call `agent action=register`
+> without `tuic_session` to receive an MCP-scoped UUID, or supply an explicit UUID when the same
+> identity must be reclaimed after reconnect.
+
+> **Prefer blocking waits over polling.** `agent action=wait since=<ms>` returns as soon
+> as new mail arrives; `session action=wait session_id=<id> until=idle|exited` blocks on a
+> peer's lifecycle. Both default to 60 seconds, cap at 300000 ms, and return
+> `{met, timed_out}`. They are event-driven end to end; the bridge deadline follows the
+> requested wait instead of its ordinary ten-second timeout. A successful agent wait also returns every retained fresh message (up to the
+> 100-message inbox capacity) and a per-recipient logical `next_since` cursor, so the normal path
+> needs no separate inbox call. Incoming messages are also **typed into an idle peer's terminal**, so a waiting
+> orchestrator is woken by its children without any poll loop.
+
+1. **Register** *(optional — sets name/project)* — the agent reads its `$TUIC_SESSION`:
    ```
-   messaging action=register tuic_session="$TUIC_SESSION" name="worker-1" project="/path/to/repo"
+   agent action=register tuic_session="$TUIC_SESSION" name="worker-1" project="/path/to/repo"
    ```
 
 2. **Discover peers** — Find other agents connected to TUICommander:
    ```
-   messaging action=list_peers
-   messaging action=list_peers project="/path/to/repo"   # filter by repo
+   agent action=list_peers
+   agent action=list_peers project="/path/to/repo"   # filter by repo
    ```
 
 3. **Send a message** — Address by the recipient's `tuic_session` UUID:
    ```
-   messaging action=send to="<recipient-tuic-session>" message="PR review done, 3 issues found"
+   agent action=send to="<recipient-tuic-session>" message="PR review done, 3 issues found"
    ```
 
-4. **Check inbox** — Read buffered messages (useful if channel push was missed):
+4. **Wait for and receive messages** — one blocking call returns the message bodies:
    ```
-   messaging action=inbox
-   messaging action=inbox limit=10 since=1712000000000
+   agent action=wait since=1712000000000
    ```
+   Pass the returned `next_since` to the next wait.
+
+5. **Check inbox directly** — useful after a reported FIFO eviction or if channel push was missed:
+   ```
+   agent action=inbox
+   agent action=inbox limit=10 since=1712000000000
+   ```
+
+`agent action=send` also returns `recipient_state` with the recipient's `shell_state` and
+`agent_state` when the recipient is a managed PTY. External generated peers omit this field.
+
+Automatic lifecycle notifications contain state only (`idle`, `completed`, or `exited`). They do
+not contain the worker's result. Every worker reports completed output or a real blocker with
+`agent action=send`; use `session action=output` only to investigate the anomaly where a child did
+not send that report.
 
 ### Channel Push vs Inbox
 
@@ -138,34 +170,40 @@ TUICommander injects these into every Claude Code PTY session — no manual conf
 | **Channel push** | Recipient has active SSE stream | Real-time | `--dangerously-load-development-channels server:tuicommander` on the recipient's CC process |
 | **Inbox buffer** | Always | Poll-based | Registration only |
 
-Messages are always buffered in the inbox regardless of whether channel push succeeds. The inbox holds up to 128 messages per agent (FIFO eviction). Individual messages are capped at 64 KB.
+Messages are always buffered in the inbox regardless of whether channel push succeeds. The inbox holds up to 100 messages per agent (FIFO eviction). Individual messages are capped at 64 KB.
 
 ### Using Messaging from a Standalone Claude Code Session
 
-If you run Claude Code outside TUICommander but still want to use TUIC messaging, you need to:
+If you run Claude Code outside TUICommander but still want to use TUIC messaging:
 
-1. **Set `TUIC_SESSION`** — export a stable UUID:
-   ```bash
-   export TUIC_SESSION=$(uuidgen)
-   ```
-
-2. **Connect to TUIC's MCP server** — add to your `.mcp.json`:
+1. **Connect to TUIC's MCP server** — the MCP channel is a Unix socket (Windows: named
+   pipe), reached through the `tuic-bridge` stdio adapter, **not** a TCP port. TUICommander
+   auto-installs this entry into each supported agent's config; to add it by hand:
    ```json
    {
      "mcpServers": {
        "tuicommander": {
-         "url": "http://localhost:17463/mcp"
+         "command": "tuic-bridge",
+         "args": []
        }
      }
    }
    ```
+   The bridge finds the socket via `TUIC_SOCKET` → `mcp.sock` → any `mcp-*.sock` in the
+   config dir.
+
+2. **Register identity** — omit the UUID for a generated identity scoped to this MCP connection:
+   ```text
+   agent action=register name="external-reviewer" project="/path/to/repo"
+   ```
+   Pass `tuic_session="<stable-uuid>"` instead when a future reconnect must reclaim the same identity.
+   Registration never creates a PTY.
 
 3. **Enable channel push** *(optional, for real-time delivery)*:
    ```bash
    claude --dangerously-load-development-channels server:tuicommander
    ```
 
-4. **Register on first turn** — the agent must call `messaging action=register` with its `$TUIC_SESSION` before sending or receiving.
 
 ### Messaging vs Claude Code Native SendMessage
 

@@ -46,7 +46,7 @@ Local voice-to-text using Whisper with Metal acceleration on macOS. Push-to-talk
 
 | Command | Description |
 |---------|-------------|
-| `get_dictation_status()` | Model status, recording state, processing state |
+| `get_dictation_status()` | Model status, recording/processing state, and normalized `audio_level` (0–1). The preview polls this shared IPC/HTTP response while recording. |
 | `get_dictation_config()` | Load dictation configuration |
 | `set_dictation_config(config)` | Save dictation configuration |
 | `get_correction_map()` | Load text correction dictionary |
@@ -185,11 +185,10 @@ Available models (GGML format):
 
 | Model | Size | Quality |
 |-------|------|---------|
-| `tiny` | ~75 MB | Low |
-| `base` | ~140 MB | Fair |
-| `small` | ~460 MB | Good |
-| `medium` | ~1.5 GB | Very good |
-| `large-v3-turbo` | ~1.6 GB | Best (recommended) |
+| `small` | ~488 MB | Good |
+| `small.en` | ~488 MB | Good (English-only) |
+| `large-v2` | ~3.0 GB | Highest accuracy (slow) |
+| `large-v3-turbo` | ~1.6 GB | Best (recommended, default) |
 
 ## Text Corrections
 
@@ -208,8 +207,9 @@ Stored in dictation config. Applied after transcription, before injecting into t
 
 ## Platform Notes
 
-- **macOS:** Metal acceleration via whisper-rs (GPU-accelerated)
-- **Linux/Windows:** CPU-only (Metal feature conditionally compiled)
+- **macOS:** Metal acceleration via whisper-rs (GPU-accelerated, always)
+- **Linux:** CPU-only (optional `cuda`/`vulkan` build feature)
+- **Windows:** CPU-only — the whisper.cpp Vulkan backend's `vulkan-shaders-gen` sub-build is chronically broken on the Windows CI runner (MAX_PATH/MSBuild), so we ship CPU; re-enable `vulkan` once stabilized
 - Microphone permissions deferred until first use (avoids startup permission popup)
 
 ## Microphone Permission Detection

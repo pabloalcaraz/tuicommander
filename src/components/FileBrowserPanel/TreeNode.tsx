@@ -1,24 +1,26 @@
 import { type Component, createSignal, For, Show } from "solid-js";
 import { useFileBrowser } from "../../hooks/useFileBrowser";
 import { appLogger } from "../../stores/appLogger";
-import { markInternalDragEnd, markInternalDragStart, startNativeDrag } from "../../stores/dragDrop";
 import type { DirEntry } from "../../types/fs";
 import { cx } from "../../utils";
 import { isAbsolutePath, joinPath } from "../../utils/pathUtils";
 import g from "../shared/git-status.module.css";
 import s from "./FileBrowserPanel.module.css";
 import { FileIcon } from "./FileIcon";
-import { formatSize, getStatusClass } from "./fileUtils";
+import { fileTooltip, formatSize, getStatusClass } from "./fileUtils";
 
 export interface TreeNodeProps {
 	entry: DirEntry;
 	depth: number;
 	repoPath: string;
 	fsRoot: string;
+	/** Relative path of the file open in the active editor, for highlighting. */
+	activePath: string | null;
 	expandedDirs: Set<string>;
 	onToggleExpand: (path: string) => void;
 	onFileOpen: (repoPath: string, filePath: string) => void;
 	onContextMenu: (e: MouseEvent, entry: DirEntry) => void;
+	onPointerDragStart?: (absPath: string, e: PointerEvent) => void;
 	/** Cache of loaded children, keyed by dir path */
 	childrenCache: Map<string, DirEntry[]>;
 	onChildrenLoaded: (path: string, children: DirEntry[]) => void;
@@ -59,20 +61,16 @@ export const TreeNode: Component<TreeNodeProps> = (props) => {
 	return (
 		<>
 			<div
-				class={cx(s.entry, props.entry.is_dir && s.entryDir, props.entry.is_ignored && s.entryIgnored)}
+				class={cx(
+					s.entry,
+					props.entry.is_dir && s.entryDir,
+					!props.entry.is_dir && props.entry.path === props.activePath && s.entryActive,
+					props.entry.is_ignored && s.entryIgnored,
+				)}
 				style={{ "padding-left": `${8 + props.depth * 16}px` }}
 				onClick={handleClick}
 				onContextMenu={(e) => props.onContextMenu(e, props.entry)}
-				draggable={true}
-				onDragStart={(e) => {
-					const p = absPath();
-					e.dataTransfer!.setData("application/x-tuic-path", p);
-					e.dataTransfer!.setData("text/plain", p);
-					e.dataTransfer!.effectAllowed = "copy";
-					markInternalDragStart();
-					startNativeDrag([p]);
-				}}
-				onDragEnd={() => markInternalDragEnd()}
+				onPointerDown={(e) => props.onPointerDragStart?.(absPath(), e)}
 				data-drop-target={props.entry.is_dir ? "folder" : undefined}
 				data-abs-path={props.entry.is_dir ? absPath() : undefined}
 			>
@@ -91,7 +89,9 @@ export const TreeNode: Component<TreeNodeProps> = (props) => {
 					<span class={s.treeLeafSpacer} />
 				</Show>
 				<FileIcon name={props.entry.name} isDir={props.entry.is_dir} class={s.entryIcon} />
-				<span class={s.entryName}>{props.entry.name}</span>
+				<span class={s.entryName} title={fileTooltip(props.entry)}>
+					{props.entry.name}
+				</span>
 				<Show when={props.entry.git_status}>
 					<span class={cx(g.dot, getStatusClass(props.entry.git_status))} title={props.entry.git_status} />
 				</Show>
@@ -113,10 +113,12 @@ export const TreeNode: Component<TreeNodeProps> = (props) => {
 							depth={props.depth + 1}
 							repoPath={props.repoPath}
 							fsRoot={props.fsRoot}
+							activePath={props.activePath}
 							expandedDirs={props.expandedDirs}
 							onToggleExpand={props.onToggleExpand}
 							onFileOpen={props.onFileOpen}
 							onContextMenu={props.onContextMenu}
+							onPointerDragStart={props.onPointerDragStart}
 							childrenCache={props.childrenCache}
 							onChildrenLoaded={props.onChildrenLoaded}
 						/>

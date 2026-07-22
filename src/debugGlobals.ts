@@ -17,6 +17,8 @@ import { appLogger } from "./stores/appLogger";
 import { getDebugSnapshot, listDebugSnapshots } from "./stores/debugRegistry";
 import { pluginStore } from "./stores/pluginStore";
 import { terminalsStore } from "./stores/terminals";
+import { clearFreezes, getFreezes, startFreezeDetector } from "./utils/freezeDetector";
+import { isPerfDebug, setPerfDebug } from "./utils/perfDebug";
 
 export function initDebugGlobals(): void {
 	(window as unknown as Record<string, unknown>).__TUIC__ = {
@@ -109,6 +111,30 @@ export function initDebugGlobals(): void {
 			};
 		},
 
+		/** UI freeze events (RAF gaps > 200ms) */
+		freezes() {
+			return getFreezes();
+		},
+
+		/** Clear recorded freeze events */
+		clearFreezes() {
+			clearFreezes();
+		},
+
+		/** Whether the frontend perf/debug instrumentation is currently recording. */
+		perfDebug() {
+			return isPerfDebug();
+		},
+
+		/** Toggle the perf/debug layer at runtime (persists across reloads).
+		 *  Dormant by default in release — call setPerfDebug(true) to wake it up
+		 *  for field diagnosis (starts the freeze detector immediately too). */
+		setPerfDebug(on: boolean) {
+			setPerfDebug(on);
+			if (on) startFreezeDetector();
+			return isPerfDebug();
+		},
+
 		/** App log entries (JS ring buffer, all levels) */
 		logs(limit = 50) {
 			return appLogger
@@ -123,4 +149,6 @@ export function initDebugGlobals(): void {
 				}));
 		},
 	};
+
+	startFreezeDetector();
 }

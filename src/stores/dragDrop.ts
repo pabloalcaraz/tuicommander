@@ -30,10 +30,15 @@ let highlightedEl: HTMLElement | null = null;
 const DROP_HOVER_CLASS = "drop-target-hover";
 
 /**
- * Convert Tauri physical-pixel coordinates to CSS pixels for elementFromPoint.
+ * Convert a Tauri drag-drop event position into CSS pixels for elementFromPoint.
+ *
+ * On macOS, Tauri reports the position in logical (point) coordinates, which
+ * already equal CSS pixels — dividing by devicePixelRatio would wrongly halve
+ * them on Retina and land the hit-test on the terminal behind the panel.
+ * On Windows/Linux the position is in physical pixels, so we divide by DPR.
  */
 export function tauriPhysicalToCss(physicalX: number, physicalY: number): { x: number; y: number } {
-	const dpr = window.devicePixelRatio || 1;
+	const dpr = isMac() ? 1 : window.devicePixelRatio || 1;
 	return { x: physicalX / dpr, y: physicalY / dpr };
 }
 
@@ -82,8 +87,9 @@ function isMac(): boolean {
 
 /** Update modifier state from a keyboard event. */
 function updateModifierFromEvent(e: KeyboardEvent) {
-	setCopyModifierHeld(isMac() ? e.altKey : e.ctrlKey);
-	setShiftHeld(e.shiftKey);
+	const nextCopy = isMac() ? e.altKey : e.ctrlKey;
+	if (nextCopy !== copyModifierHeld()) setCopyModifierHeld(nextCopy);
+	if (e.shiftKey !== shiftHeld()) setShiftHeld(e.shiftKey);
 }
 
 /**
@@ -116,7 +122,7 @@ export async function initDragDrop(): Promise<void> {
 			const payload = event.payload;
 
 			// Internal drag (tab/pane/sidebar move) — only handle hover highlight,
-			// don't treat as file drop. The actual move happens via dragend fallback.
+			// File browser uses pointer events instead (see FileBrowserPanel.tsx).
 			if (isInternalDrag()) {
 				if ((payload.type === "enter" || payload.type === "over") && payload.position) {
 					_lastDragCssPosition = tauriPhysicalToCss(payload.position.x, payload.position.y);
@@ -170,6 +176,18 @@ export function markInternalDragEnd(): void {
 }
 export function isInternalDrag(): boolean {
 	return internalDragCount > 0;
+}
+
+/** Find the folder drop target at CSS pixel coordinates. Returns abs path or null. */
+export function findFolderTargetAtPoint(x: number, y: number): string | null {
+	const el = document.elementFromPoint(x, y);
+	let cur: Element | null = el;
+	while (cur) {
+		const dt = (cur as HTMLElement).dataset;
+		if (dt?.dropTarget === "folder" && dt.absPath) return dt.absPath;
+		cur = cur.parentElement;
+	}
+	return null;
 }
 
 // ---- Internal drag tracking (Tauri dragDropEnabled=true workaround) ----
@@ -260,7 +278,7 @@ async function resolveDragIcon(): Promise<string> {
 	if (_dragIconPath) return _dragIconPath;
 	try {
 		const { resolveResource } = await import("@tauri-apps/api/path");
-		_dragIconPath = await resolveResource("icons/32x32.png");
+		_dragIconPath = await resolveResource("icons/drag-file.png");
 	} catch {
 		_dragIconPath = "";
 	}

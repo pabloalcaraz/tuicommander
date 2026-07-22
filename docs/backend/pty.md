@@ -77,7 +77,7 @@ spawn_reader_thread(reader, paused, session_id, app, state)
 6. Write to `OutputRingBuffer` (64KB circular buffer for MCP access)
 7. Serialize parsed events once with `serde_json::to_value` — reused for both Tauri IPC and event bus (avoids double serialization)
 8. Broadcast to WebSocket clients (if any connected)
-9. Emit Tauri event `pty-output` with `{session_id, data}`
+9. Emit Tauri event `pty-output` with `{session_id, data}` — **throttled to ~10/s** (≥100ms between emits). The desktop canvas renders from grid frames and discards this text (it only drives the frontend activity dot / `lastDataAt`); emitting per-chunk flooded the WebView main thread under output storms (`yes`), starving keydown so Ctrl+C never reached `write_pty`. Dropping intermediate chunks is safe — only a periodic "output happened" pulse is needed.
 
 **Cursor-up clamping** — The `clamp_cursor_up()` function limits `ESC[nA` (cursor up) and `ESC[nF` (cursor previous line) sequences to prevent them from moving the cursor beyond the visible viewport. This replaced the previous DiffRenderer approach for simpler escape sequence handling.
 
@@ -96,15 +96,20 @@ spawn_reader_thread(reader, paused, session_id, app, state)
 Frame emission is decoupled from PTY reading via a per-session **frame ticker** thread (same approach as iTerm2's Metal display-link renderer):
 
 1. **Reader thread**: processes PTY data into the alacritty VT grid, sets a `grid_frame_dirty` AtomicBool flag
-2. **Ticker thread**: every 8ms, checks the dirty flag → if set, serializes dirty rows via `serialize_dirty_rows()` → sends frame via `send_grid_frame()` (respects `grid_frame_in_flight` backpressure)
+2. **Ticker thread**: every 16ms, checks the dirty flag → if set, serializes dirty rows via `serialize_dirty_rows()` → sends frame via `send_grid_frame()` (respects `grid_frame_in_flight` backpressure)
 3. **Frontend**: coalesces paint triggers via `requestAnimationFrame` (~60fps)
-4. **Ack handler**: on frontend ack, flushes any remaining dirty rows accumulated while in-flight
+4. **Ack handler**: clears only the in-flight flag; the ticker sends any dirty rows accumulated while the prior frame was in flight
 
-This coalesces rapid writes (e.g. spinner CR+erase+rewrite within 8ms) into a single frame, eliminating flicker from intermediate erase states. Max added latency is 8ms — imperceptible. The ticker exits when the reader's `running` flag clears, with a final flush to avoid losing the last frame.
+This coalesces rapid writes (e.g. spinner CR+erase+rewrite within 16ms) into a single frame, eliminating flicker from intermediate erase states. The ticker exits when the reader's `running` flag clears, with a final flush to avoid losing the last frame.
 
 ### Headless Reader Thread
 
 `spawn_headless_reader_thread()` — used for HTTP-created sessions (no Tauri app handle). Same pipeline but skips Tauri event emission; only writes to ring buffer and WebSocket. Includes `extract_question_line()` for silence-based question detection, session lifecycle events (`session-created`, `session-closed`), and full output parser integration.
+
+Named agent sessions propagate their stable `display_name` through the
+`session-created` event. Desktop and browser clients mark that initial tab name
+as custom, preserving it across OSC title and structured intent updates as well
+as frontend reconnection. Unnamed tabs retain the normal dynamic-title behavior.
 
 ## Shell Resolution
 
@@ -219,7 +224,30 @@ Shells that emit OSC 7 (`\x1b]7;file://hostname/path\x07`) report the current wo
 | `TERM_PROGRAM` | `ghostty` | Satisfy Claude Code's terminal allow-list for kitty protocol; also prevents macOS `/etc/zshrc` from sourcing `zshrc_Apple_Terminal` |
 | `TERM_PROGRAM_VERSION` | `3.0.0` | Passes Claude Code's version gate (rejects `^[0-2]\.`) |
 
-Additionally, `CLAUDECODE` is removed from the environment (`env_remove`) to prevent nested-session detection when TUICommander itself runs inside a Claude Code session.
+Additionally, `CLAUDECODE` is removed from the environment (`env_remove`) to prevent nested-session detection when TUICommander itself runs inside a Claude Code session. `NO_COLOR` is also removed from every PTY command immediately after construction because it may belong to a Codex parent that launched TUICommander, not to the independent child session. This does not force application color or override explicit command flags; a deliberate per-agent environment may restore `NO_COLOR` after sanitization.
+
+## Child Process Priority
+
+Each spawned shell is given a lower scheduling priority right after spawn
+(`lower_pty_child_priority()`), so heavy workloads run inside a pane (`cargo
+build`, bundlers, test runners) yield CPU to TUIC's own render loop and the rest
+of the system. A child inherits the parent's priority **at fork time**, so every
+process the shell later spawns is deprioritized too. The effect only bites under
+contention — an idle machine still runs the build at full speed.
+
+| Platform | Mechanism | Default |
+|----------|-----------|---------|
+| macOS / Linux | `setpriority(PRIO_PROCESS, …)` | nice **+10**, override via `TUIC_PTY_NICE` |
+| Windows | `SetPriorityClass(BELOW_NORMAL_PRIORITY_CLASS)` | fixed |
+
+Validated on an M4 Max under 14-core saturation: TUIC's UI goes from frozen
+(nice 0) to responsive (nice +10). `BELOW_NORMAL` (not `IDLE_PRIORITY_CLASS`) is
+the Windows analog — `IDLE` only runs when the whole system is idle, the
+equivalent of macOS QoS-background, which would make builds crawl.
+
+### macOS Thread QoS Elevation
+
+On macOS, the PTY **reader thread**, the **frame ticker**, and the **keystroke-write thread** are all raised to `QOS_CLASS_USER_INTERACTIVE` via `pthread_set_qos_class_self_np` (`raise_thread_for_interactive_io()` in `src-tauri/src/pty.rs`, `thread_qos` module). This is complementary to the child-process renice: on Apple Silicon the scheduler is QoS-band driven — `nice` only reorders threads within a band. Without this elevation, TUIC's interactive-path threads ran in the default QoS band alongside compiler worker threads, causing input latency under heavy builds. Raising to `USER_INTERACTIVE` puts the interactive path in a higher scheduler band. macOS-only; a no-op on Linux/Windows.
 
 ## Session Conflict Flag File
 
@@ -291,16 +319,70 @@ The reader thread tracks output silence to detect unanswered agent prompts. When
 
 ## Shell State (Busy/Idle) Detection
 
-The reader thread tracks output timing to emit `ShellState` events (`busy`/`idle`). Rust is the single source of truth — the frontend does not derive busy/idle from raw PTY data.
+The backend combines explicit lifecycle markers, agent-specific screen evidence,
+real output, and silence to emit `ShellState` events (`busy`/`idle`). Rust is the
+single source of truth — the frontend does not derive activity from raw PTY data.
 
 **Transitions:**
-- **→ busy:** Any non-chrome-only chunk transitions to busy via atomic CAS (`try_shell_transition`)
-- **→ idle (process_chunk):** Chrome-only chunks without a status line transition to idle if `should_transition_idle` passes (real output > 500ms ago for shells, > 2.5s for agents, no active sub-tasks)
-- **→ idle (backup timer):** A 1s timer catches the case where no chunks arrive at all (reader blocked on `read()`). Uses `has_recent_chunks()` (checks `last_chunk_at` with 2s window) to avoid firing when the reader is actively processing chunks
+- **Explicit markers:** OSC 133 shell markers and OSC 7770 agent hooks transition immediately. Output silence cannot override an observed hook `busy`; it ends on hook `idle`, a confirmed interruption, process exit, or a stable ready composer after the submitted turn produced real activity. The last path recovers safely when an idle hook is missed without letting the previous turn's composer cancel a fresh submission.
+- **→ busy:** A submitted agent prompt, real output, an animated spinner, or an agent-specific `Working` screen transitions via atomic CAS (`try_shell_transition`). Positive screen evidence is evaluated even while the stored state is idle, so false-idle is self-healing.
+- **→ idle:** The 1s silence timer is the sole heuristic idle path. Plain shells use 500ms; agents use 2.5s and must have no active sub-tasks. Agents with ready-screen adapters require the ready prompt to remain stable for 1.5s.
+- **Interrupts:** Ctrl-C and bare Escape record `interrupt pending` but never force idle. Idle follows only after an interrupted/ready screen, explicit Stop, or process exit.
 
-**Spinner keepalive:** Agent spinners (dingbats ✻, braille ⠋, Aider ░█) produce chrome-only repaints at ~1Hz without a matching StatusLine event (e.g. timer-only lines like "✻ Cogitated for 3m 47s" lack trailing ellipsis). These spinner rows update `last_output_ms` via `is_spinner_row()` in `chrome.rs`, keeping `should_transition_idle()` from firing while the agent is alive. When the spinner stops, the idle timer expires naturally after AGENT_IDLE_MS (2.5s). Static chrome (mode-line ⏵, borders ▀▄) does NOT update the timestamp.
+**Movement is the busy signal (#446-596f):** "if the text above the input area moves, the agent is active." Post-cutoff `changed_rows` are text-equality diffed (`TerminalGrid::process`), so a byte-identical repaint produces no ChangedRow: any *static* glyph — a completed-turn summary `✻ Sautéed for 1m 25s`, a `· run /mcp` hint, HUD `░░` bars, banner art — is inert by construction and can neither latch nor hold BUSY. Spinner rows among the changed rows (glyph must LEAD the trimmed line, `is_spinner_row()` in `chrome.rs`) additionally refresh `last_output_ms` while the agent animates; when movement stops, the idle timer expires naturally after AGENT_IDLE_MS (2.5s).
 
-**Status line ticks:** Claude Code's status line updates every ~1s while an agent is thinking. These are chrome-only chunks with `has_status_line=true`. The `!has_status_line` guard in the chunk-processing idle path prevents idle transition while status line ticks are arriving.
+**Prompt-based screen adapters:** Claude, Gemini, and Aider screen classifiers are prompt-based only — `Ready` when the input prompt is visible, `Unknown` otherwise, never `Working` from glyph presence (three stuck-BUSY regressions came from static glyphs read as live spinners). Codex is the deliberate exception: it distinguishes `Working`/`Ready`/`Interrupted` by the *presence* of its `• Working (… esc to interrupt)` status line, because its TUI legitimately freezes for minutes while a child process runs — accepted policy: prefer false-BUSY over false-IDLE for Codex. Codex inspection uses the full screen snapshot before chrome filtering (its separator divides tool output from the summary rather than framing the prompt, so `find_chrome_cutoff()` would discard the Working row) and searches a bounded neighborhood immediately above the lowest `›` prompt; historical Working text elsewhere in scrollback cannot latch busy. A frozen agent screen with no visible prompt stays BUSY by design (irreducible ambiguity — the user can see the screen).
+
+**Signal precedence and confirmation:** Explicit hook busy > Codex Working marker > movement (real output / animated spinner) > silence. A ready prompt visible from the previous turn cannot cancel a newly submitted prompt until real activity has been observed; after activity, a stable ready composer can repair a missed hook idle. A current-turn completion marker prevents a stale Working row from relatching BUSY, but a pending process probe or confirmed meaningful descendant still owns the task lifecycle. Hook-based question suppression activates only after an OSC 7770 state marker is actually received, rather than trusting a possibly stale configuration flag.
+
+**Safety consumers:** For agents with a verified screen adapter, peer-message injection and Unix auto-standby require confirmed idle (explicit Stop/OSC or stable ready screen). A silence-only idle can update the cosmetic state but cannot type into or `SIGSTOP` a potentially working agent. Agents without an adapter retain the legacy heuristic behavior until their UI is characterized.
+
+**Task lifecycle is separate from shell activity:** `shell_state=idle` means the
+PTY is quiet; it does not prove that the assigned task finished. An agent's
+`suggest: [ ... ]` marker explicitly closes the current task epoch and produces
+`agent_state=completed` plus a `state_change: completed` parent notification.
+Likewise, a visible ready composer may coexist with an autonomous background
+command. While a meaningful descendant of the agent is alive, session state
+reports `background_work=true` and keeps `agent_state=working`; `shell_state`
+remains `idle` because terminal input readiness is a separate fact. Persistent
+integration helpers (`mdkb`, `tuic-bridge`, and `node_repl`) and Claude's
+standalone timed `caffeinate -i -t <seconds>` assertion do not count as work;
+Unix classification checks both `comm` and the authoritative argv path from
+unlimited-width `ps` output. A `caffeinate` invocation that wraps a command
+remains meaningful background work. Parent `idle` lifecycle mail is
+deferred until the real descendant exits, while confirmed-ready message
+delivery keeps using the terminal-readiness gate. The first confirmed-ready
+observation and every explicit agent IDLE marker arm a generation boundary:
+idle/completed lifecycle output waits until a process snapshot newer than that
+observation or marker has been reconciled. Fresh working evidence starts a new
+readiness episode even within the same task epoch: it invalidates only the
+satisfied or pending snapshot boundary, so the next ready observation must
+reconcile a newer snapshot while preserving tracked background work and the
+snapshot generation. One app-wide process snapshot is collected at most once
+per second on Tokio's
+blocking pool and shared by every session. The refresher runs only while a
+ready probe or tracked background process needs it, skips missed interval ticks,
+and stops scanning stable idle sessions. Enumeration or parse failures preserve
+the prior `background_work` value. On Windows, where Toolhelp does not provide
+command lines, generic `node.exe` processes are kept as meaningful work rather
+than guessed to be `node_repl` helpers.
+Submitting new user or PTY-injected peer input starts a new task epoch immediately,
+clearing the prior completion marker and its stale suggested actions before new output arrives.
+Claude channel and inbox delivery do not claim a submitted turn; the channel is used only
+inside an already working turn. Idle or completed managed composers take the PTY submission
+path, and lifecycle changes only after that input or normal activity evidence. Idle
+CAS and parent lifecycle notification share the same per-session lifecycle lock;
+submitted epoch mutation and its IDLE-to-BUSY transition hold that lock as one
+critical section, so a new turn cannot inherit a stale idle notification. The
+authoritative parent inbox enqueue occurs under the child lock; parent terminal
+wake/dispatch runs only after release, avoiding cross-session lock ordering. A
+queued BUSY-to-IDLE transition also carries the task epoch observed before it
+waited for the lock and is discarded if a new submitted turn won first.
+Without a fresh marker the new task epoch returns to `idle`, not `completed`.
+
+**Transactional peer injection:** Reserving an idle composer creates an ownership token before the PTY write. A failure proven to occur before any byte was written rolls the synthetic BUSY state back to the prior confirmed IDLE state and keeps the message queued. Once any byte may have escaped, failure is `delivery_uncertain`: the session remains conservatively BUSY, the authoritative inbox remains readable, and TUIC does not automatically retry into the terminal. Real output, a Working screen, or an explicit state marker invalidates rollback ownership so a late error cannot erase genuine activity. `session status` exposes the additive `delivery_uncertain` flag.
+
+**Status line ticks:** Animated spinner repaint evidence refreshes both shell activity and `SilenceState`, preventing low-confidence question/tool-error events from contradicting a busy tab. Static mode/footer rows remain chrome only and do not prove activity.
 
 **Agent detection:** `detectAgentForTerminal()` fires on shell-state transitions (immediate on idle, 500ms debounce on busy). A 30s fallback poll catches cold starts. This replaces the previous 3s polling interval, reducing syscalls ~30x.
 

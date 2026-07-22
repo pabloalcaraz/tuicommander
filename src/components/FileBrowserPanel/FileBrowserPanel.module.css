@@ -126,6 +126,16 @@
   background: var(--bg-highlight);
 }
 
+.entryActive {
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 30%, transparent);
+  border-radius: var(--radius-sm);
+}
+
+.entryActive .entryName {
+  color: var(--fg-primary);
+}
+
 .entryIgnored {
   opacity: 0.4;
 }

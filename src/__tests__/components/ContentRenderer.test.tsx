@@ -1,3 +1,5 @@
+// @vitest-environment jsdom
+
 import { fireEvent, render } from "@solidjs/testing-library";
 import { describe, expect, it, vi } from "vitest";
 import { ContentRenderer, stripEventHandlers } from "../../components/ui/ContentRenderer";
@@ -106,6 +108,35 @@ describe("ContentRenderer", () => {
 		expect(link).not.toBeNull();
 		// Should not throw when clicked without handler
 		fireEvent.click(link);
+	});
+
+	describe("image src sanitization", () => {
+		// convertFileSrc yields asset://localhost/… (macOS/Linux) for rewritten
+		// relative image paths. DOMPurify must keep that scheme, otherwise it
+		// strips the src and the image renders as a broken box (see ContentRenderer
+		// ALLOWED_URI_REGEXP).
+		it("preserves asset:// image src through sanitization", () => {
+			const md = "![diagram](asset://localhost/Users/me/repo/assets/diagram.png)";
+			const { container } = render(() => <ContentRenderer content={md} />);
+			const img = container.querySelector("img") as HTMLImageElement;
+			expect(img).not.toBeNull();
+			expect(img.getAttribute("src")).toBe("asset://localhost/Users/me/repo/assets/diagram.png");
+		});
+
+		it("preserves tauri:// image src through sanitization", () => {
+			const md = "![diagram](tauri://localhost/foo.png)";
+			const { container } = render(() => <ContentRenderer content={md} />);
+			const img = container.querySelector("img") as HTMLImageElement;
+			expect(img.getAttribute("src")).toBe("tauri://localhost/foo.png");
+		});
+
+		it("still strips javascript: image src", () => {
+			const md = "![x](javascript:alert(1))";
+			const { container } = render(() => <ContentRenderer content={md} />);
+			const img = container.querySelector("img");
+			// DOMPurify must drop the dangerous scheme (empty or removed src)
+			expect(img?.getAttribute("src") ?? "").toBe("");
+		});
 	});
 
 	describe("GFM task-list checkboxes", () => {

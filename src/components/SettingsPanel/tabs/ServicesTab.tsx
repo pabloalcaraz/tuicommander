@@ -10,13 +10,55 @@ import {
 } from "../../../stores/remoteConnections";
 import { rpc, type UpstreamMcpConfig, type UpstreamMcpServer, type UpstreamTransport } from "../../../transport";
 import { cx } from "../../../utils";
+import { writeClipboard } from "../../../utils/clipboard";
 import { handleOpenUrl } from "../../../utils/openUrl";
+import { updateAppConfig } from "../../../utils/updateAppConfig";
 import { SettingInput, SettingSelect, SettingToggle } from "../SettingFields";
 import s from "../Settings.module.css";
 
 /** Pure helper: should the Authorize button be shown for this server+status? */
-export function shouldShowAuthorize(authType: string | undefined, status: string | undefined): boolean {
+export function shouldShowAuthorize(
+	authType: string | undefined,
+	status: string | undefined,
+	enabled: boolean,
+): boolean {
+	// A disabled upstream is never connected, so authorizing it is meaningless.
+	if (!enabled) return false;
 	return authType === "oauth2" || status === "needs_auth" || status === "authenticating";
+}
+
+type UpstreamAuthForm = Pick<
+	ReturnType<typeof emptyForm>,
+	"transportType" | "authMethod" | "oauthClientId" | "oauthClientSecret" | "oauthScopes"
+>;
+
+/** Build the persisted auth block from the editor. An empty OAuth client ID
+ * deliberately means no explicit auth block: the backend then performs DCR
+ * after the upstream advertises OAuth. This must also clear a previous Bearer
+ * block instead of silently retaining it. */
+export function authFromUpstreamForm(
+	form: UpstreamAuthForm,
+	existingAuth?: UpstreamMcpServer["auth"],
+): UpstreamMcpServer["auth"] {
+	if (form.transportType !== "http" || form.authMethod !== "oauth2") return undefined;
+	const clientId = form.oauthClientId.trim();
+	if (!clientId) return undefined;
+	const scopes = form.oauthScopes.trim()
+		? form.oauthScopes
+				.trim()
+				.split(/[\s,]+/)
+				.filter(Boolean)
+		: undefined;
+	const secret = form.oauthClientSecret.trim() || undefined;
+	const existingOAuth = existingAuth?.type === "oauth2" ? existingAuth : undefined;
+	return {
+		type: "oauth2",
+		client_id: clientId,
+		...(secret ? { client_secret: secret } : {}),
+		...(scopes?.length ? { scopes } : {}),
+		...(existingOAuth?.authorization_endpoint ? { authorization_endpoint: existingOAuth.authorization_endpoint } : {}),
+		...(existingOAuth?.token_endpoint ? { token_endpoint: existingOAuth.token_endpoint } : {}),
+	};
 }
 
 interface StartOAuthResponse {
@@ -83,13 +125,15 @@ interface AuthConfig {
 	username: string;
 	password_hash: string;
 	session_token_duration_secs: number;
+	session_token_exists?: boolean;
 	lan_auth_bypass: boolean;
 }
 
 interface RelayConfig {
 	enabled: boolean;
 	url: string;
-	token: string;
+	token?: string;
+	token_exists?: boolean;
 	session_id: string;
 }
 
@@ -312,9 +356,7 @@ export const ServicesTab: Component = () => {
 	/** Save a single config field (load-modify-save pattern matching other tabs) */
 	const saveConfigField = async (updater: (config: AppConfig) => void) => {
 		try {
-			const config = await rpc<AppConfig>("load_config");
-			updater(config);
-			await rpc("save_config", { config });
+			await updateAppConfig<AppConfig>(updater);
 		} catch (e) {
 			appLogger.error("config", "Failed to save config", e);
 		}
@@ -339,7 +381,7 @@ export const ServicesTab: Component = () => {
 		const url = connectUrl();
 		if (!url) return;
 		try {
-			await navigator.clipboard.writeText(url);
+			await writeClipboard(url);
 			setUrlCopied(true);
 			setTimeout(() => setUrlCopied(false), 2000);
 		} catch {
@@ -712,7 +754,7 @@ export const ServicesTab: Component = () => {
 				label={t("services.toggle.enableRelay", "Enable cloud relay")}
 				hint={t(
 					"services.hint.relayDescription",
-					"Connect from anywhere via an E2E-encrypted WebSocket relay. No port forwarding or VPN needed.",
+					"Connect from anywhere via an encrypted WebSocket relay. No port forwarding or VPN needed. Note: traffic is encrypted in transit, but the relay operator can derive the key — this is not end-to-end encryption.",
 				)}
 			/>
 
@@ -750,13 +792,14 @@ export const ServicesTab: Component = () => {
 						setRelayToken(v);
 						saveConfigField((c) => {
 							c.services.relay.token = v;
+							c.services.relay.token_exists = v.length > 0;
 						});
 					}}
 					type="password"
 					placeholder={t("services.placeholder.relayToken", "Paste token from relay server registration")}
 					hint={t(
 						"services.hint.relayToken",
-						"Obtained from the relay server's /register endpoint. Used for both authentication and E2E encryption key derivation.",
+						"Obtained from the relay server's /register endpoint. Used for both authentication and encryption key derivation — because the relay receives this token, it can derive the key, so traffic is not end-to-end encrypted.",
 					)}
 				/>
 
@@ -826,8 +869,7 @@ export const ServicesTab: Component = () => {
 							<button
 								class={s.mcpSnippetCopy}
 								onClick={() => {
-									navigator.clipboard
-										.writeText(bridgeInfo()!.config_snippet)
+									writeClipboard(bridgeInfo()!.config_snippet)
 										.then(() => {
 											setSnippetCopied(true);
 											setTimeout(() => setSnippetCopied(false), 2000);
@@ -1017,21 +1059,7 @@ const UpstreamMcpPanel: Component<{ upstreamStatus: UpstreamStatusEntry[] }> = (
 			timeout_secs: f.timeout,
 		};
 
-		if (f.transportType === "http" && f.authMethod === "oauth2" && f.oauthClientId.trim()) {
-			const scopes = f.oauthScopes.trim()
-				? f.oauthScopes
-						.trim()
-						.split(/[\s,]+/)
-						.filter(Boolean)
-				: undefined;
-			const secret = f.oauthClientSecret.trim() || undefined;
-			server.auth = {
-				type: "oauth2",
-				client_id: f.oauthClientId.trim(),
-				...(secret ? { client_secret: secret } : {}),
-				...(scopes?.length ? { scopes } : {}),
-			};
-		}
+		server.auth = authFromUpstreamForm(f);
 
 		// Save credential before persisting config (ignored if empty)
 		if (f.credential && f.authMethod === "bearer") {
@@ -1131,41 +1159,27 @@ const UpstreamMcpPanel: Component<{ upstreamStatus: UpstreamStatusEntry[] }> = (
 			timeout_secs: f.timeout,
 		};
 
-		if (f.transportType === "http" && f.authMethod === "oauth2" && f.oauthClientId.trim()) {
-			const scopes = f.oauthScopes.trim()
-				? f.oauthScopes
-						.trim()
-						.split(/[\s,]+/)
-						.filter(Boolean)
-				: undefined;
-			const secret = f.oauthClientSecret.trim() || undefined;
-			const existingOAuth =
-				server.auth?.type === "oauth2"
-					? (server.auth as { authorization_endpoint?: string; token_endpoint?: string })
-					: undefined;
-			updated.auth = {
-				type: "oauth2" as const,
-				client_id: f.oauthClientId.trim(),
-				...(secret ? { client_secret: secret } : {}),
-				...(scopes?.length ? { scopes } : {}),
-				...(existingOAuth?.authorization_endpoint
-					? { authorization_endpoint: existingOAuth.authorization_endpoint }
-					: {}),
-				...(existingOAuth?.token_endpoint ? { token_endpoint: existingOAuth.token_endpoint } : {}),
-			};
-		} else if (f.authMethod === "bearer") {
-			delete updated.auth;
-		}
+		updated.auth = authFromUpstreamForm(f, server.auth);
 
-		if (f.credential && f.authMethod === "bearer") {
-			try {
-				await rpc("save_mcp_upstream_credential", { name: server.name, token: f.credential });
-			} catch {
-				/* non-fatal */
+		const ok = await saveUpstreams(upstreams().map((s) => (s.id === server.id ? updated : s)));
+		if (!ok) return;
+
+		const oldMethod = server.auth?.type === "oauth2" ? "oauth2" : "bearer";
+		const methodChanged = oldMethod !== f.authMethod;
+		try {
+			if (methodChanged) {
+				await rpc("delete_mcp_upstream_credential", { name: server.name });
 			}
+			if (f.credential && f.authMethod === "bearer") {
+				await rpc("save_mcp_upstream_credential", { name: server.name, token: f.credential });
+			}
+			if (methodChanged || f.credential) {
+				await rpc("reconnect_mcp_upstream", { name: server.name });
+			}
+		} catch (e) {
+			setError(`Authentication settings saved, but credential update failed: ${String(e)}`);
+			return;
 		}
-
-		await saveUpstreams(upstreams().map((s) => (s.id === server.id ? updated : s)));
 		setEditingId(null);
 	}
 
@@ -1187,6 +1201,17 @@ const UpstreamMcpPanel: Component<{ upstreamStatus: UpstreamStatusEntry[] }> = (
 			appLogger.error("settings", "Failed to delete MCP upstream credential", { error: String(e) }),
 		);
 		await saveUpstreams(upstreams().filter((s) => s.id !== id));
+	}
+
+	async function clearUpstreamCredential(name: string) {
+		try {
+			await rpc("delete_mcp_upstream_credential", { name });
+			setEditForm((current) => ({ ...current, credential: "" }));
+			await rpc("reconnect_mcp_upstream", { name });
+			setError("");
+		} catch (e) {
+			setError(`Failed to clear saved credential: ${String(e)}`);
+		}
 	}
 
 	return (
@@ -1404,7 +1429,7 @@ const UpstreamMcpPanel: Component<{ upstreamStatus: UpstreamStatusEntry[] }> = (
 														}}
 														title={statusLabel(entry().status)}
 													/>
-													<Show when={entry().status === "authenticating" || entry().status === "needs_auth"}>
+													<Show when={server.enabled && entry().status !== "disabled"}>
 														<span style={{ "font-size": "11px", color: statusColor(entry().status) }}>
 															{statusLabel(entry().status)}
 														</span>
@@ -1454,11 +1479,7 @@ const UpstreamMcpPanel: Component<{ upstreamStatus: UpstreamStatusEntry[] }> = (
 								</div>
 								{/* Action buttons — never shrink */}
 								{/* Authorize — show for explicit OAuth2 config OR when server auto-detected needs_auth (DCR case) */}
-								<Show
-									when={
-										server.auth?.type === "oauth2" || st()?.status === "needs_auth" || st()?.status === "authenticating"
-									}
-								>
+								<Show when={shouldShowAuthorize(server.auth?.type, st()?.status, server.enabled)}>
 									<Show
 										when={st()?.status === "authenticating"}
 										fallback={
@@ -1474,13 +1495,15 @@ const UpstreamMcpPanel: Component<{ upstreamStatus: UpstreamStatusEntry[] }> = (
 												title={
 													st()?.status === "needs_auth"
 														? "Upstream requires authorization — click to open the provider's consent page"
-														: "Authorize via OAuth 2.1"
+														: st()?.status === "ready"
+															? "Re-authorize — sign in again to switch account"
+															: "Authorize via OAuth 2.1"
 												}
 												onClick={() => {
 													startAuthorizeFlow(server.name).catch((e) => appLogger.warn("network", String(e)));
 												}}
 											>
-												Authorize
+												{st()?.status === "ready" ? "Re-authorize" : "Authorize"}
 											</button>
 										}
 									>
@@ -1584,6 +1607,14 @@ const UpstreamMcpPanel: Component<{ upstreamStatus: UpstreamStatusEntry[] }> = (
 													<p class={s.hint} style={{ margin: "2px 0 0" }}>
 														Stored in OS keychain. Leave blank to keep current token.
 													</p>
+													<button
+														type="button"
+														class={s.copyBtn}
+														style={{ width: "auto", "margin-top": "4px" }}
+														onClick={() => void clearUpstreamCredential(server.name)}
+													>
+														Clear saved token
+													</button>
 												</div>
 											</Show>
 											<Show when={editForm().authMethod === "oauth2"}>

@@ -4,7 +4,7 @@ TUICommander uses an Obsidian-style plugin system. Plugins extend the Activity C
 
 ## Quick Start: External Plugin
 
-1. Create a directory: `~/.config/tuicommander/plugins/my-plugin/`
+1. Create a directory: `~/.config/com.tuic.commander/plugins/my-plugin/`
 2. Create `manifest.json`:
 
 ```json
@@ -59,7 +59,7 @@ export default {
 };
 ```
 
-4. Restart the app (or save the file — hot reload will pick it up).
+4. Save the file — hot reload picks it up. Adding a brand-new plugin directory or symlink while the app is running is also discovered live, so no restart is needed.
 
 ## Architecture
 
@@ -85,13 +85,13 @@ Tauri OutputParser --> pluginRegistry.dispatchStructuredEvent(type, payload, ses
 
 ## Plugin Lifecycle
 
-1. **Discovery** — Rust `list_user_plugins` scans `~/.config/tuicommander/plugins/` for `manifest.json` files
+1. **Discovery** — Rust `list_user_plugins` scans `~/.config/com.tuic.commander/plugins/` for `manifest.json` files
 2. **Validation** — Frontend validates manifest fields and `minAppVersion`
-3. **Import** — `import("plugin://my-plugin/main.js")` loads the module via the custom URI protocol
+3. **Import** — `import("plugin://my-plugin/main.js")` loads the module via the custom URI protocol (on Windows the loader rewrites this to `http://plugin.localhost/my-plugin/main.js`, since WebView2 only serves custom schemes under `http://{scheme}.localhost/...`)
 4. **Module check** — Default export must have `id`, `onload`, `onunload`
 5. **Register** — `pluginRegistry.register(plugin, capabilities)` calls `plugin.onload(host)`
 6. **Active** — Plugin receives PTY lines, structured events, and can use the PluginHost API
-7. **Hot reload** — File changes emit `plugin-changed` events; the plugin is unregistered and re-imported
+7. **Hot reload** — File changes emit `plugin-changed` events; the plugin is unregistered and re-imported. Creating a new top-level plugin directory or symlink after startup also emits the event (the watcher does not descend into symlink targets, so the create of the link itself is the trigger), and the new plugin is discovered and loaded without a restart
 8. **Unload** — `plugin.onunload()` is called, then all registrations are auto-disposed
 
 ### Crash Safety
@@ -101,12 +101,16 @@ Every boundary is wrapped in try/catch:
 - Module validation — missing `id`, `onload`, or `onunload` logs an error and skips the plugin
 - `plugin.onload()` — if it throws, partial registrations are cleaned up automatically
 - Watcher/handler dispatch — exceptions are caught and logged, other plugins continue
+- UI callbacks registered through `PluginHost` (file icons/previews, activity
+  items, context menu actions, ticker messages, dashboards, commands) are
+  isolated the same way; failures are written both to the app log and the
+  plugin's dedicated log buffer
 
 A broken plugin produces a console error and is skipped. The app always continues.
 
 ## Manifest Reference
 
-File: `~/.config/tuicommander/plugins/{id}/manifest.json`
+File: `~/.config/com.tuic.commander/plugins/{id}/manifest.json`
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
@@ -287,7 +291,24 @@ host.registerOutputWatcher({
 });
 ```
 
-#### host.getClaudeProjectDir(repoPath) -> Promise\<string | null>
+#### host.getSessionCwd(sessionId) -> string | null
+
+Returns the current working directory of the given terminal session, or `null` if the session is unknown or has no recorded CWD. No capability required.
+
+```typescript
+const cwd = host.getSessionCwd(sessionId);
+// → "/Users/me/project" (or null)
+```
+
+#### host.getActiveRepoPath() -> string | null
+
+Shortcut for the active repository's path (equivalent to `host.getActiveRepo()?.path`). Returns `null` when no repository is active. No capability required.
+
+```typescript
+const repoPath = host.getActiveRepoPath();
+```
+
+#### `host.getClaudeProjectDir(repoPath) -> Promise<string | null>`
 
 Resolves a repository path to the absolute path of its Claude Code project directory (`~/.claude/projects/<slug>`). The slug encoding is handled by the Rust side — plugins should use this instead of constructing paths manually. Requires `"fs:read"` capability.
 
@@ -338,21 +359,21 @@ const sub = host.onStateChange((event) => {
 
 These methods require declaring `"git:read"` in `manifest.json`. They provide read-only access to git repository state.
 
-#### host.getGitBranches(repoPath) -> Promise<Array<{ name, isCurrent }>>
+#### `host.getGitBranches(repoPath) -> Promise<Array<{ name, isCurrent }>>`
 
 ```typescript
 const branches = await host.getGitBranches("/Users/me/project");
 // [{ name: "main", isCurrent: true }, { name: "feature/x", isCurrent: false }]
 ```
 
-#### host.getRecentCommits(repoPath, count?) -> Promise<Array<{ hash, message, author, date }>>
+#### `host.getRecentCommits(repoPath, count?) -> Promise<Array<{ hash, message, author, date }>>`
 
 ```typescript
 const commits = await host.getRecentCommits("/Users/me/project", 5);
 // [{ hash: "abc1234", message: "fix: bug", author: "name", date: "2026-02-25" }]
 ```
 
-#### host.getGitDiff(repoPath, scope?) -> Promise<string>
+#### `host.getGitDiff(repoPath, scope?) -> Promise<string>`
 
 ```typescript
 const diff = await host.getGitDiff("/Users/me/project", "staged");
@@ -363,7 +384,7 @@ const diff = await host.getGitDiff("/Users/me/project", "staged");
 
 These methods require declaring capabilities in `manifest.json`. Calling without the required capability throws `PluginCapabilityError`.
 
-#### host.writePty(sessionId, data) -> Promise<void>
+#### `host.writePty(sessionId, data) -> Promise<void>`
 
 Sends raw bytes to a terminal session. **Requires `"pty:write"` capability.**
 
@@ -373,7 +394,7 @@ Sends raw bytes to a terminal session. **Requires `"pty:write"` capability.**
 await host.writePty(sessionId, "\x03"); // Send Ctrl-C
 ```
 
-#### host.sendAgentInput(sessionId, text) -> Promise<void>
+#### `host.sendAgentInput(sessionId, text) -> Promise<void>`
 
 Sends user input to an agent session with correct Enter handling. **Requires `"pty:write"` capability.**
 
@@ -398,10 +419,10 @@ Opens a local markdown file in the markdown panel. **Requires `"ui:markdown"` ca
 
 ```typescript
 // Open the plugin's own README
-host.openMarkdownFile("/Users/me/.config/tuicommander/plugins/my-plugin/README.md");
+host.openMarkdownFile("/Users/me/.config/com.tuic.commander/plugins/my-plugin/README.md");
 ```
 
-#### host.playNotificationSound(sound?) -> Promise<void>
+#### `host.playNotificationSound(sound?) -> Promise<void>`
 
 Plays a notification sound. **Requires `"ui:sound"` capability.**
 
@@ -420,7 +441,7 @@ await host.playNotificationSound();              // defaults to "info"
 
 These methods provide sandboxed filesystem access. All paths must be absolute and within the user's home directory (`$HOME`).
 
-#### host.readFile(absolutePath) -> Promise<string>
+#### `host.readFile(absolutePath) -> Promise<string>`
 
 Read a file's content as UTF-8 text. Maximum file size: 10 MB. **Requires `"fs:read"` capability.**
 
@@ -428,7 +449,16 @@ Read a file's content as UTF-8 text. Maximum file size: 10 MB. **Requires `"fs:r
 const content = await host.readFile("/Users/me/.claude/projects/foo/conversation.jsonl");
 ```
 
-#### host.listDirectory(path, pattern?, options?) -> Promise<string[]>
+#### `host.readFileBase64(absolutePath) -> Promise<string>`
+
+Read a file's raw bytes and return them as a base64 string. Maximum file size: 10 MB. Use this for binary previews such as `.docx`, images, or archives. **Requires `"fs:read"` capability.**
+
+```typescript
+const encoded = await host.readFileBase64("/Users/me/Documents/spec.docx");
+const bytes = Uint8Array.from(atob(encoded), (ch) => ch.charCodeAt(0));
+```
+
+#### `host.listDirectory(path, pattern?, options?) -> Promise<string[]>`
 
 List filenames in a directory, optionally filtered by a glob pattern. Returns filenames only (not full paths). **Requires `"fs:list"` capability.**
 
@@ -444,7 +474,7 @@ const recent = await host.listDirectory(dir, "*.jsonl", { sortBy: "mtime" });
 const activeFile = recent[0]; // most recently written
 ```
 
-#### host.watchPath(path, callback, options?) -> Promise<Disposable>
+#### `host.watchPath(path, callback, options?) -> Promise<Disposable>`
 
 Watch a path for filesystem changes. Emits batched events after a debounce period. **Requires `"fs:watch"` capability.**
 
@@ -475,7 +505,7 @@ interface FsChangeEvent {
 }
 ```
 
-#### host.writeFile(absolutePath, content) -> Promise<void>
+#### `host.writeFile(absolutePath, content) -> Promise<void>`
 
 Write content to a file within `$HOME`. Creates parent directories if needed. Refuses to overwrite directories. Max 10 MB. **Requires `"fs:write"` capability.**
 
@@ -483,7 +513,7 @@ Write content to a file within `$HOME`. Creates parent directories if needed. Re
 await host.writeFile("/Users/me/project/stories/new-story.md", "---\nstatus: pending\n---\n# New Story");
 ```
 
-#### host.renamePath(from, to) -> Promise<void>
+#### `host.renamePath(from, to) -> Promise<void>`
 
 Rename or move a file within `$HOME`. Both paths must be absolute. Source must exist. Creates parent directories for destination if needed. **Requires `"fs:rename"` capability.**
 
@@ -492,6 +522,27 @@ await host.renamePath(
   "/Users/me/project/stories/old-name.md",
   "/Users/me/project/stories/new-name.md",
 );
+```
+
+#### `host.scanBuildArtifacts(repoPaths, options?) -> Promise<ArtifactEntry[]>`
+
+Recursively scan the given repo roots for build-artifact directories (Rust/Maven `target/`, `node_modules/`, JS framework caches like `.next`/`.turbo`, Python `.venv`/`__pycache__`/tool caches, .NET `obj`/`bin`, Gradle/CMake/Flutter `build/`, SwiftPM `.build`/`Pods`, `.terraform`, Elixir `_build`, Zig, Haskell, Composer `vendor/`). Read-only. Unlike `listDirectory`, this **ignores `.gitignore`** (artifact dirs are gitignored by design) and stops descending on a match, so a nested `node_modules` is folded into the outer entry — never double counted. Ambiguously-named dirs (`target`, `bin`/`obj`, `build`, `vendor`, …) only count when a toolchain marker sits beside them (e.g. `Cargo.toml` or `pom.xml` for `target`; a `.csproj`/`.fsproj`/`.vbproj`/`.sln`/`.slnx` for `bin`/`obj`; `build.gradle`/`CMakeLists.txt`/`pubspec.yaml` for `build`; `composer.json` for `vendor`) — a Go sysroot `bin` or an Xcode `PIFCache/target` is walked like any other dir, not claimed. The full rule table is `ARTIFACT_RULES` in `src-tauri/src/plugin_fs.rs`. Each `repoPaths` entry is `$HOME`-scoped **and intersected server-side with the app's actual registered-repository list** — a path that isn't equal to or nested under a genuinely registered repo root is silently dropped, so a plugin cannot widen its scan surface by passing arbitrary `$HOME` paths. Results for the same normalized set of roots are shared across concurrent callers and reused for 30 seconds. Pass `{ forceRefresh: true }` to bypass a completed cached result; an already-running scan for the same roots is still shared. **Requires `"fs:scan"` capability.**
+
+Each `ArtifactEntry` is `{ path, kind, size_bytes, last_modified_secs, repo }` — `kind` is one of `rust | maven | node | jscache | python | dotnet | gradle | cmake | swift | flutter | terraform | elixir | zig | haskell | php`, `last_modified_secs` is the max mtime of the dir's direct children (a "last build" signal).
+
+```typescript
+const entries = await host.scanBuildArtifacts(host.getRepos().map((r) => r.path));
+const refreshed = await host.scanBuildArtifacts(host.getRepos().map((r) => r.path), {
+  forceRefresh: true,
+});
+```
+
+#### `host.deleteBuildArtifact(path, repoPaths) -> Promise<void>`
+
+Delete a build-artifact directory. Destructive. The backend guard requires (all must hold): the path canonicalizes to a basename that is a known artifact dir, it is strictly inside one of `repoPaths` (never a repo root itself), that containing root is itself a **server-verified registered repository** (caller-supplied roots not backed by a real registered repo are dropped — the plugin cannot claim an arbitrary `$HOME` directory as a "repo"), it is `$HOME`-scoped, and — for ambiguously-named dirs — the same toolchain marker required by the scanner sits beside it (so Rust `src/bin` sources are refused). Only then is `remove_dir_all` run. **Requires `"fs:delete"` capability.**
+
+```typescript
+await host.deleteBuildArtifact("/Users/me/project/target", ["/Users/me/project"]);
 ```
 
 ### Tier 3c: Status Bar Ticker (capability-gated)
@@ -746,6 +797,7 @@ if (window.tuic) {
 |--------|-------------|
 | `tuic.version` | SDK version string (e.g. `"1.0"`) |
 | `tuic.open(path, opts?)` | Open a markdown file in a new tab. `path` is absolute. `opts.pinned` pins the tab. |
+| `tuic.edit(path, opts?)` | Open a file in the code editor. `opts.line` (1-based) jumps to a line; omit for the top. |
 | `tuic.terminal(repoPath)` | Open a new terminal in the given repository. |
 
 ```javascript
@@ -777,6 +829,7 @@ tuic.terminal("/Users/me/myrepo");
 | URL | Action |
 |-----|--------|
 | `tuic://open/<absolute-path>` | Open file in markdown tab |
+| `tuic://edit/<absolute-path>?line=N` | Open file in the code editor (optional `line`) |
 | `tuic://terminal?repo=<repo-path>` | Open terminal in repository |
 
 **Security:** Paths are validated against the list of known repositories. Paths outside any registered repo are rejected with a warning. The SDK runs inside the sandbox and communicates with the host exclusively via `postMessage`.
@@ -931,7 +984,7 @@ host.registerContextMenuAction({
 
 ### Tier 3g: Credential Access (capability-gated)
 
-#### host.readCredential(serviceName) -> Promise<string | null>
+#### `host.readCredential(serviceName) -> Promise<string | null>`
 
 Read credentials from the system credential store by service name. Returns the raw credential JSON string, or `null` if not found. **Requires `"credentials:read"` capability.**
 
@@ -951,7 +1004,7 @@ if (credJson) {
 
 ### Tier 3h: HTTP Requests (capability-gated)
 
-#### host.httpFetch(url, options?) -> Promise<HttpResponse>
+#### `host.httpFetch(url, options?) -> Promise<HttpResponse>`
 
 Make an HTTP request. Non-2xx status codes are returned normally (not thrown as errors). **Requires `"net:http"` capability.**
 
@@ -992,7 +1045,7 @@ interface HttpResponse {
 
 ### Tier 3i: File Tail (capability-gated)
 
-#### host.readFileTail(absolutePath, maxBytes) -> Promise<string>
+#### `host.readFileTail(absolutePath, maxBytes) -> Promise<string>`
 
 Read the last N bytes of a file, skipping any partial first line. Useful for reading recent entries from large JSONL files. **Requires `"fs:read"` capability.**
 
@@ -1003,7 +1056,7 @@ const lines = tail.split("\n").filter(Boolean);
 
 ### Tier 3j: CLI Execution (capability-gated)
 
-#### host.execCli(binary, args, cwd?) -> Promise<string>
+#### `host.execCli(binary, args, cwd?) -> Promise<string>`
 
 Execute a CLI binary declared in the plugin's manifest and return its stdout. **Requires `"exec:cli"` capability.**
 
@@ -1029,7 +1082,7 @@ console.log(status.index.documents); // 1486
 
 ### Tier 4: Scoped Tauri Invoke (whitelisted commands only)
 
-#### host.invoke<T>(cmd, args?) -> Promise<T>
+#### `host.invoke<T>(cmd, args?) -> Promise<T>`
 
 Invokes a whitelisted Tauri command. Non-whitelisted commands throw immediately.
 
@@ -1043,7 +1096,7 @@ Invokes a whitelisted Tauri command. Non-whitelisted commands throw immediately.
 | `delete_plugin_data` | `{ plugin_id: string, path: string }` | `void` | none (always allowed) |
 | `get_input_buffer_content` | `{ sessionId: string }` | `string` | `pty:read` |
 
-**Plugin data storage** is sandboxed to `~/.config/tuicommander/plugins/{id}/data/`. No capability required — every plugin can store its own data.
+**Plugin data storage** is sandboxed to `~/.config/com.tuic.commander/plugins/{id}/data/`. No capability required — every plugin can store its own data.
 
 ```typescript
 // Store cache data
@@ -1083,11 +1136,13 @@ Capabilities gate access to Tier 3 and Tier 4 methods. Declare them in `manifest
 | `net:http` | `host.httpFetch()` | Can make HTTP requests (scoped to `allowedUrls`) |
 | `invoke:read_file` | `host.invoke("read_file", ...)` | Can read files on disk |
 | `invoke:list_markdown_files` | `host.invoke("list_markdown_files", ...)` | Can list directory contents |
-| `fs:read` | `host.readFile()`, `host.readFileTail()` | Can read files within `$HOME` (10 MB limit) |
+| `fs:read` | `host.readFile()`, `host.readFileBase64()`, `host.readFileTail()` | Can read files within `$HOME` (10 MB limit) |
 | `fs:list` | `host.listDirectory()` | Can list directory contents within `$HOME` |
 | `fs:watch` | `host.watchPath()` | Can watch filesystem paths within `$HOME` for changes |
 | `fs:write` | `host.writeFile()` | Can write files within `$HOME` (10 MB limit) |
 | `fs:rename` | `host.renamePath()` | Can rename/move files within `$HOME` |
+| `fs:scan` | `host.scanBuildArtifacts()` | Can recursively scan registered repos for build-artifact directories (read-only; ignores `.gitignore`) |
+| `fs:delete` | `host.deleteBuildArtifact()` | Can delete a build-artifact directory inside a registered repo (guarded `remove_dir_all`) |
 | `exec:cli` | `host.execCli()` | Can execute CLI binaries declared in manifest `binaries` field |
 | `git:read` | `host.getGitBranches()`, `host.getRecentCommits()`, `host.getGitDiff()` | Read-only access to git repository state |
 | `ui:context-menu` | `host.registerTerminalAction()` | Can add actions to the terminal right-click "Actions" submenu |
@@ -1210,7 +1265,7 @@ esbuild src/main.ts --bundle --format=esm --outfile=main.js --external:nothing
 
 Install by copying the directory to:
 - macOS: `~/Library/Application Support/com.tuic.commander/plugins/my-plugin/`
-- Linux: `~/.config/tuicommander/plugins/my-plugin/`
+- Linux: `~/.config/com.tuic.commander/plugins/my-plugin/`
 - Windows: `%APPDATA%/com.tuic.commander/plugins/my-plugin/`
 
 Directory structure:
@@ -1280,7 +1335,7 @@ The Browse tab compares installed versions to detect available updates.
 
 ## Per-Plugin Error Logging
 
-Each plugin has a dedicated ring buffer logger (500 entries max). Errors from `onload`, `onunload`, output watchers, and structured event handlers are automatically captured.
+Each plugin has a dedicated ring buffer logger (500 entries max). Errors from `onload`, `onunload`, output watchers, structured event handlers, and PluginHost-registered UI callbacks are automatically captured.
 
 Plugins can also write to their log via `host.log(level, message, data)`.
 
@@ -1376,17 +1431,17 @@ The Rust `OutputParser` detects patterns in terminal output and emits typed even
 
 ### plan-file
 
-Detected when a plan file path appears in terminal output. The path is always resolved to an absolute path before emission:
+Detected when a plan file path appears in terminal output. The emitted `path` is **relative or absolute, as it appeared in the output** — the parser does NOT resolve relative paths to absolute:
 
-- Relative paths (e.g. `plans/foo.md`, `.claude/plans/bar.md`) are resolved against the terminal session's CWD
-- Tilde paths (`~/.claude/plans/bar.md`) are expanded to the user's home directory
+- Relative paths (e.g. `plans/foo.md`, `.claude/plans/bar.md`) are emitted unchanged
+- Tilde paths (`~/.claude/plans/bar.md`) are the only ones rewritten — `~` is expanded to the user's home directory
 - Already-absolute paths are passed through unchanged
 
-If the session has no CWD (rare), relative paths are emitted as-is and may fail to open.
+Relative-to-absolute resolution (against the terminal session's CWD via `host.getSessionCwd`) happens later, in the built-in plan plugin; plans whose CWD cannot be determined are skipped.
 
 ```typescript
 { type: "plan-file", path: string }
-// path: always absolute, e.g. "/Users/me/project/plans/foo.md",
+// path: relative or absolute, e.g. "plans/foo.md", ".claude/plans/bar.md",
 //       "/Users/me/.claude/plans/graceful-rolling-quasar.md"
 ```
 
@@ -1491,6 +1546,7 @@ Available from the [plugin registry](https://github.com/sstraus/tuicommander-plu
 | `mdkb-dashboard` | 2+3 | `exec:cli`, `fs:read`, `ui:panel`, `ui:ticker` | mdkb knowledge base dashboard |
 | `rtk-dashboard` | 3 | `exec:cli`, `ui:panel`, `ui:context-menu` | RTK token savings dashboard (`binaries: ["rtk"]`) |
 | `csv-preview` | 3 | `ui:file-preview`, `ui:panel`, `fs:read` | Preview CSV/TSV files as sortable HTML tables |
+| `docx-preview` | 3 | `ui:file-preview`, `ui:panel`, `fs:read` | Preview Word `.docx`/`.dotx` files as HTML with Mammoth.js |
 
 ## Troubleshooting
 

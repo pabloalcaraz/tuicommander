@@ -224,6 +224,13 @@ pub(crate) struct UpstreamRegistry {
     /// `AppState` holds both the registry and the flow manager as `Arc`s.
     oauth_flow:
         parking_lot::RwLock<Option<std::sync::Weak<crate::mcp_oauth::flow::OAuthFlowManager>>>,
+    /// Set once boot-time `auto_connect_saved_upstreams` has registered every
+    /// configured upstream (their async `initialize` may still be in flight).
+    initial_connect_complete: std::sync::atomic::AtomicBool,
+    /// Set once the first `tools/list` has waited for upstreams to settle (or
+    /// timed out). After this, `await_initial_settle` is a no-op — the boot
+    /// race window is over and we never block `tools/list` again.
+    initial_settle_done: std::sync::atomic::AtomicBool,
 }
 
 impl UpstreamRegistry {
@@ -234,30 +241,33 @@ impl UpstreamRegistry {
             mcp_tools_tx: parking_lot::RwLock::new(None),
             auth_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
             oauth_flow: parking_lot::RwLock::new(None),
+            initial_connect_complete: std::sync::atomic::AtomicBool::new(false),
+            initial_settle_done: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
     /// Insert a fake Ready upstream with the given tools. Test-only.
     #[cfg(test)]
     pub(crate) fn inject_ready_upstream(&self, name: &str, tool_names: &[&str]) {
+        self.inject_ready_http_upstream(name, &format!("http://127.0.0.1:1/{name}"), tool_names);
+    }
+
+    /// Insert a Ready HTTP upstream backed by a caller-supplied test server.
+    #[cfg(test)]
+    pub(crate) fn inject_ready_http_upstream(&self, name: &str, url: &str, tool_names: &[&str]) {
         use crate::mcp_proxy::http_client::{HttpMcpClient, UpstreamToolDef};
         let config = UpstreamMcpServer {
             id: uuid::Uuid::new_v4().to_string(),
             name: name.to_string(),
             transport: UpstreamTransport::Http {
-                url: format!("http://127.0.0.1:1/{name}"),
+                url: url.to_string(),
             },
             enabled: true,
             timeout_secs: 10,
             tool_filter: None,
             auth: None,
         };
-        let client = HttpMcpClient::new(
-            name.to_string(),
-            format!("http://127.0.0.1:1/{name}"),
-            10,
-            false,
-        );
+        let client = HttpMcpClient::new(name.to_string(), url.to_string(), 10, false);
         let entry = Arc::new(UpstreamEntry::new(
             config,
             UpstreamClient::Http(Box::new(tokio::sync::RwLock::new(client))),
@@ -385,6 +395,59 @@ impl UpstreamRegistry {
         }
     }
 
+    /// Mark boot-time auto-connect as complete: every configured upstream has
+    /// been registered (async `initialize` may still be running).
+    pub(crate) fn mark_initial_connect_complete(&self) {
+        self.initial_connect_complete
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Block (bounded) until first-boot upstream initialization has settled,
+    /// then serve `tools/list`.
+    ///
+    /// Without this, Claude Code connects to the bridge and lists tools before
+    /// the async upstream `initialize` finishes, receives a list missing the
+    /// upstream-proxied tools, and never refetches — CC ignores
+    /// `notifications/tools/list_changed` (anthropics/claude-code#4118), so the
+    /// stale list sticks until the user forces a refresh. We wait until
+    /// auto-connect has registered every upstream AND none is still `Connecting`
+    /// (i.e. all reached `Ready`/`Failed`/`NeedsAuth`/…), bounded by `timeout`.
+    ///
+    /// The `initial_settle_done` latch makes subsequent calls a no-op once a
+    /// settle has been observed; `connect_upstream` re-arms it when an upstream
+    /// is added after boot so its tools aren't missed on the next `tools/list`.
+    //
+    // DEFERRED (2026-06-13) — concurrent callers during the boot window each spin
+    // their own 50ms poll loop instead of sharing one wake signal. Harmless in
+    // practice (CC sends a single tools/list at handshake) but a tokio::sync::Notify
+    // would collapse them. Revisit if multi-client boot latency shows up.
+    pub(crate) async fn await_initial_settle(&self, timeout: std::time::Duration) {
+        use std::sync::atomic::Ordering;
+        if self.initial_settle_done.load(Ordering::Acquire) {
+            return;
+        }
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let settled = self.initial_connect_complete.load(Ordering::Acquire)
+                && !self
+                    .entries
+                    .iter()
+                    .any(|e| matches!(*e.value().status.read(), UpstreamStatus::Connecting));
+            if settled {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                tracing::warn!(
+                    source = "mcp_registry",
+                    "tools/list settle wait timed out — serving a possibly-partial upstream tool list"
+                );
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        self.initial_settle_done.store(true, Ordering::Release);
+    }
+
     // -----------------------------------------------------------------------
     // Aggregation
     // -----------------------------------------------------------------------
@@ -427,13 +490,6 @@ impl UpstreamRegistry {
                 let mut def = tool.definition.clone();
                 if let Some(obj) = def.as_object_mut() {
                     obj.insert("name".to_string(), Value::String(prefixed_name));
-                    // Annotate description with upstream origin
-                    let desc = obj
-                        .get("description")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    let annotated = format!("[via {}] {}", entry.config.name, desc);
-                    obj.insert("description".to_string(), Value::String(annotated));
                 }
                 result.push(def);
             }
@@ -584,27 +640,35 @@ impl UpstreamRegistry {
     /// loaded from disk and connected first.
     #[allow(dead_code)] // invoked from Tauri command layer (#1198)
     pub(crate) async fn on_oauth_complete(&self, upstream_name: &str) -> Result<(), String> {
-        if !self.entries.contains_key(upstream_name) {
-            tracing::warn!(
-                source = "mcp_registry",
-                name = upstream_name,
-                "on_oauth_complete: entry not in registry, loading from config"
-            );
-            let config: crate::mcp_upstream_config::UpstreamMcpConfig =
-                crate::config::load_json_config(crate::mcp_upstream_config::UPSTREAMS_FILE);
-            let server = config
-                .servers
-                .into_iter()
-                .find(|s| s.name == upstream_name)
-                .ok_or_else(|| {
-                    format!("Upstream '{upstream_name}' not found in config or registry")
-                })?;
-            self.connect_upstream(server, None).await?;
-            // connect_upstream spawns initialize which will pick up the OAuth token
-            return Ok(());
-        }
-
-        let entry = Arc::clone(self.entries.get(upstream_name).unwrap().value());
+        // Snapshot the entry in a single lookup. A `contains_key` + later
+        // `.get().unwrap()` would panic if a concurrent `disconnect_upstream`
+        // removed the entry in the gap (OAuth-complete and user disconnect race).
+        let entry = match self
+            .entries
+            .get(upstream_name)
+            .map(|e| Arc::clone(e.value()))
+        {
+            Some(entry) => entry,
+            None => {
+                tracing::warn!(
+                    source = "mcp_registry",
+                    name = upstream_name,
+                    "on_oauth_complete: entry not in registry, loading from config"
+                );
+                let config: crate::mcp_upstream_config::UpstreamMcpConfig =
+                    crate::config::load_json_config(crate::mcp_upstream_config::UPSTREAMS_FILE);
+                let server = config
+                    .servers
+                    .into_iter()
+                    .find(|s| s.name == upstream_name)
+                    .ok_or_else(|| {
+                        format!("Upstream '{upstream_name}' not found in config or registry")
+                    })?;
+                self.connect_upstream(server, None).await?;
+                // connect_upstream spawns initialize which will pick up the OAuth token
+                return Ok(());
+            }
+        };
 
         *entry.status.write() = UpstreamStatus::Connecting;
         self.emit_status_change(upstream_name, "connecting");
@@ -664,6 +728,18 @@ impl UpstreamRegistry {
             return Ok(());
         }
 
+        // Re-arm the settle gate when an upstream is connected after boot-time
+        // auto-connect already settled. The gate is otherwise one-shot, so a
+        // runtime-added upstream's `initialize` would race the next `tools/list`
+        // and its tools would be missing until a manual refresh.
+        if self
+            .initial_connect_complete
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            self.initial_settle_done
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
+
         // Run initialize in background (don't block the caller).
         // Snapshot the event bus sender and flow manager (if any) so the
         // spawned task can emit events and trigger OAuth without a reference
@@ -694,11 +770,19 @@ impl UpstreamRegistry {
             .remove(name)
             .ok_or_else(|| format!("Upstream '{name}' not found"))?;
 
-        // Fire-and-forget shutdown for stdio (sync)
-        if let UpstreamClient::Stdio(ref mutex) = entry.client
-            && let Ok(mut client) = mutex.lock()
-        {
-            client.shutdown();
+        // Fire-and-forget shutdown for stdio. `shutdown()` blocks up to 2s
+        // (graceful child wait + SIGKILL fallback), so run it on a detached
+        // thread — this keeps the async callers (reconnect/apply_config_diff)
+        // off that stall. `std::thread` (not `spawn_blocking`) because this fn
+        // is sync and also runs from non-runtime contexts (tests, config
+        // reconcile), where `spawn_blocking` would panic for lack of a runtime.
+        if let UpstreamClient::Stdio(ref mutex) = entry.client {
+            let mutex = std::sync::Arc::clone(mutex);
+            std::thread::spawn(move || {
+                if let Ok(mut client) = mutex.lock() {
+                    client.shutdown();
+                }
+            });
         }
         // HTTP clients don't hold persistent connections — nothing to clean up.
 
@@ -1073,6 +1157,32 @@ async fn initialize_entry_with_oauth(
             mark_entry_needs_auth(entry, name, bus);
             return;
         }
+        Err(UpstreamError::AuthFailed)
+            if matches!(
+                entry.config.auth,
+                Some(crate::mcp_upstream_config::UpstreamAuth::OAuth2 { .. })
+            ) =>
+        {
+            // An OAuth token existed but the server rejected it with a plain 401
+            // (no `WWW-Authenticate` challenge) and the single force-refresh
+            // didn't recover it — the refresh token is expired/revoked too. Drop
+            // the dead token and re-enter "awaiting user consent" so the UI shows
+            // "Authorize", instead of parking the upstream in a silent red
+            // failure the user can't act on (re-saving the same config wouldn't
+            // help either, since the stale token would just be reused).
+            if let Err(e) = crate::mcp_upstream_credentials::delete_upstream_credential(name) {
+                tracing::warn!(source = "mcp_registry", %name, "Failed to clear rejected OAuth token: {e}");
+            }
+            tracing::info!(
+                source = "mcp_registry",
+                %name,
+                "OAuth token rejected and refresh failed — awaiting re-authorization"
+            );
+            *entry.last_error.write() = None;
+            let _ = flow_mgr; // flow is only started after user click, never here
+            mark_entry_needs_auth(entry, name, bus);
+            return;
+        }
         Err(e) => {
             let e_str = e.to_string();
             *entry.last_error.write() = Some(e_str.clone());
@@ -1082,7 +1192,7 @@ async fn initialize_entry_with_oauth(
                 *entry.status.write() = UpstreamStatus::Failed;
                 "failed"
             } else if entry.cb.is_open() {
-                tracing::warn!(source = "mcp_registry", %name, "Initialization failed (circuit open): {e_str}");
+                tracing::warn!(source = "mcp_registry", audience = "diagnostic", %name, "Initialization failed (circuit open): {e_str}");
                 *entry.status.write() = UpstreamStatus::CircuitOpen;
                 "circuit_open"
             } else {
@@ -1175,12 +1285,14 @@ async fn run_health_checks(registry: &UpstreamRegistry) {
                     let _ = flow; // flow is only started after user click, never here
                     mark_entry_needs_auth(&entry, &name, bus.as_ref());
                 }
-                Err(_) => {
+                Err(e) => {
+                    let e_str = e.to_string();
+                    *entry.last_error.write() = Some(e_str.clone());
                     let exhausted = entry.cb.record_failure();
                     let new_status = if exhausted {
                         // Only log on first transition to Failed, not on repeated probe failures
                         if status != UpstreamStatus::Failed {
-                            tracing::error!(source = "mcp_registry", %name, "Health check failed permanently");
+                            tracing::error!(source = "mcp_registry", %name, "Health check failed permanently: {e_str}");
                         }
                         UpstreamStatus::Failed
                     } else {
@@ -1188,7 +1300,7 @@ async fn run_health_checks(registry: &UpstreamRegistry) {
                         // while already open are coalesced by the ring buffer but we want
                         // to avoid generating the warn at all once the circuit is open.
                         if status != UpstreamStatus::CircuitOpen {
-                            tracing::warn!(source = "mcp_registry", %name, "Health check failed — circuit opening");
+                            tracing::warn!(source = "mcp_registry", audience = "diagnostic", %name, "Health check failed — circuit opening: {e_str}");
                         }
                         UpstreamStatus::CircuitOpen
                     };
@@ -1391,16 +1503,21 @@ mod tests {
     }
 
     #[test]
-    fn aggregated_tools_annotates_description() {
+    fn aggregated_tools_preserve_upstream_description_without_tuic_preamble() {
         let registry = UpstreamRegistry::new();
-        let (name, entry) = ready_entry("myserver", vec![make_tool_def("do_thing")]);
+        let mut tool = make_tool_def("do_thing");
+        tool.definition["description"] =
+            Value::String("Search the upstream index once.".to_string());
+        let (name, entry) = ready_entry("myserver", vec![tool]);
         registry.entries.insert(name, entry);
 
         let tools = registry.aggregated_tools();
         assert_eq!(tools.len(), 1);
         let desc = tools[0]["description"].as_str().unwrap();
-        assert!(desc.starts_with("[via myserver]"), "got: {desc}");
-        assert!(desc.contains("test tool"), "got: {desc}");
+        assert_eq!(desc, "Search the upstream index once.");
+        assert!(!desc.contains("TUICommander"));
+        assert!(!desc.contains("TUIC Protocol"));
+        assert!(!desc.contains("Required Output Markers"));
     }
 
     #[test]
@@ -1593,6 +1710,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn await_initial_settle_fast_when_complete_and_idle() {
+        // Boot finished, nothing connecting → first tools/list must not block.
+        let registry = UpstreamRegistry::new();
+        registry.mark_initial_connect_complete();
+        let start = tokio::time::Instant::now();
+        registry
+            .await_initial_settle(std::time::Duration::from_secs(5))
+            .await;
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(100),
+            "no connecting upstreams → settle immediately"
+        );
+    }
+
+    #[tokio::test]
+    async fn await_initial_settle_times_out_then_latches() {
+        // auto-connect never completes (e.g. wedged) → tools/list must still be
+        // served after the bounded timeout, and the latch makes later calls free.
+        let registry = UpstreamRegistry::new();
+        let start = tokio::time::Instant::now();
+        registry
+            .await_initial_settle(std::time::Duration::from_millis(150))
+            .await;
+        assert!(
+            start.elapsed() >= std::time::Duration::from_millis(150),
+            "must wait out the timeout before serving"
+        );
+        let second = tokio::time::Instant::now();
+        registry
+            .await_initial_settle(std::time::Duration::from_secs(5))
+            .await;
+        assert!(
+            second.elapsed() < std::time::Duration::from_millis(50),
+            "latch set after first wait → subsequent calls are no-ops"
+        );
+    }
+
+    #[tokio::test]
     async fn disconnect_emits_tools_changed_signal() {
         // Regression: toggling an upstream off in McpPopup must invalidate the
         // MCP client's cached tool list. The signal is what the SSE
@@ -1614,6 +1769,56 @@ mod tests {
         assert!(
             rx.try_recv().is_ok(),
             "disconnect_upstream must emit mcp_tools_changed so connected MCP clients refresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn health_check_failure_records_last_error() {
+        // Regression: the Err arm of the health check must bind the error, log it,
+        // and write entry.last_error so the failure reason surfaces in the status
+        // snapshot the UI reads. Previously the error was discarded (Err(_)), leaving
+        // stale/empty diagnostics after an upstream went down.
+        let registry = UpstreamRegistry::new();
+        let name = "unreachable".to_string();
+        // Loopback port 1 refuses connections fast → deterministic health-check failure.
+        let url = "http://127.0.0.1:1/mcp";
+        let config = http_server_config(&name, url);
+        let client = HttpMcpClient::new(name.clone(), url.to_string(), 2, false);
+        let entry = Arc::new(UpstreamEntry::new(
+            config,
+            UpstreamClient::Http(Box::new(tokio::sync::RwLock::new(client))),
+        ));
+        *entry.status.write() = UpstreamStatus::Ready;
+        assert!(
+            entry.last_error.read().is_none(),
+            "precondition: no error recorded yet"
+        );
+        registry.entries.insert(name.clone(), Arc::clone(&entry));
+
+        // run_health_checks spawns a detached probe task; poll until it records.
+        run_health_checks(&registry).await;
+        let mut recorded = None;
+        for _ in 0..100 {
+            if let Some(e) = entry.last_error.read().clone() {
+                recorded = Some(e);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let recorded = recorded.expect("health-check failure must record last_error");
+        assert!(
+            !recorded.is_empty(),
+            "recorded error must be non-empty: {recorded}"
+        );
+
+        // The failure reason must be visible in the status snapshot the UI reads.
+        let snap = registry.status_snapshot();
+        let upstream = &snap["upstreams"][0];
+        assert_eq!(upstream["name"], name);
+        assert_eq!(
+            upstream["last_error"].as_str(),
+            Some(recorded.as_str()),
+            "snapshot must surface the recorded failure reason"
         );
     }
 

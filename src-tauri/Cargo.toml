@@ -1,13 +1,37 @@
 [workspace]
-members = [".", "crates/tuic-bridge", "crates/tuic-cli", "patches/alacritty_terminal"]
+members = [
+    ".",
+    "crates/tuic-bridge",
+    "crates/tuic-cli",
+    "patches/alacritty_terminal",
+    "patches/vte",
+]
+exclude = ["patches/wayland-scanner"]
+resolver = "2"
+
+[workspace.package]
+version = "1.6.3"
 
 [package]
 name = "tuicommander"
-version = "1.2.4-nightly"
+version.workspace = true
 description = "TUICommander - Native platform for AI coding agents"
 authors = ["Stefano Straus <github.com/sstraus>"]
 edition = "2024"
 default-run = "tuicommander"
+
+[package.metadata.cargo-machete]
+# Used from build.rs behind the desktop feature; cargo-machete does not inspect
+# feature-gated build scripts.
+ignored = ["tauri-build"]
+
+[profile.dev]
+opt-level = 1
+
+# Dependencies compiled at opt-level 1 in dev (was 2): much faster first-build /
+# cold rebuild, runtime still acceptable for dev. whisper/audio only need O1.
+[profile.dev.package."*"]
+opt-level = 1
 
 [profile.release]
 lto = "thin"
@@ -83,7 +107,10 @@ workspace = true
 
 [lib]
 name = "tuicommander_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
+# Desktop-only: the bin links the lib as rlib (main.rs → tuicommander_lib::run()).
+# staticlib/cdylib are only needed for mobile (iOS/Android) — dropping them makes
+# the huge lib compile once instead of three times. Re-add if mobile is planned.
+crate-type = ["rlib"]
 
 [[bin]]
 name = "tuic-remote"
@@ -100,13 +127,23 @@ serde_json = "1"
 portable-pty = "0.9"
 tokio = { version = "1", features = ["full"] }
 dashmap = "6"
+moka = { version = "0.12", features = ["sync"] }
+gix = { version = "0.85", default-features = false, features = [
+    "sha1",
+    "revision",
+    "status",
+    "blame",
+    "blob-diff",
+    "dirwalk",
+    "parallel",
+] }
 parking_lot = "0.12"
 regex = "1"
 lazy_static = "1"
 uuid = { version = "1", features = ["v4", "v7"] }
-ulid = "1"
+ulid = "3"
 cuid2 = "0.1"
-base32 = "0.4"
+base32 = "0.5.1"
 zeroize = { version = "1", features = ["alloc"] }
 hex = "0.4"
 ring = "0.17"
@@ -114,8 +151,8 @@ dirs = "6"
 tauri-plugin-dialog = { version = "2.7", optional = true }
 tauri-plugin-single-instance = { version = "2", optional = true }
 whisper-rs = { version = "0.16", optional = true }
-cpal = { version = "0.17", optional = true }
-rodio = { version = "0.20", optional = true }
+cpal = { version = "0.17.3", optional = true }
+rodio = { version = "0.22.2", default-features = false, features = ["playback"], optional = true }
 reqwest = { version = "0.13", features = ["stream", "json", "form"] }
 futures-util = "0.3"
 axum = { version = "0.8", features = ["ws"] }
@@ -125,7 +162,7 @@ bcrypt = "0.19"
 base64 = "0.22"
 include_dir = { version = "0.7.4", features = ["glob"] }
 mime_guess = "2.0.5"
-tower-http = { version = "0.6.8", features = ["cors", "compression-gzip", "compression-br"] }
+tower-http = { version = "0.7", features = ["cors", "compression-gzip", "compression-br"] }
 rand = "0.10"
 libc = "0.2"
 notify = "8"
@@ -147,14 +184,13 @@ keyring = { version = "3", features = ["apple-native", "windows-native", "linux-
 url = "2"
 chrono = { version = "0.4", features = ["serde"] }
 alacritty_terminal = "0.26.0"
-tokio-tungstenite = { version = "0.29", features = ["rustls-tls-native-roots"] }
-aes-gcm = "0.10"
-sha2 = "0.10"
-hkdf = "0.12"
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
+aes-gcm = "0.11"
+sha2 = "0.11"
+hkdf = "0.13"
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 axum-server-dual-protocol = "0.7"
-web-push-native = { version = "0.4", default-features = false, features = ["serialization"] }
-p256 = { version = "0.13", features = ["ecdsa"] }
+web-push-native = { version = "0.4", default-features = false }
 rand_core = { version = "0.6", features = ["getrandom"] }
 base64ct = { version = "1", features = ["alloc"] }
 anyhow = "1"
@@ -165,10 +201,10 @@ genai = "0.6.0-beta.11"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
-console-subscriber = { version = "0.4", optional = true }
-cron = "0.16"
+console-subscriber = { version = "0.5", optional = true }
+cron = "0.17"
 toml = "1"
-rusqlite = { version = "0.39", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 ssh2-config = "0.7"
 
 [features]
@@ -194,7 +230,9 @@ desktop = [
     "dep:objc2-app-kit",
     "dep:block2",
 ]
-# GPU features for Linux builds (macOS always has Metal, Windows always has Vulkan via target deps)
+# GPU features for Linux builds (macOS always has Metal via target dep; Windows
+# is CPU-only — the whisper.cpp Vulkan backend's vulkan-shaders-gen sub-build is
+# chronically broken on the Windows runner (MAX_PATH/MSBuild), so we ship CPU).
 cuda = ["whisper-rs/cuda"]
 vulkan = ["whisper-rs/vulkan"]
 tokio-console = ["console-subscriber"]
@@ -202,17 +240,25 @@ tokio-console = ["console-subscriber"]
 [target.'cfg(target_os = "macos")'.dependencies]
 whisper-rs = { version = "0.16", features = ["metal"], optional = true }
 objc2 = { version = "0.6", optional = true }
-objc2-foundation = { version = "0.3", optional = true }
+objc2-foundation = { version = "0.3", features = ["NSUserDefaults", "NSDictionary", "NSString", "NSValue"], optional = true }
 objc2-app-kit = { version = "0.3", features = ["NSEvent", "block2"], optional = true }
 block2 = { version = "0.6", optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-whisper-rs = { version = "0.16", features = ["vulkan"], optional = true }
+# CPU-only on Windows: the Vulkan backend (vulkan-shaders-gen) fails to build on
+# the CI runner. Dictation runs on CPU; re-enable "vulkan" only once the
+# whisper.cpp Windows shader build is stabilized.
+whisper-rs = { version = "0.16", optional = true }
 windows-sys = { version = "0.61", features = ["Win32_System_Diagnostics_ToolHelp", "Win32_System_Diagnostics_Debug", "Win32_System_Threading", "Win32_Foundation", "Win32_System_ProcessStatus", "Wdk_System_Threading"] }
 
 [patch.crates-io]
 alacritty_terminal = { path = "patches/alacritty_terminal" }
 vte = { path = "patches/vte" }
+# crates.io 0.31.10 pins vulnerable quick-xml 0.39. Keep that release's code
+# compatible with wayland-client/backend 0.31/0.3, while applying upstream's
+# quick-xml 0.41 parser adaptation. Patching current Wayland master here would
+# generate interfaces for its unreleased backend ABI and break Linux builds.
+wayland-scanner = { path = "patches/wayland-scanner" }
 
 [dev-dependencies]
 tempfile = "3"
@@ -220,4 +266,3 @@ tower = { version = "0.5", features = ["util"] }
 serial_test = "3"
 mockito = "1"
 strip-ansi-escapes = "0.2"
-

@@ -43,6 +43,10 @@ export interface BaseRefOption {
 	is_default: boolean;
 }
 
+export interface RemoveWorktreeResult {
+	branch_delete_warning?: string | null;
+}
+
 /** Repository hook for git operations */
 export function useRepository() {
 	/** Get repository info */
@@ -65,6 +69,16 @@ export function useRepository() {
 		await invoke("rename_branch", { path: repoPath, oldName, newName });
 	}
 
+	/** Create a new git branch (optionally checking it out). */
+	async function createBranch(
+		repoPath: string,
+		name: string,
+		startPoint: string | null,
+		checkout: boolean,
+	): Promise<void> {
+		await invoke("create_branch", { path: repoPath, name, startPoint, checkout });
+	}
+
 	/** Get diff stats (additions/deletions) for a repository */
 	async function getDiffStats(path: string, scope?: string): Promise<{ additions: number; deletions: number }> {
 		try {
@@ -76,8 +90,18 @@ export function useRepository() {
 	}
 
 	/** Remove a worktree by branch name */
-	async function removeWorktree(repoPath: string, branchName: string, deleteBranch: boolean): Promise<void> {
-		await invoke("remove_worktree", { repoPath, branchName, deleteBranch });
+	async function removeWorktree(
+		repoPath: string,
+		branchName: string,
+		deleteBranch: boolean,
+		force?: boolean,
+	): Promise<RemoveWorktreeResult> {
+		return await invoke<RemoveWorktreeResult>("remove_worktree", {
+			repoPath,
+			branchName,
+			deleteBranch,
+			force: force ?? false,
+		});
 	}
 
 	/** Create a new worktree with a branch */
@@ -87,6 +111,7 @@ export function useRepository() {
 		createBranch?: boolean,
 		baseRef?: string,
 	): Promise<{
+		status: "ok" | "pending";
 		name: string;
 		path: string;
 		branch: string;
@@ -149,10 +174,11 @@ export function useRepository() {
 			return await invoke<string>("read_file", { path, file });
 		} catch (err) {
 			const msg = String(err);
-			// ENOENT is legitimate (file deleted/renamed while a tab still points at it);
-			// downgrade to warn so the app log isn't spammed on every repo revision bump.
+			// ENOENT is legitimate (file deleted/renamed while a tab still points at it)
+			// and not actionable; log at debug so the app log isn't spammed on every
+			// repo revision bump (a stale tab re-reads the missing file each bump).
 			if (msg.includes("No such file or directory") || msg.includes("os error 2")) {
-				appLogger.warn("git", "File not found", { path, file });
+				appLogger.debug("git", "File not found", { path, file });
 			} else {
 				appLogger.error("git", "Failed to read file", { path, file, error: msg });
 			}
@@ -185,6 +211,7 @@ export function useRepository() {
 		merged: boolean;
 		action: string;
 		archive_path: string | null;
+		branch_delete_warning?: string | null;
 	}
 
 	/** Merge a worktree branch into target, then archive or delete */
@@ -362,6 +389,7 @@ export function useRepository() {
 		getDiffStats,
 		openInApp,
 		renameBranch,
+		createBranch,
 		removeWorktree,
 		createWorktree,
 		getWorktreePaths,

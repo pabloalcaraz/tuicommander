@@ -136,6 +136,18 @@ pub struct Grid<T> {
 
     /// Maximum number of lines in history.
     max_scroll_limit: usize,
+
+    /// Total number of lines that have ever scrolled off the top of the active
+    /// region into history, counted across the grid's whole lifetime. Unlike
+    /// `history_size()` it never plateaus or shrinks on eviction, so callers can
+    /// derive an eviction-stable absolute row coordinate (`total_scrolled() -
+    /// history_size()` = lines evicted from the history top so far).
+    ///
+    /// Defaulted on deserialize so pre-existing `grid.json` ref fixtures (recorded
+    /// before this field existed) still load; it is excluded from `PartialEq`, so the
+    /// recording-based ref comparisons are unaffected by its runtime value.
+    #[cfg_attr(feature = "serde", serde(default))]
+    lines_scrolled: usize,
 }
 
 impl<T: GridCell + Default + PartialEq> Grid<T> {
@@ -148,7 +160,18 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
             cursor: Cursor::default(),
             lines,
             columns,
+            lines_scrolled: 0,
         }
+    }
+
+    /// Total lines that have ever scrolled into history over the grid's lifetime.
+    /// Monotonic: unlike `history_size()` it does not plateau or shrink when the
+    /// scrollback cap evicts old lines, so `total_scrolled() - history_size()`
+    /// yields the number of lines evicted from the history top — the base for an
+    /// eviction-stable absolute row coordinate.
+    #[inline]
+    pub fn total_scrolled(&self) -> usize {
+        self.lines_scrolled
     }
 
     /// Update the size of the scrollback history.
@@ -256,6 +279,17 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
         T: ResetDiscriminant<D>,
         D: PartialEq,
     {
+        // DEFERRED (2026-06-24, re-evaluated 2026-07-06) — story 056-7545 (Ink
+        // duplication into scrollback). RESOLVED FOR THE MAIN REPRO: raw-ring
+        // capture (mdkb `ink-banner-dup-raw-ring-2026-07-06`) proved the grid is
+        // FAITHFUL — Claude Code's Ink itself re-emits its full frame (banner
+        // included) via ~28×CRLF (pushes the old frame into scrollback) + ESC[H +
+        // per-line erase + reprint whenever its frame exceeds the viewport or the
+        // width changes. The duplicates are IN the byte stream; any terminal
+        // records them. Do NOT patch scroll_up for this. If a future repro shows
+        // grid copies > raw emissions (compare search-buffer hits vs raw-ring
+        // occurrences), only then suspect this code path again.
+
         // When rotating the entire region with fixed lines at the top, just reset everything.
         if region.end - region.start <= positions && region.start != 0 {
             for i in (region.start.0..region.end.0).map(Line::from) {
@@ -272,6 +306,12 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
 
         // Only rotate the entire history if the active region starts at the top.
         if region.start == 0 {
+            // These lines scroll off the top of the active region into history.
+            // Count them before `increase_scroll_limit` clamps to the cap, so the
+            // total keeps climbing even once history is full and the oldest lines
+            // are being evicted.
+            self.lines_scrolled += positions;
+
             // Create scrollback for the new lines.
             self.increase_scroll_limit(positions);
 

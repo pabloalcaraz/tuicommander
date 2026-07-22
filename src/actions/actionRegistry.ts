@@ -38,6 +38,8 @@ const ACTION_META: Partial<Record<ActionName, ActionMeta>> = {
 	"edit-command": { label: "Edit saved command", category: "Terminal" },
 	"prev-tab": { label: "Previous tab", category: "Terminal" },
 	"next-tab": { label: "Next tab", category: "Terminal" },
+	"focus-last-terminal": { label: "Return to last terminal", category: "Navigation" },
+	"jump-waiting-terminal": { label: "Jump to waiting terminal", category: "Navigation" },
 
 	"zoom-in": { label: "Zoom in", category: "Zoom" },
 	"zoom-out": { label: "Zoom out", category: "Zoom" },
@@ -91,6 +93,12 @@ const ACTION_META: Partial<Record<ActionName, ActionMeta>> = {
 	"toggle-tunnels": { label: "SSH Tunnels", category: "Panels" },
 	"process-manager": { label: "Process Manager", category: "Navigation" },
 	"open-generators": { label: "Open generators", category: "Generators" },
+	"show-remote-qr": { label: "QR for Remote Mobile Connection", category: "Remote" },
+	"block-prev": { label: "Previous command block", category: "Terminal" },
+	"block-next": { label: "Next command block", category: "Terminal" },
+	"block-fold-toggle": { label: "Toggle block fold", category: "Terminal" },
+	"block-search-toggle": { label: "Search in block", category: "Terminal" },
+	"toggle-compose-panel": { label: "Toggle compose panel", category: "Panels" },
 };
 
 /**
@@ -104,10 +112,7 @@ export function getActionEntries(handlers: ShortcutHandlers): ActionEntry[] {
 
 	const handlerMap: Partial<Record<ActionName, () => void>> = {
 		"new-terminal": handlers.createNewTerminal,
-		"close-terminal": () => {
-			const activeId = handlers.terminalIds()[0]; // simplified - close active
-			if (activeId) handlers.closeTerminal(activeId);
-		},
+		"close-terminal": handlers.closeActiveTabOrPane,
 		"reopen-closed-tab": handlers.reopenClosedTab,
 		"clear-terminal": handlers.clearTerminal,
 		"refresh-terminal": handlers.refreshTerminal,
@@ -116,6 +121,8 @@ export function getActionEntries(handlers: ShortcutHandlers): ActionEntry[] {
 		"edit-command": () => handlers.handleRunCommand(true),
 		"prev-tab": () => handlers.navigateTab("prev"),
 		"next-tab": () => handlers.navigateTab("next"),
+		"focus-last-terminal": handlers.focusLastTerminal,
+		"jump-waiting-terminal": handlers.jumpWaitingTerminal,
 		"zoom-in": handlers.zoomIn,
 		"zoom-out": handlers.zoomOut,
 		"zoom-reset": handlers.zoomReset,
@@ -128,6 +135,7 @@ export function getActionEntries(handlers: ShortcutHandlers): ActionEntry[] {
 		"toggle-notes": handlers.toggleNotesPanel,
 		"toggle-help": handlers.toggleHelpPanel,
 		"toggle-file-browser": handlers.toggleFileBrowserPanel,
+		"toggle-file-browser-content-search": handlers.requestFileBrowserContentSearch,
 		"toggle-outline": handlers.toggleOutlinePanel,
 		"toggle-git-ops": handlers.toggleGitOpsPanel,
 		"toggle-diff-scroll": handlers.toggleDiffScroll,
@@ -161,6 +169,12 @@ export function getActionEntries(handlers: ShortcutHandlers): ActionEntry[] {
 		"toggle-tunnels": () => tunnelPanelStore.toggle(),
 		"process-manager": handlers.toggleProcessManager,
 		"open-generators": handlers.toggleGenerators,
+		"show-remote-qr": handlers.showRemoteQr,
+		"block-prev": handlers.blockPrev,
+		"block-next": handlers.blockNext,
+		"block-fold-toggle": handlers.blockFoldToggle,
+		"block-search-toggle": handlers.blockSearchToggle,
+		"toggle-compose-panel": handlers.toggleComposePanel,
 	};
 
 	// Defensive dedup-by-id — today ACTION_META is a Record so ids are unique by
