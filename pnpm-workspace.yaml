@@ -1,3 +1,10 @@
+# pnpm 11 requires an explicit `packages` field whenever a workspace file exists;
+# without it every pnpm command aborts with "packages field missing or empty".
+# This repo is a single root package (the `website/` tree has its own workspace),
+# so the root is the only member.
+packages:
+  - "."
+
 allowBuilds:
   esbuild: true
 
