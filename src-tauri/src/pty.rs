@@ -5942,6 +5942,44 @@ pub(crate) fn spawn_reader_thread(
                 "unknown panic payload".to_string()
             };
             tracing::error!(session_id = %sid_for_panic, "READER THREAD PANICKED: {msg}");
+
+            // The clean-exit path emits PtyExit / SessionClosed (and their
+            // frontend `pty-exit-*` / `session-closed` events) INSIDE the
+            // catch_unwind block, so a panic reaches here having emitted none of
+            // them. Without these the frontend never learns the session died: the
+            // tab keeps its now-dead session id, no more grid frames arrive, and
+            // it sits blank with no way to recover. Re-emit them here so a panicked
+            // reader terminates the session exactly like a normal exit.
+            state_for_panic.emit_pty_event(crate::state::AppEvent::PtyExit {
+                session_id: sid_for_panic.clone(),
+            });
+            #[cfg(feature = "desktop")]
+            if let Some(app) = state_for_panic.app_handle.read().as_ref() {
+                let _ = app.emit(
+                    &format!("pty-exit-{sid_for_panic}"),
+                    serde_json::json!({ "session_id": sid_for_panic }),
+                );
+            }
+            state_for_panic.emit_pty_event(crate::state::AppEvent::SessionClosed {
+                session_id: sid_for_panic.clone(),
+                reason: "reader_panic".to_string(),
+            });
+            #[cfg(feature = "desktop")]
+            if let Some(app) = state_for_panic.app_handle.read().as_ref() {
+                let agent_type = state_for_panic
+                    .session_states
+                    .get(&sid_for_panic)
+                    .and_then(|s| s.agent_type.clone());
+                let _ = app.emit(
+                    "session-closed",
+                    serde_json::json!({
+                        "session_id": sid_for_panic,
+                        "reason": "reader_panic",
+                        "agent_type": agent_type,
+                    }),
+                );
+            }
+
             mark_session_exited(&sid_for_panic, &state_for_panic);
         }
     });
