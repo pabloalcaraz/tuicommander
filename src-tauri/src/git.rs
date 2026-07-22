@@ -94,16 +94,16 @@ pub(crate) fn canonical_repo_root(repo_path: &Path) -> PathBuf {
             }
             Err(_) => git_dir.clone(),
         };
-        let common_git_dir = common_git_dir.canonicalize().unwrap_or(common_git_dir);
+        // `dunce::canonicalize` resolves symlinks/`..` like `std`, but returns a
+        // plain `C:\...` path on Windows instead of a verbatim `\\?\C:\...` one.
+        // Verbatim paths break process cwd (see `pty::sanitize_cwd`), and this
+        // root is used exactly there when opening a repo's terminal.
+        let common_git_dir = dunce::canonicalize(&common_git_dir).unwrap_or(common_git_dir);
         if let Some(parent) = common_git_dir.parent() {
-            return parent
-                .canonicalize()
-                .unwrap_or_else(|_| parent.to_path_buf());
+            return dunce::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
         }
     }
-    repo_path
-        .canonicalize()
-        .unwrap_or_else(|_| repo_path.to_path_buf())
+    dunce::canonicalize(repo_path).unwrap_or_else(|_| repo_path.to_path_buf())
 }
 
 /// Read the current branch name from .git/HEAD (file I/O, no subprocess).
@@ -3294,7 +3294,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path().join("main");
         std::fs::create_dir_all(root.join(".git")).expect("mkdir .git");
-        assert_eq!(canonical_repo_root(&root), root.canonicalize().unwrap());
+        assert_eq!(canonical_repo_root(&root), dunce::canonicalize(&root).unwrap());
     }
 
     #[test]
@@ -3319,7 +3319,7 @@ mod tests {
 
         // Both the main repo and its linked worktree canonicalize to the same root.
         assert_eq!(canonical_repo_root(&wt), canonical_repo_root(&main));
-        assert_eq!(canonical_repo_root(&main), main.canonicalize().unwrap());
+        assert_eq!(canonical_repo_root(&main), dunce::canonicalize(&main).unwrap());
     }
 
     #[test]

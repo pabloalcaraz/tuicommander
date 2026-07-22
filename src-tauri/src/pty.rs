@@ -112,6 +112,32 @@ fn inject_unix_terminal_env(cmd: &mut CommandBuilder) {
     cmd.env("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS", "1");
 }
 
+/// Strip Windows extended-length (verbatim) path prefixes before a path is used
+/// as a shell working directory.
+///
+/// `std::fs::canonicalize` on Windows returns verbatim paths like
+/// `\\?\C:\Users\me\repo`. Passing that as a process cwd is broken end to end:
+/// PowerShell's location provider renders the ugly
+/// `Microsoft.PowerShell.Core\FileSystem::\\?\C:\...` prompt, and `CreateProcessW`
+/// plus most native executables refuse a verbatim working directory, so every
+/// non-git command fails. Git tolerates it, which is why only git appeared to work.
+///
+/// This is the belt-and-braces layer: the source is also fixed by canonicalizing
+/// with `dunce` (see `git::canonical_repo_root`), but any path that reaches a cwd
+/// is sanitized here so a stray verbatim prefix can never hit the shell again.
+///
+/// Pure string transform — a no-op on non-verbatim paths and on non-Windows.
+pub(crate) fn sanitize_cwd(cwd: String) -> String {
+    if let Some(rest) = cwd.strip_prefix(r"\\?\") {
+        // `\\?\UNC\server\share` is the verbatim form of `\\server\share`.
+        if let Some(unc) = rest.strip_prefix(r"UNC\") {
+            return format!(r"\\{unc}");
+        }
+        return rest.to_string();
+    }
+    cwd
+}
+
 /// Build a CommandBuilder for the given shell with platform-appropriate flags.
 ///
 /// The `shell` string may contain arguments (e.g. `wsl.exe -d Ubuntu`).
@@ -5966,7 +5992,7 @@ pub(crate) async fn create_pty(
         let mut cmd = build_shell_command(&shell);
 
         if let Some(ref cwd) = config.cwd {
-            let cwd = crate::cli::expand_tilde(cwd);
+            let cwd = sanitize_cwd(crate::cli::expand_tilde(cwd));
             // Don't convert drive paths for WSL — cmd.cwd() sets the Windows
             // process CWD via CreateProcessW, which can't resolve Linux paths.
             // Windows translates drive paths to /mnt/... automatically when
@@ -6112,7 +6138,7 @@ pub(crate) async fn spawn_session_for_agent(
     let mut cmd = build_shell_command(&shell);
 
     if let Some(ref dir) = cwd {
-        let expanded = crate::cli::expand_tilde(dir);
+        let expanded = sanitize_cwd(crate::cli::expand_tilde(dir));
         cmd.cwd(expanded);
     }
 
@@ -6256,7 +6282,7 @@ pub(crate) async fn create_pty_with_worktree(
         let shell = resolve_shell(pty_config.shell);
 
         let mut cmd = build_shell_command(&shell);
-        cmd.cwd(&worktree_path);
+        cmd.cwd(sanitize_cwd(worktree_path.to_string_lossy().into_owned()));
 
         // Inject OSC 133 shell integration (command block markers)
         crate::shell_integration::inject(&state.data_dir, &shell, &mut cmd);
@@ -8416,6 +8442,39 @@ pub(crate) async fn set_session_visible(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sanitize_cwd_strips_verbatim_drive_prefix() {
+        assert_eq!(
+            sanitize_cwd(r"\\?\C:\Users\Pablo\Proyectos\FacturPat".to_string()),
+            r"C:\Users\Pablo\Proyectos\FacturPat"
+        );
+    }
+
+    #[test]
+    fn sanitize_cwd_rewrites_verbatim_unc_prefix() {
+        assert_eq!(
+            sanitize_cwd(r"\\?\UNC\server\share\dir".to_string()),
+            r"\\server\share\dir"
+        );
+    }
+
+    #[test]
+    fn sanitize_cwd_leaves_plain_paths_untouched() {
+        assert_eq!(
+            sanitize_cwd(r"C:\Users\Pablo\repo".to_string()),
+            r"C:\Users\Pablo\repo"
+        );
+        assert_eq!(
+            sanitize_cwd("/home/pablo/repo".to_string()),
+            "/home/pablo/repo"
+        );
+        // A genuine UNC path (not verbatim) must pass through unchanged.
+        assert_eq!(
+            sanitize_cwd(r"\\server\share".to_string()),
+            r"\\server\share"
+        );
+    }
 
     /// The interactive-path threads raise their QoS to USER_INTERACTIVE. Verify
     /// the syscall actually takes effect by reading the class back on the same
