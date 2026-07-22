@@ -6453,6 +6453,36 @@ pub(crate) fn list_worktrees(state: State<'_, Arc<AppState>>) -> Vec<serde_json:
         .collect()
 }
 
+/// On Windows, ConPTY turns the input pipe into console INPUT_RECORDs held in a
+/// fixed-size buffer. One large write (a paste) can enqueue records faster than
+/// the child (PSReadLine) drains them, overflowing the buffer so only the tail
+/// survives — the classic "only the end of a long paste appears, and the rest
+/// does weird things" bug. Writing in bounded chunks, flushing each and briefly
+/// yielding lets the child drain between chunks.
+///
+/// Keystrokes and escape sequences (tiny) take the single-write fast path. On
+/// non-Windows PTYs the OS pipe already provides backpressure, so the whole
+/// `#[cfg(windows)]` branch compiles out and behaviour is unchanged.
+#[cfg(windows)]
+const PTY_PASTE_CHUNK_THRESHOLD: usize = 4096;
+#[cfg(windows)]
+const PTY_PASTE_CHUNK_BYTES: usize = 2048;
+
+fn write_pty_bytes(writer: &mut dyn Write, data: &[u8]) -> std::io::Result<()> {
+    #[cfg(windows)]
+    if data.len() > PTY_PASTE_CHUNK_THRESHOLD {
+        for chunk in data.chunks(PTY_PASTE_CHUNK_BYTES) {
+            writer.write_all(chunk)?;
+            writer.flush()?;
+            // Yield so ConPTY drains its input-record buffer before the next chunk.
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        return Ok(());
+    }
+    writer.write_all(data)?;
+    writer.flush()
+}
+
 /// Write data to a PTY session
 #[cfg(feature = "desktop")]
 #[tauri::command]
@@ -6494,14 +6524,8 @@ pub(crate) async fn write_pty(
         {
             let mut session = entry.lock();
             let lock_ms = t0.elapsed().as_millis();
-            session
-                .writer
-                .write_all(data.as_bytes())
+            write_pty_bytes(session.writer.as_mut(), data.as_bytes())
                 .map_err(|e| format!("Failed to write to PTY: {e}"))?;
-            session
-                .writer
-                .flush()
-                .map_err(|e| format!("Failed to flush PTY: {e}"))?;
             let total_ms = t0.elapsed().as_millis();
             if total_ms > 100 {
                 tracing::warn!(session_id = %session_id, lock_ms = %lock_ms, total_ms = %total_ms,
@@ -15330,6 +15354,49 @@ mod tests {
         let failure = write_all_with_progress(&mut writer, b"payload", 0).unwrap_err();
         assert_eq!(failure.0, 2, "partial progress must be retained");
         assert!(failure.1.contains("injected failure"));
+    }
+
+    /// Records the length of every `write` call so we can tell a single write
+    /// from a chunked one.
+    struct RecordingWriter {
+        writes: Vec<usize>,
+    }
+    impl std::io::Write for RecordingWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.writes.push(bytes.len());
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn write_pty_bytes_small_input_takes_single_write() {
+        let mut w = RecordingWriter { writes: Vec::new() };
+        write_pty_bytes(&mut w, b"ls -la\r").expect("write");
+        assert_eq!(w.writes, vec![7], "a keystroke-sized write must not be chunked");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn write_pty_bytes_large_input_is_chunked() {
+        let payload = vec![b'x'; PTY_PASTE_CHUNK_THRESHOLD + 1];
+        let mut w = RecordingWriter { writes: Vec::new() };
+        write_pty_bytes(&mut w, &payload).expect("write");
+        assert!(
+            w.writes.len() > 1,
+            "a paste over the threshold must be split into chunks"
+        );
+        assert!(
+            w.writes.iter().all(|&n| n <= PTY_PASTE_CHUNK_BYTES),
+            "no chunk may exceed the chunk size"
+        );
+        assert_eq!(
+            w.writes.iter().sum::<usize>(),
+            payload.len(),
+            "every byte of the paste must be written exactly once"
+        );
     }
 
     #[test]
