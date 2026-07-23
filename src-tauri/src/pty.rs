@@ -6454,28 +6454,42 @@ pub(crate) fn list_worktrees(state: State<'_, Arc<AppState>>) -> Vec<serde_json:
 }
 
 /// On Windows, ConPTY turns the input pipe into console INPUT_RECORDs held in a
-/// fixed-size buffer. One large write (a paste) can enqueue records faster than
-/// the child (PSReadLine) drains them, overflowing the buffer so only the tail
-/// survives — the classic "only the end of a long paste appears, and the rest
-/// does weird things" bug. Writing in bounded chunks, flushing each and briefly
-/// yielding lets the child drain between chunks.
+/// bounded buffer. One large write (a paste) can enqueue records faster than the
+/// child drains them; the buffer overflows and input is lost. For raw-mode
+/// children (Claude Code, vim, agents) the OLDEST records are dropped, so only
+/// the tail of a long paste survives — the classic "solo se pega la última
+/// parte" bug. (Cooked-mode line readers such as cmd additionally cap a single
+/// line at ~254 chars; that is an OS limit no pacing can lift.)
 ///
-/// Keystrokes and escape sequences (tiny) take the single-write fast path. On
-/// non-Windows PTYs the OS pipe already provides backpressure, so the whole
-/// `#[cfg(windows)]` branch compiles out and behaviour is unchanged.
+/// Mitigation: write in small bounded chunks, flushing each and — on Windows —
+/// briefly yielding so the child drains its input buffer between chunks. This is
+/// belt-and-suspenders with the bundled newer ConPTY (which backpressures the
+/// input pipe rather than dropping records): even if the yield is momentarily
+/// too short under CPU load, the OS-level flow control catches the overflow.
+///
+/// The chunk split + flush runs on EVERY platform so CI (which runs the Rust
+/// tests on Linux) actually exercises it; only the inter-chunk yield is
+/// Windows-specific, because Unix PTYs already backpressure via the OS pipe and
+/// the extra writes are harmless there. Keystrokes and escape sequences (tiny)
+/// take the single-write fast path, preserving typing latency.
+///
+/// Every PTY input path routes through here — desktop `write_pty` and the
+/// MCP/HTTP `write_pty_input`/`write_pty_input_pair` — so no path can regress to
+/// an unpaced single write.
+const PTY_PASTE_CHUNK_THRESHOLD: usize = 1024;
+const PTY_PASTE_CHUNK_BYTES: usize = 1024;
 #[cfg(windows)]
-const PTY_PASTE_CHUNK_THRESHOLD: usize = 4096;
-#[cfg(windows)]
-const PTY_PASTE_CHUNK_BYTES: usize = 2048;
+const PTY_PASTE_CHUNK_YIELD: std::time::Duration = std::time::Duration::from_millis(2);
 
-fn write_pty_bytes(writer: &mut dyn Write, data: &[u8]) -> std::io::Result<()> {
-    #[cfg(windows)]
+pub(crate) fn write_pty_bytes(writer: &mut dyn Write, data: &[u8]) -> std::io::Result<()> {
     if data.len() > PTY_PASTE_CHUNK_THRESHOLD {
         for chunk in data.chunks(PTY_PASTE_CHUNK_BYTES) {
             writer.write_all(chunk)?;
             writer.flush()?;
-            // Yield so ConPTY drains its input-record buffer before the next chunk.
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            // Yield so ConPTY drains its bounded input-record buffer before the
+            // next chunk. Windows-only: Unix PTYs backpressure via the OS pipe.
+            #[cfg(windows)]
+            std::thread::sleep(PTY_PASTE_CHUNK_YIELD);
         }
         return Ok(());
     }
@@ -15356,14 +15370,17 @@ mod tests {
         assert!(failure.1.contains("injected failure"));
     }
 
-    /// Records the length of every `write` call so we can tell a single write
-    /// from a chunked one.
+    /// Records the length of every `write` call (so we can tell a single write
+    /// from a chunked one) and the exact bytes written in order (so we can prove
+    /// a chunked paste loses and reorders nothing).
     struct RecordingWriter {
         writes: Vec<usize>,
+        data: Vec<u8>,
     }
     impl std::io::Write for RecordingWriter {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
             self.writes.push(bytes.len());
+            self.data.extend_from_slice(bytes);
             Ok(bytes.len())
         }
         fn flush(&mut self) -> std::io::Result<()> {
@@ -15373,16 +15390,22 @@ mod tests {
 
     #[test]
     fn write_pty_bytes_small_input_takes_single_write() {
-        let mut w = RecordingWriter { writes: Vec::new() };
+        let mut w = RecordingWriter { writes: Vec::new(), data: Vec::new() };
         write_pty_bytes(&mut w, b"ls -la\r").expect("write");
         assert_eq!(w.writes, vec![7], "a keystroke-sized write must not be chunked");
+        assert_eq!(w.data, b"ls -la\r", "the bytes must be delivered unchanged");
     }
 
-    #[cfg(windows)]
+    // Not gated to Windows: the chunk split + flush runs on every platform, so
+    // CI (which runs these tests on Linux) exercises the paste-truncation fix.
     #[test]
-    fn write_pty_bytes_large_input_is_chunked() {
-        let payload = vec![b'x'; PTY_PASTE_CHUNK_THRESHOLD + 1];
-        let mut w = RecordingWriter { writes: Vec::new() };
+    fn write_pty_bytes_large_input_is_chunked_in_order() {
+        // A varied payload just over 3 chunks + a ragged tail — so the test
+        // catches reordering, dropped bytes AND an off-by-one on the last chunk.
+        let payload: Vec<u8> = (0..PTY_PASTE_CHUNK_THRESHOLD * 3 + 7)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let mut w = RecordingWriter { writes: Vec::new(), data: Vec::new() };
         write_pty_bytes(&mut w, &payload).expect("write");
         assert!(
             w.writes.len() > 1,
@@ -15393,9 +15416,8 @@ mod tests {
             "no chunk may exceed the chunk size"
         );
         assert_eq!(
-            w.writes.iter().sum::<usize>(),
-            payload.len(),
-            "every byte of the paste must be written exactly once"
+            w.data, payload,
+            "every byte of the paste must be written exactly once, in order"
         );
     }
 
