@@ -2313,7 +2313,7 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 					.readText()
 					.then((text) => {
 						if (text) {
-							if (currentFrame?.bracketedPaste) {
+							if (currentFrame?.bracketedPaste || text.includes("\n")) {
 								writePty(`\x1b[200~${text}\x1b[201~`);
 							} else {
 								writePty(text);
@@ -2438,7 +2438,7 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 			}
 			const text = e.clipboardData?.getData("text");
 			if (text) {
-				if (currentFrame?.bracketedPaste) {
+				if (currentFrame?.bracketedPaste || text.includes("\n")) {
 					writePty(`\x1b[200~${text}\x1b[201~`);
 				} else {
 					writePty(text);

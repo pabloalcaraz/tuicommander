@@ -53,7 +53,12 @@ jobs:
     name: Frontend (typecheck + tests)
     runs-on: ubuntu-22.04
     steps:
+      # Fetch the `plugins` submodule: buildCleaner.test.ts imports the real
+      # plugin implementation from plugins/build-cleaner/main.js. Without this
+      # the checkout leaves plugins/ empty and vitest fails to resolve the import.
       - uses: actions/checkout@v6
+        with:
+          submodules: recursive
 
       - uses: pnpm/action-setup@v4
 

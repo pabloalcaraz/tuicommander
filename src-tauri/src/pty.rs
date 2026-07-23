@@ -112,6 +112,32 @@ fn inject_unix_terminal_env(cmd: &mut CommandBuilder) {
     cmd.env("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS", "1");
 }
 
+/// Strip Windows extended-length (verbatim) path prefixes before a path is used
+/// as a shell working directory.
+///
+/// `std::fs::canonicalize` on Windows returns verbatim paths like
+/// `\\?\C:\Users\me\repo`. Passing that as a process cwd is broken end to end:
+/// PowerShell's location provider renders the ugly
+/// `Microsoft.PowerShell.Core\FileSystem::\\?\C:\...` prompt, and `CreateProcessW`
+/// plus most native executables refuse a verbatim working directory, so every
+/// non-git command fails. Git tolerates it, which is why only git appeared to work.
+///
+/// This is the belt-and-braces layer: the source is also fixed by canonicalizing
+/// with `dunce` (see `git::canonical_repo_root`), but any path that reaches a cwd
+/// is sanitized here so a stray verbatim prefix can never hit the shell again.
+///
+/// Pure string transform — a no-op on non-verbatim paths and on non-Windows.
+pub(crate) fn sanitize_cwd(cwd: String) -> String {
+    if let Some(rest) = cwd.strip_prefix(r"\\?\") {
+        // `\\?\UNC\server\share` is the verbatim form of `\\server\share`.
+        if let Some(unc) = rest.strip_prefix(r"UNC\") {
+            return format!(r"\\{unc}");
+        }
+        return rest.to_string();
+    }
+    cwd
+}
+
 /// Build a CommandBuilder for the given shell with platform-appropriate flags.
 ///
 /// The `shell` string may contain arguments (e.g. `wsl.exe -d Ubuntu`).
@@ -5916,6 +5942,44 @@ pub(crate) fn spawn_reader_thread(
                 "unknown panic payload".to_string()
             };
             tracing::error!(session_id = %sid_for_panic, "READER THREAD PANICKED: {msg}");
+
+            // The clean-exit path emits PtyExit / SessionClosed (and their
+            // frontend `pty-exit-*` / `session-closed` events) INSIDE the
+            // catch_unwind block, so a panic reaches here having emitted none of
+            // them. Without these the frontend never learns the session died: the
+            // tab keeps its now-dead session id, no more grid frames arrive, and
+            // it sits blank with no way to recover. Re-emit them here so a panicked
+            // reader terminates the session exactly like a normal exit.
+            state_for_panic.emit_pty_event(crate::state::AppEvent::PtyExit {
+                session_id: sid_for_panic.clone(),
+            });
+            #[cfg(feature = "desktop")]
+            if let Some(app) = state_for_panic.app_handle.read().as_ref() {
+                let _ = app.emit(
+                    &format!("pty-exit-{sid_for_panic}"),
+                    serde_json::json!({ "session_id": sid_for_panic }),
+                );
+            }
+            state_for_panic.emit_pty_event(crate::state::AppEvent::SessionClosed {
+                session_id: sid_for_panic.clone(),
+                reason: "reader_panic".to_string(),
+            });
+            #[cfg(feature = "desktop")]
+            if let Some(app) = state_for_panic.app_handle.read().as_ref() {
+                let agent_type = state_for_panic
+                    .session_states
+                    .get(&sid_for_panic)
+                    .and_then(|s| s.agent_type.clone());
+                let _ = app.emit(
+                    "session-closed",
+                    serde_json::json!({
+                        "session_id": sid_for_panic,
+                        "reason": "reader_panic",
+                        "agent_type": agent_type,
+                    }),
+                );
+            }
+
             mark_session_exited(&sid_for_panic, &state_for_panic);
         }
     });
@@ -5966,7 +6030,7 @@ pub(crate) async fn create_pty(
         let mut cmd = build_shell_command(&shell);
 
         if let Some(ref cwd) = config.cwd {
-            let cwd = crate::cli::expand_tilde(cwd);
+            let cwd = sanitize_cwd(crate::cli::expand_tilde(cwd));
             // Don't convert drive paths for WSL — cmd.cwd() sets the Windows
             // process CWD via CreateProcessW, which can't resolve Linux paths.
             // Windows translates drive paths to /mnt/... automatically when
@@ -6112,7 +6176,7 @@ pub(crate) async fn spawn_session_for_agent(
     let mut cmd = build_shell_command(&shell);
 
     if let Some(ref dir) = cwd {
-        let expanded = crate::cli::expand_tilde(dir);
+        let expanded = sanitize_cwd(crate::cli::expand_tilde(dir));
         cmd.cwd(expanded);
     }
 
@@ -6256,7 +6320,7 @@ pub(crate) async fn create_pty_with_worktree(
         let shell = resolve_shell(pty_config.shell);
 
         let mut cmd = build_shell_command(&shell);
-        cmd.cwd(&worktree_path);
+        cmd.cwd(sanitize_cwd(worktree_path.to_string_lossy().into_owned()));
 
         // Inject OSC 133 shell integration (command block markers)
         crate::shell_integration::inject(&state.data_dir, &shell, &mut cmd);
@@ -6389,6 +6453,36 @@ pub(crate) fn list_worktrees(state: State<'_, Arc<AppState>>) -> Vec<serde_json:
         .collect()
 }
 
+/// On Windows, ConPTY turns the input pipe into console INPUT_RECORDs held in a
+/// fixed-size buffer. One large write (a paste) can enqueue records faster than
+/// the child (PSReadLine) drains them, overflowing the buffer so only the tail
+/// survives — the classic "only the end of a long paste appears, and the rest
+/// does weird things" bug. Writing in bounded chunks, flushing each and briefly
+/// yielding lets the child drain between chunks.
+///
+/// Keystrokes and escape sequences (tiny) take the single-write fast path. On
+/// non-Windows PTYs the OS pipe already provides backpressure, so the whole
+/// `#[cfg(windows)]` branch compiles out and behaviour is unchanged.
+#[cfg(windows)]
+const PTY_PASTE_CHUNK_THRESHOLD: usize = 4096;
+#[cfg(windows)]
+const PTY_PASTE_CHUNK_BYTES: usize = 2048;
+
+fn write_pty_bytes(writer: &mut dyn Write, data: &[u8]) -> std::io::Result<()> {
+    #[cfg(windows)]
+    if data.len() > PTY_PASTE_CHUNK_THRESHOLD {
+        for chunk in data.chunks(PTY_PASTE_CHUNK_BYTES) {
+            writer.write_all(chunk)?;
+            writer.flush()?;
+            // Yield so ConPTY drains its input-record buffer before the next chunk.
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        return Ok(());
+    }
+    writer.write_all(data)?;
+    writer.flush()
+}
+
 /// Write data to a PTY session
 #[cfg(feature = "desktop")]
 #[tauri::command]
@@ -6430,14 +6524,8 @@ pub(crate) async fn write_pty(
         {
             let mut session = entry.lock();
             let lock_ms = t0.elapsed().as_millis();
-            session
-                .writer
-                .write_all(data.as_bytes())
+            write_pty_bytes(session.writer.as_mut(), data.as_bytes())
                 .map_err(|e| format!("Failed to write to PTY: {e}"))?;
-            session
-                .writer
-                .flush()
-                .map_err(|e| format!("Failed to flush PTY: {e}"))?;
             let total_ms = t0.elapsed().as_millis();
             if total_ms > 100 {
                 tracing::warn!(session_id = %session_id, lock_ms = %lock_ms, total_ms = %total_ms,
@@ -8416,6 +8504,39 @@ pub(crate) async fn set_session_visible(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sanitize_cwd_strips_verbatim_drive_prefix() {
+        assert_eq!(
+            sanitize_cwd(r"\\?\C:\Users\Pablo\Proyectos\FacturPat".to_string()),
+            r"C:\Users\Pablo\Proyectos\FacturPat"
+        );
+    }
+
+    #[test]
+    fn sanitize_cwd_rewrites_verbatim_unc_prefix() {
+        assert_eq!(
+            sanitize_cwd(r"\\?\UNC\server\share\dir".to_string()),
+            r"\\server\share\dir"
+        );
+    }
+
+    #[test]
+    fn sanitize_cwd_leaves_plain_paths_untouched() {
+        assert_eq!(
+            sanitize_cwd(r"C:\Users\Pablo\repo".to_string()),
+            r"C:\Users\Pablo\repo"
+        );
+        assert_eq!(
+            sanitize_cwd("/home/pablo/repo".to_string()),
+            "/home/pablo/repo"
+        );
+        // A genuine UNC path (not verbatim) must pass through unchanged.
+        assert_eq!(
+            sanitize_cwd(r"\\server\share".to_string()),
+            r"\\server\share"
+        );
+    }
 
     /// The interactive-path threads raise their QoS to USER_INTERACTIVE. Verify
     /// the syscall actually takes effect by reading the class back on the same
@@ -15233,6 +15354,49 @@ mod tests {
         let failure = write_all_with_progress(&mut writer, b"payload", 0).unwrap_err();
         assert_eq!(failure.0, 2, "partial progress must be retained");
         assert!(failure.1.contains("injected failure"));
+    }
+
+    /// Records the length of every `write` call so we can tell a single write
+    /// from a chunked one.
+    struct RecordingWriter {
+        writes: Vec<usize>,
+    }
+    impl std::io::Write for RecordingWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.writes.push(bytes.len());
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn write_pty_bytes_small_input_takes_single_write() {
+        let mut w = RecordingWriter { writes: Vec::new() };
+        write_pty_bytes(&mut w, b"ls -la\r").expect("write");
+        assert_eq!(w.writes, vec![7], "a keystroke-sized write must not be chunked");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn write_pty_bytes_large_input_is_chunked() {
+        let payload = vec![b'x'; PTY_PASTE_CHUNK_THRESHOLD + 1];
+        let mut w = RecordingWriter { writes: Vec::new() };
+        write_pty_bytes(&mut w, &payload).expect("write");
+        assert!(
+            w.writes.len() > 1,
+            "a paste over the threshold must be split into chunks"
+        );
+        assert!(
+            w.writes.iter().all(|&n| n <= PTY_PASTE_CHUNK_BYTES),
+            "no chunk may exceed the chunk size"
+        );
+        assert_eq!(
+            w.writes.iter().sum::<usize>(),
+            payload.len(),
+            "every byte of the paste must be written exactly once"
+        );
     }
 
     #[test]

@@ -8803,6 +8803,7 @@ dependencies = [
  "dashmap",
  "dirs",
  "drag",
+ "dunce",
  "futures-util",
  "genai",
  "gh-token",
