@@ -389,6 +389,9 @@ export function useGitOperations(deps: GitOperationsDeps) {
 				const storeIds = new Set(terminalsStore.getIds());
 				const toRemove: string[] = [];
 				const terminalsToClose: string[] = [];
+				// Branches whose linked worktree git no longer lists, pending an on-disk
+				// existence check before we close their terminals.
+				const closeCandidates: Array<{ branchName: string; worktreePath: string }> = [];
 
 				// If activeBranch is no longer a worktree, find its replacement:
 				// the worktree branch that occupies the same path (HEAD moved).
@@ -442,20 +445,12 @@ export function useGitOperations(deps: GitOperationsDeps) {
 							// `\\?\C:\repo`). A raw compare called the main checkout a "deleted
 							// linked worktree" and killed its terminals — including running agents —
 							// every time an external `git checkout -b` moved HEAD.
-							const isLinkedWorktree = branchState.worktreePath && !pathsEqual(branchState.worktreePath, repoPath);
-							if (isLinkedWorktree) {
-								// Linked worktree was removed externally — close its terminals
-								appLogger.info(
-									"terminal",
-									`refreshAllBranchStats: closing terminals for deleted worktree "${branchName}"`,
-									{
-										terminals: branchState.terminals,
-										worktreePath: branchState.worktreePath,
-									},
-								);
-								terminalsToClose.push(...branchState.terminals.filter((id) => storeIds.has(id)));
-								toRemove.push(branchName);
-								markProcessed(repoPath, branchName);
+							const linkedPath = branchState.worktreePath;
+							if (linkedPath && !pathsEqual(linkedPath, repoPath)) {
+								// Don't take git's word for it: `worktree_paths` dropping a branch is
+								// only evidence that git stopped listing it, and killing a live agent
+								// is unrecoverable. Confirm on disk after the loop.
+								closeCandidates.push({ branchName, worktreePath: linkedPath });
 							} else {
 								appLogger.info("terminal", `refreshAllBranchStats: keeping "${branchName}" — has live terminals`, {
 									terminals: branchState.terminals,
@@ -465,6 +460,54 @@ export function useGitOperations(deps: GitOperationsDeps) {
 						}
 						toRemove.push(branchName);
 						markProcessed(repoPath, branchName);
+					}
+				}
+
+				// Last line of defence before killing PTYs: a branch vanishing from
+				// `worktree_paths` is not proof that its directory is gone. Any bug that
+				// mis-attributes a path (or a transient git read) would otherwise take a
+				// running agent with it, and a killed agent cannot be resumed. Probe the
+				// filesystem and only close terminals whose worktree really is gone;
+				// anything we cannot confirm as deleted is kept and retried next refresh.
+				if (closeCandidates.length > 0) {
+					const probes = await Promise.all(
+						closeCandidates.map(async (candidate) => {
+							try {
+								const stat = await invoke<{ exists: boolean; is_dir: boolean }>("stat_path", {
+									path: candidate.worktreePath,
+								});
+								return { candidate, deleted: stat?.exists === false };
+							} catch (err) {
+								appLogger.warn(
+									"terminal",
+									`refreshAllBranchStats: stat_path failed for "${candidate.branchName}" — keeping its terminals`,
+									{ worktreePath: candidate.worktreePath, error: String(err) },
+								);
+								return { candidate, deleted: false };
+							}
+						}),
+					);
+					if (refreshGeneration.get(repoPath) !== gen) return; // stale after probe
+
+					for (const { candidate, deleted } of probes) {
+						const branchState = repositoriesStore.get(repoPath)?.branches[candidate.branchName];
+						if (!branchState) continue; // user removed it while we were probing
+						if (!deleted) {
+							appLogger.info(
+								"terminal",
+								`refreshAllBranchStats: keeping "${candidate.branchName}" — git dropped it but the worktree is still on disk`,
+								{ worktreePath: candidate.worktreePath, terminals: branchState.terminals },
+							);
+							continue;
+						}
+						appLogger.info(
+							"terminal",
+							`refreshAllBranchStats: closing terminals for deleted worktree "${candidate.branchName}"`,
+							{ terminals: branchState.terminals, worktreePath: candidate.worktreePath },
+						);
+						terminalsToClose.push(...branchState.terminals.filter((id) => storeIds.has(id)));
+						toRemove.push(candidate.branchName);
+						markProcessed(repoPath, candidate.branchName);
 					}
 				}
 
