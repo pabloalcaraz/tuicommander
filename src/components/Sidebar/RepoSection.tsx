@@ -23,6 +23,7 @@ import { compareBranches } from "../../utils/branchSort";
 import { keyFor } from "../../utils/hotkey";
 import { navigateToTerminal } from "../../utils/navigateToTerminal";
 import { handleOpenUrl } from "../../utils/openUrl";
+import { pathsEqual } from "../../utils/pathUtils";
 import { timeSync } from "../../utils/perfTrace";
 import type { ContextMenuItem } from "../ContextMenu";
 import { ContextMenu, createContextMenu } from "../ContextMenu";
@@ -341,8 +342,11 @@ export const BranchItem: Component<{
 	const contextMenuItems = (): ContextMenuItem[] => {
 		const isShell = props.branch.isShell;
 		const hasBranch = !isShell && !!props.branch.name;
-		const isLinkedWorktree = !!props.branch.worktreePath && props.branch.worktreePath !== props.repoPath;
-		const isMainWorktree = props.branch.worktreePath === props.repoPath;
+		// Normalized compare: the two spellings of the same directory can differ in
+		// separators, casing or a leftover `\\?\` prefix, and a raw `!==` would then
+		// offer "Remove Worktree" on the main checkout.
+		const isLinkedWorktree = !!props.branch.worktreePath && !pathsEqual(props.branch.worktreePath, props.repoPath);
+		const isMainWorktree = !!props.branch.worktreePath && pathsEqual(props.branch.worktreePath, props.repoPath);
 
 		// Group 1 — quick actions, ordered by real usage frequency (Copy Path and the
 		// GitHub links are the most-used, so they lead).
@@ -573,13 +577,13 @@ export const BranchItem: Component<{
 					{/* Only linked worktrees can be removed — never the main checkout, whose
 					    worktreePath IS the repo root. `isMain` is name-based (main/master/
 					    develop) so it misses a main checkout sitting on a differently-named
-					    branch; the worktreePath !== repoPath test is the reliable signal and
+					    branch; the worktreePath-vs-repoPath test is the reliable signal and
 					    mirrors the context-menu `isLinkedWorktree` predicate. */}
 					<Show
 						when={
 							!props.branch.isMain &&
 							props.branch.worktreePath &&
-							props.branch.worktreePath !== props.repoPath &&
+							!pathsEqual(props.branch.worktreePath, props.repoPath) &&
 							props.canRemove
 						}
 					>

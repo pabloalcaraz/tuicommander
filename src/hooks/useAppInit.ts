@@ -14,7 +14,7 @@ import { applyAppTheme, listenForThemeChanges, loadThemes } from "../themes";
 import { isTauri } from "../transport";
 import type { SavedTerminal } from "../types";
 import { assignTabToActiveGroup } from "../utils/paneTabAssign";
-import { isAbsolutePath, normalizeSep, pathStartsWith, pathStripPrefix } from "../utils/pathUtils";
+import { isAbsolutePath, normalizeSep, pathStartsWith, pathStripPrefix, pathsEqual } from "../utils/pathUtils";
 import { createRevisionCoalescer } from "./revisionCoalescer";
 
 /** Track PTY sessions created by the browser client so we only close our own on unload */
@@ -269,7 +269,11 @@ export async function initApp(deps: AppInitDeps) {
 		const isMainCheckout =
 			oldBranch &&
 			oldBranchState &&
-			(oldBranchState.worktreePath === null || oldBranchState.worktreePath === repo_path);
+			// Normalized compare: a raw `===` missed the main checkout whenever the two
+			// spellings differed (separators, casing, or a stored `\\?\` prefix), so the
+			// rename fell through to the "linked worktree" path and left a stale entry
+			// behind for `refreshAllBranchStats` to reap — terminals and all.
+			(oldBranchState.worktreePath === null || pathsEqual(oldBranchState.worktreePath, repo_path));
 
 		if (isMainCheckout) {
 			// Main checkout (not a worktree): rename the single branch entry so

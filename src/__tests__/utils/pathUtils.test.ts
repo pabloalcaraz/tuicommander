@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+	canonicalizeForCompare,
 	isAbsolutePath,
 	joinPath,
 	normalizeSep,
@@ -8,7 +9,9 @@ import {
 	pathParts,
 	pathStartsWith,
 	pathStripPrefix,
+	pathsEqual,
 	replaceBasename,
+	stripVerbatimPrefix,
 } from "../../utils/pathUtils";
 
 // ---------------------------------------------------------------------------
@@ -72,6 +75,86 @@ describe("normalizeSep", () => {
 });
 
 // ---------------------------------------------------------------------------
+// stripVerbatimPrefix
+// ---------------------------------------------------------------------------
+
+describe("stripVerbatimPrefix", () => {
+	it("strips the drive-letter verbatim prefix", () => {
+		expect(stripVerbatimPrefix("\\\\?\\C:\\Users\\Pablo\\Proyectos\\standapp")).toBe(
+			"C:\\Users\\Pablo\\Proyectos\\standapp",
+		);
+	});
+
+	it("rewrites the verbatim UNC prefix to a plain UNC path", () => {
+		expect(stripVerbatimPrefix("\\\\?\\UNC\\server\\share\\repo")).toBe("\\\\server\\share\\repo");
+	});
+
+	it("also handles a verbatim prefix whose separators were already normalized", () => {
+		expect(stripVerbatimPrefix("//?/C:/repo")).toBe("C:/repo");
+		expect(stripVerbatimPrefix("//?/UNC/server/share")).toBe("\\\\server/share");
+	});
+
+	it("leaves non-verbatim paths untouched", () => {
+		expect(stripVerbatimPrefix("C:\\repo")).toBe("C:\\repo");
+		expect(stripVerbatimPrefix("/home/pablo/repo")).toBe("/home/pablo/repo");
+		// A genuine UNC path is not verbatim.
+		expect(stripVerbatimPrefix("\\\\server\\share")).toBe("\\\\server\\share");
+		expect(stripVerbatimPrefix("")).toBe("");
+	});
+});
+
+// ---------------------------------------------------------------------------
+// canonicalizeForCompare / pathsEqual
+// ---------------------------------------------------------------------------
+
+describe("canonicalizeForCompare", () => {
+	it("case-folds Windows-style paths", () => {
+		expect(canonicalizeForCompare("C:\\Users\\Pablo\\Repo")).toBe("c:/users/pablo/repo");
+		expect(canonicalizeForCompare("\\\\Server\\Share")).toBe("//server/share");
+	});
+
+	it("preserves case on Unix paths, whose filesystems are case-sensitive", () => {
+		expect(canonicalizeForCompare("/Users/Pablo/Repo")).toBe("/Users/Pablo/Repo");
+	});
+
+	it("drops trailing separators", () => {
+		expect(canonicalizeForCompare("/repo///")).toBe("/repo");
+		expect(canonicalizeForCompare("C:\\repo\\")).toBe("c:/repo");
+	});
+});
+
+describe("pathsEqual", () => {
+	// The regression this whole helper exists for: `git worktree list` prints
+	// `C:/repo`, the directory picker gives `C:\repo`, and anything that went
+	// through `std::fs::canonicalize` gives `\\?\C:\repo`. A raw `!==` read those
+	// as three different directories and closed the main checkout's terminals.
+	it("treats the three Windows spellings of one directory as equal", () => {
+		const picker = "C:\\Users\\Pablo\\Proyectos\\standapp";
+		const gitCli = "C:/Users/Pablo/Proyectos/standapp";
+		const verbatim = "\\\\?\\C:\\Users\\Pablo\\Proyectos\\standapp";
+
+		expect(pathsEqual(picker, gitCli)).toBe(true);
+		expect(pathsEqual(picker, verbatim)).toBe(true);
+		expect(pathsEqual(gitCli, verbatim)).toBe(true);
+	});
+
+	it("ignores drive-letter and path casing on Windows paths", () => {
+		expect(pathsEqual("c:\\users\\pablo\\repo", "C:\\Users\\Pablo\\Repo")).toBe(true);
+	});
+
+	it("respects casing on Unix paths", () => {
+		expect(pathsEqual("/Users/Pablo/repo", "/users/pablo/repo")).toBe(false);
+	});
+
+	it("distinct directories stay distinct", () => {
+		expect(pathsEqual("C:\\repo\\a", "C:\\repo\\b")).toBe(false);
+		expect(pathsEqual("C:\\repo", "D:\\repo")).toBe(false);
+		// A sibling whose name merely shares a prefix is not the same directory.
+		expect(pathsEqual("C:\\repo", "C:\\repository")).toBe(false);
+	});
+});
+
+// ---------------------------------------------------------------------------
 // pathStartsWith
 // ---------------------------------------------------------------------------
 
@@ -117,6 +200,16 @@ describe("pathStartsWith", () => {
 	it("empty prefix matches everything", () => {
 		expect(pathStartsWith("/any/path", "")).toBe(true);
 	});
+
+	it("tolerates a verbatim prefix on either side", () => {
+		expect(pathStartsWith("\\\\?\\C:\\repo\\src", "C:\\repo")).toBe(true);
+		expect(pathStartsWith("C:\\repo\\src", "\\\\?\\C:\\repo")).toBe(true);
+	});
+
+	it("ignores casing on Windows paths but not on Unix paths", () => {
+		expect(pathStartsWith("C:\\REPO\\src", "c:\\repo")).toBe(true);
+		expect(pathStartsWith("/REPO/src", "/repo")).toBe(false);
+	});
 });
 
 // ---------------------------------------------------------------------------
@@ -150,6 +243,15 @@ describe("pathStripPrefix", () => {
 
 	it("partial directory name is NOT stripped", () => {
 		expect(pathStripPrefix("/Users/develop/file", "/Users/dev")).toBeNull();
+	});
+
+	it("matches across verbatim and casing differences", () => {
+		expect(pathStripPrefix("\\\\?\\C:\\repo\\src\\file.ts", "C:\\repo")).toBe("src/file.ts");
+		expect(pathStripPrefix("C:\\REPO\\src\\file.ts", "c:\\repo")).toBe("src/file.ts");
+	});
+
+	it("returns the remainder with its original casing, not the folded form", () => {
+		expect(pathStripPrefix("C:\\repo\\Src\\Main.rs", "C:\\repo")).toBe("Src/Main.rs");
 	});
 });
 

@@ -17,7 +17,7 @@ import { isTauri, rpc } from "../transport";
 import type { RepoInfo } from "../types";
 import { verifyAndBuildResumeCommand } from "../utils/agentSession";
 import { assignTabToActiveGroup } from "../utils/paneTabAssign";
-import { pathStartsWith } from "../utils/pathUtils";
+import { pathStartsWith, pathsEqual } from "../utils/pathUtils";
 import { markPerf, timeBatch } from "../utils/perfTrace";
 import { effectiveMergeMethod, isMergeMethodNotAllowed } from "../utils/prMerge";
 import { escapeShellArg } from "../utils/shell";
@@ -398,7 +398,7 @@ export function useGitOperations(deps: GitOperationsDeps) {
 					const activePath = currentRepo.branches[active]?.worktreePath;
 					if (activePath) {
 						for (const [wtBranch, wtPath] of Object.entries(worktreePaths)) {
-							if (wtPath === activePath) {
+							if (pathsEqual(wtPath, activePath)) {
 								activeBranchReplacement = wtBranch;
 								break;
 							}
@@ -437,7 +437,12 @@ export function useGitOperations(deps: GitOperationsDeps) {
 						const branchState = currentRepo.branches[branchName];
 						const hasLiveTerminals = branchState?.terminals.some((id) => storeIds.has(id));
 						if (hasLiveTerminals) {
-							const isLinkedWorktree = branchState.worktreePath && branchState.worktreePath !== repoPath;
+							// `pathsEqual`, not `!==`: the same directory reaches us spelled three
+							// ways (picker `C:\repo`, git CLI `C:/repo`, canonicalized
+							// `\\?\C:\repo`). A raw compare called the main checkout a "deleted
+							// linked worktree" and killed its terminals — including running agents —
+							// every time an external `git checkout -b` moved HEAD.
+							const isLinkedWorktree = branchState.worktreePath && !pathsEqual(branchState.worktreePath, repoPath);
 							if (isLinkedWorktree) {
 								// Linked worktree was removed externally — close its terminals
 								appLogger.info(
@@ -666,7 +671,9 @@ export function useGitOperations(deps: GitOperationsDeps) {
 		if (!repoSettingsStore.getEffective(repoPath)?.autoArchiveMerged) return;
 
 		const mergedLinkedBranches = Object.values(branches).filter(
-			(b) => b.isMerged && b.worktreePath !== null && b.worktreePath !== repoPath,
+			// Same normalized compare as `refreshAllBranchStats`: a raw `!==` would
+			// classify the main checkout as a linked worktree and archive it.
+			(b) => b.isMerged && b.worktreePath !== null && !pathsEqual(b.worktreePath, repoPath),
 		);
 		if (mergedLinkedBranches.length === 0) return;
 
@@ -827,7 +834,7 @@ export function useGitOperations(deps: GitOperationsDeps) {
 					if (branchTermSet.has(id)) continue;
 					if (claimedIds.has(id)) continue;
 					const term = terminalsStore.get(id);
-					if (term?.cwd === branch.worktreePath) {
+					if (term?.cwd && pathsEqual(term.cwd, branch.worktreePath)) {
 						repositoriesStore.addTerminalToBranch(repoPath, branchName, id);
 					}
 				}
@@ -1650,7 +1657,10 @@ export function useGitOperations(deps: GitOperationsDeps) {
 	const closeTerminalsInWorktree = async (wtPath: string) => {
 		for (const termId of terminalsStore.getIds()) {
 			const terminal = terminalsStore.get(termId);
-			if (terminal?.cwd && (terminal.cwd === wtPath || terminal.cwd.startsWith(wtPath + "/"))) {
+			// `pathStartsWith` handles separator, casing and verbatim-prefix mismatches;
+			// the raw `startsWith` only matched `/`-separated same-case paths, so on
+			// Windows it silently closed nothing.
+			if (terminal?.cwd && pathStartsWith(terminal.cwd, wtPath)) {
 				await deps.closeTerminal(termId, true);
 			}
 		}
@@ -1937,7 +1947,9 @@ export function useGitOperations(deps: GitOperationsDeps) {
 		repositoriesStore.setBranch(repoPath, newBranch, { worktreePath: repoPath });
 
 		// Find all branches on the main worktree that aren't the new branch
-		const stale = Object.values(repo.branches).filter((b) => b.worktreePath === repoPath && b.name !== newBranch);
+		const stale = Object.values(repo.branches).filter(
+			(b) => b.worktreePath !== null && pathsEqual(b.worktreePath, repoPath) && b.name !== newBranch,
+		);
 
 		batch(() => {
 			for (const branch of stale) {
@@ -1954,7 +1966,9 @@ export function useGitOperations(deps: GitOperationsDeps) {
 		if (!repo) return;
 
 		// Pre-flight: check for busy terminals on the main worktree
-		const mainWorktreeBranches = Object.values(repo.branches).filter((b) => b.worktreePath === repoPath);
+		const mainWorktreeBranches = Object.values(repo.branches).filter(
+			(b) => b.worktreePath !== null && pathsEqual(b.worktreePath, repoPath),
+		);
 		for (const branch of mainWorktreeBranches) {
 			for (const termId of branch.terminals) {
 				const term = terminalsStore.get(termId);
