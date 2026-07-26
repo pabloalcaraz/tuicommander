@@ -138,6 +138,18 @@ pub(crate) fn sanitize_cwd(cwd: String) -> String {
     cwd
 }
 
+/// Sanitize the cwd that gets *recorded* on a `PtySession`, not just the one handed
+/// to `cmd.cwd()`.
+///
+/// This value is what `session-created` and `list_active_sessions` report, and the
+/// frontend stores it as `terminal.cwd` / `savedTerminals[].cwd` and compares it
+/// against repo and worktree paths to decide which branch owns a tab. A verbatim
+/// `\\?\` prefix matches nothing, so tabs got misattributed and cwd-scoped closes
+/// hit the wrong sessions.
+pub(crate) fn record_session_cwd(cwd: Option<String>) -> Option<String> {
+    cwd.map(sanitize_cwd)
+}
+
 /// Build a CommandBuilder for the given shell with platform-appropriate flags.
 ///
 /// The `shell` string may contain arguments (e.g. `wsl.exe -d Ubuntu`).
@@ -6098,7 +6110,7 @@ pub(crate) async fn create_pty(
             _child: child,
             paused: paused.clone(),
             worktree: None,
-            cwd: config.cwd,
+            cwd: record_session_cwd(config.cwd),
             display_name: None,
             shell: shell.clone(),
         }),
@@ -6361,7 +6373,7 @@ pub(crate) async fn create_pty_with_worktree(
     };
 
     let branch = worktree.branch.clone();
-    let worktree_cwd = Some(worktree.path.to_string_lossy().to_string());
+    let worktree_cwd = record_session_cwd(Some(worktree.path.to_string_lossy().into_owned()));
 
     // Store session with worktree info (master handle kept for resize support)
     let paused = Arc::new(AtomicBool::new(false));
@@ -8550,6 +8562,35 @@ mod tests {
             sanitize_cwd(r"\\server\share".to_string()),
             r"\\server\share"
         );
+    }
+
+    /// The cwd stored on a `PtySession` is reported to the frontend, which matches
+    /// it against repo/worktree paths to attribute a tab to a branch. Both
+    /// `create_pty` and `create_pty_with_worktree` route through this helper so
+    /// neither can leak a verbatim prefix into the store again.
+    #[test]
+    fn record_session_cwd_sanitizes_verbatim_paths() {
+        assert_eq!(
+            record_session_cwd(Some(r"\\?\C:\Users\Pablo\Proyectos\standapp".to_string())),
+            Some(r"C:\Users\Pablo\Proyectos\standapp".to_string())
+        );
+        assert_eq!(
+            record_session_cwd(Some(r"\\?\UNC\server\share\repo".to_string())),
+            Some(r"\\server\share\repo".to_string())
+        );
+    }
+
+    #[test]
+    fn record_session_cwd_preserves_plain_and_absent_paths() {
+        assert_eq!(
+            record_session_cwd(Some(r"C:\Users\Pablo\repo".to_string())),
+            Some(r"C:\Users\Pablo\repo".to_string())
+        );
+        assert_eq!(
+            record_session_cwd(Some("/home/pablo/repo".to_string())),
+            Some("/home/pablo/repo".to_string())
+        );
+        assert_eq!(record_session_cwd(None), None);
     }
 
     /// The interactive-path threads raise their QoS to USER_INTERACTIVE. Verify
