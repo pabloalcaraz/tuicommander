@@ -2,6 +2,7 @@ import { batch } from "solid-js";
 import { createStore, produce } from "solid-js/store";
 import { invoke } from "../invoke";
 import type { SavedTerminal } from "../types";
+import { stripVerbatimPrefix } from "../utils/pathUtils";
 import { markPerf } from "../utils/perfTrace";
 import { appLogger } from "./appLogger";
 import { makeBranchKey } from "./tabManager";
@@ -91,6 +92,41 @@ export interface GroupedLayout {
 function isMainBranch(branchName: string): boolean {
 	const mainBranches = ["main", "master", "develop", "development", "dev"];
 	return mainBranches.includes(branchName.toLowerCase());
+}
+
+/** Strip Windows verbatim (`\\?\`) prefixes from persisted paths, in place.
+ *
+ * Older builds recorded `worktreePath` and `savedTerminals[].cwd` straight from
+ * Rust's `canonicalize`, which returns `\\?\C:\repo` on Windows. Those values
+ * live on in the saved config, and a verbatim path matches nothing when compared
+ * against a repo path: the main checkout then looks like a linked worktree that
+ * git no longer lists, and its terminals get closed. Fixing the writers doesn't
+ * clean state already on disk, so normalize it once on load.
+ *
+ * Returns true when something changed, so the caller can re-persist.
+ */
+function migratePersistedPaths(repos: Record<string, RepositoryState>): boolean {
+	let changed = false;
+	for (const repo of Object.values(repos)) {
+		for (const branch of Object.values(repo.branches)) {
+			if (branch.worktreePath) {
+				const fixed = stripVerbatimPrefix(branch.worktreePath);
+				if (fixed !== branch.worktreePath) {
+					branch.worktreePath = fixed;
+					changed = true;
+				}
+			}
+			for (const saved of branch.savedTerminals ?? []) {
+				if (!saved.cwd) continue;
+				const fixed = stripVerbatimPrefix(saved.cwd);
+				if (fixed !== saved.cwd) {
+					saved.cwd = fixed;
+					changed = true;
+				}
+			}
+		}
+	}
+	return changed;
 }
 
 const SAVE_DEBOUNCE_MS = 500;
@@ -185,6 +221,7 @@ function createRepositoriesStore() {
 	const actions = {
 		/** Load repos from Rust backend; migrate from localStorage on first run */
 		async hydrate(): Promise<void> {
+			let pathsMigrated = false;
 			try {
 				// One-time migration from localStorage
 				const legacy = localStorage.getItem(LEGACY_STORAGE_KEY);
@@ -234,6 +271,7 @@ function createRepositoriesStore() {
 							}
 						}
 					});
+					pathsMigrated = migratePersistedPaths(repos);
 					setState("repositories", repos);
 
 					// Hydrate repoOrder: use saved order, falling back to Object.keys for repos not yet in the order
@@ -253,6 +291,12 @@ function createRepositoriesStore() {
 					}
 				}
 				hydrated = true;
+				if (pathsMigrated) {
+					appLogger.info("store", "Normalized verbatim (\\\\?\\) paths in persisted repositories");
+					// Write back now: saves were blocked until `hydrated`, so the debounced
+					// path would only fire on the next unrelated mutation.
+					saveNow();
+				}
 				syncHotRepos(state.repositories);
 			} catch (err) {
 				appLogger.error("store", "Failed to hydrate repositories", err);
