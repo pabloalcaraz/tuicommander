@@ -17,7 +17,7 @@ import { isTauri, rpc } from "../transport";
 import type { RepoInfo } from "../types";
 import { verifyAndBuildResumeCommand } from "../utils/agentSession";
 import { assignTabToActiveGroup } from "../utils/paneTabAssign";
-import { pathStartsWith } from "../utils/pathUtils";
+import { pathStartsWith, pathsEqual } from "../utils/pathUtils";
 import { markPerf, timeBatch } from "../utils/perfTrace";
 import { effectiveMergeMethod, isMergeMethodNotAllowed } from "../utils/prMerge";
 import { escapeShellArg } from "../utils/shell";
@@ -389,6 +389,9 @@ export function useGitOperations(deps: GitOperationsDeps) {
 				const storeIds = new Set(terminalsStore.getIds());
 				const toRemove: string[] = [];
 				const terminalsToClose: string[] = [];
+				// Branches whose linked worktree git no longer lists, pending an on-disk
+				// existence check before we close their terminals.
+				const closeCandidates: Array<{ branchName: string; worktreePath: string }> = [];
 
 				// If activeBranch is no longer a worktree, find its replacement:
 				// the worktree branch that occupies the same path (HEAD moved).
@@ -398,7 +401,7 @@ export function useGitOperations(deps: GitOperationsDeps) {
 					const activePath = currentRepo.branches[active]?.worktreePath;
 					if (activePath) {
 						for (const [wtBranch, wtPath] of Object.entries(worktreePaths)) {
-							if (wtPath === activePath) {
+							if (pathsEqual(wtPath, activePath)) {
 								activeBranchReplacement = wtBranch;
 								break;
 							}
@@ -437,20 +440,17 @@ export function useGitOperations(deps: GitOperationsDeps) {
 						const branchState = currentRepo.branches[branchName];
 						const hasLiveTerminals = branchState?.terminals.some((id) => storeIds.has(id));
 						if (hasLiveTerminals) {
-							const isLinkedWorktree = branchState.worktreePath && branchState.worktreePath !== repoPath;
-							if (isLinkedWorktree) {
-								// Linked worktree was removed externally — close its terminals
-								appLogger.info(
-									"terminal",
-									`refreshAllBranchStats: closing terminals for deleted worktree "${branchName}"`,
-									{
-										terminals: branchState.terminals,
-										worktreePath: branchState.worktreePath,
-									},
-								);
-								terminalsToClose.push(...branchState.terminals.filter((id) => storeIds.has(id)));
-								toRemove.push(branchName);
-								markProcessed(repoPath, branchName);
+							// `pathsEqual`, not `!==`: the same directory reaches us spelled three
+							// ways (picker `C:\repo`, git CLI `C:/repo`, canonicalized
+							// `\\?\C:\repo`). A raw compare called the main checkout a "deleted
+							// linked worktree" and killed its terminals — including running agents —
+							// every time an external `git checkout -b` moved HEAD.
+							const linkedPath = branchState.worktreePath;
+							if (linkedPath && !pathsEqual(linkedPath, repoPath)) {
+								// Don't take git's word for it: `worktree_paths` dropping a branch is
+								// only evidence that git stopped listing it, and killing a live agent
+								// is unrecoverable. Confirm on disk after the loop.
+								closeCandidates.push({ branchName, worktreePath: linkedPath });
 							} else {
 								appLogger.info("terminal", `refreshAllBranchStats: keeping "${branchName}" — has live terminals`, {
 									terminals: branchState.terminals,
@@ -460,6 +460,54 @@ export function useGitOperations(deps: GitOperationsDeps) {
 						}
 						toRemove.push(branchName);
 						markProcessed(repoPath, branchName);
+					}
+				}
+
+				// Last line of defence before killing PTYs: a branch vanishing from
+				// `worktree_paths` is not proof that its directory is gone. Any bug that
+				// mis-attributes a path (or a transient git read) would otherwise take a
+				// running agent with it, and a killed agent cannot be resumed. Probe the
+				// filesystem and only close terminals whose worktree really is gone;
+				// anything we cannot confirm as deleted is kept and retried next refresh.
+				if (closeCandidates.length > 0) {
+					const probes = await Promise.all(
+						closeCandidates.map(async (candidate) => {
+							try {
+								const stat = await invoke<{ exists: boolean; is_dir: boolean }>("stat_path", {
+									path: candidate.worktreePath,
+								});
+								return { candidate, deleted: stat?.exists === false };
+							} catch (err) {
+								appLogger.warn(
+									"terminal",
+									`refreshAllBranchStats: stat_path failed for "${candidate.branchName}" — keeping its terminals`,
+									{ worktreePath: candidate.worktreePath, error: String(err) },
+								);
+								return { candidate, deleted: false };
+							}
+						}),
+					);
+					if (refreshGeneration.get(repoPath) !== gen) return; // stale after probe
+
+					for (const { candidate, deleted } of probes) {
+						const branchState = repositoriesStore.get(repoPath)?.branches[candidate.branchName];
+						if (!branchState) continue; // user removed it while we were probing
+						if (!deleted) {
+							appLogger.info(
+								"terminal",
+								`refreshAllBranchStats: keeping "${candidate.branchName}" — git dropped it but the worktree is still on disk`,
+								{ worktreePath: candidate.worktreePath, terminals: branchState.terminals },
+							);
+							continue;
+						}
+						appLogger.info(
+							"terminal",
+							`refreshAllBranchStats: closing terminals for deleted worktree "${candidate.branchName}"`,
+							{ terminals: branchState.terminals, worktreePath: candidate.worktreePath },
+						);
+						terminalsToClose.push(...branchState.terminals.filter((id) => storeIds.has(id)));
+						toRemove.push(candidate.branchName);
+						markProcessed(repoPath, candidate.branchName);
 					}
 				}
 
@@ -666,7 +714,9 @@ export function useGitOperations(deps: GitOperationsDeps) {
 		if (!repoSettingsStore.getEffective(repoPath)?.autoArchiveMerged) return;
 
 		const mergedLinkedBranches = Object.values(branches).filter(
-			(b) => b.isMerged && b.worktreePath !== null && b.worktreePath !== repoPath,
+			// Same normalized compare as `refreshAllBranchStats`: a raw `!==` would
+			// classify the main checkout as a linked worktree and archive it.
+			(b) => b.isMerged && b.worktreePath !== null && !pathsEqual(b.worktreePath, repoPath),
 		);
 		if (mergedLinkedBranches.length === 0) return;
 
@@ -827,7 +877,7 @@ export function useGitOperations(deps: GitOperationsDeps) {
 					if (branchTermSet.has(id)) continue;
 					if (claimedIds.has(id)) continue;
 					const term = terminalsStore.get(id);
-					if (term?.cwd === branch.worktreePath) {
+					if (term?.cwd && pathsEqual(term.cwd, branch.worktreePath)) {
 						repositoriesStore.addTerminalToBranch(repoPath, branchName, id);
 					}
 				}
@@ -1650,7 +1700,10 @@ export function useGitOperations(deps: GitOperationsDeps) {
 	const closeTerminalsInWorktree = async (wtPath: string) => {
 		for (const termId of terminalsStore.getIds()) {
 			const terminal = terminalsStore.get(termId);
-			if (terminal?.cwd && (terminal.cwd === wtPath || terminal.cwd.startsWith(wtPath + "/"))) {
+			// `pathStartsWith` handles separator, casing and verbatim-prefix mismatches;
+			// the raw `startsWith` only matched `/`-separated same-case paths, so on
+			// Windows it silently closed nothing.
+			if (terminal?.cwd && pathStartsWith(terminal.cwd, wtPath)) {
 				await deps.closeTerminal(termId, true);
 			}
 		}
@@ -1937,7 +1990,9 @@ export function useGitOperations(deps: GitOperationsDeps) {
 		repositoriesStore.setBranch(repoPath, newBranch, { worktreePath: repoPath });
 
 		// Find all branches on the main worktree that aren't the new branch
-		const stale = Object.values(repo.branches).filter((b) => b.worktreePath === repoPath && b.name !== newBranch);
+		const stale = Object.values(repo.branches).filter(
+			(b) => b.worktreePath !== null && pathsEqual(b.worktreePath, repoPath) && b.name !== newBranch,
+		);
 
 		batch(() => {
 			for (const branch of stale) {
@@ -1954,7 +2009,9 @@ export function useGitOperations(deps: GitOperationsDeps) {
 		if (!repo) return;
 
 		// Pre-flight: check for busy terminals on the main worktree
-		const mainWorktreeBranches = Object.values(repo.branches).filter((b) => b.worktreePath === repoPath);
+		const mainWorktreeBranches = Object.values(repo.branches).filter(
+			(b) => b.worktreePath !== null && pathsEqual(b.worktreePath, repoPath),
+		);
 		for (const branch of mainWorktreeBranches) {
 			for (const termId of branch.terminals) {
 				const term = terminalsStore.get(termId);

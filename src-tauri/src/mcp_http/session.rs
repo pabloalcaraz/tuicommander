@@ -109,13 +109,11 @@ pub(crate) fn write_pty_input(
         .ok_or_else(|| "Session not found".to_string())?;
     {
         let mut session = entry.lock();
-        session
-            .writer
-            .write_all(data.as_bytes())
+        // Route through write_pty_bytes so a large paste is chunked + paced on
+        // Windows (ConPTY input-buffer overflow) instead of a single write that
+        // truncates. It flushes internally.
+        crate::pty::write_pty_bytes(session.writer.as_mut(), data.as_bytes())
             .map_err(|e| format!("Write failed: {e}"))?;
-        if let Err(e) = session.writer.flush() {
-            tracing::warn!(session_id = %session_id, "PTY flush failed: {e}");
-        }
     }
     drop(entry);
 
@@ -143,17 +141,12 @@ pub(crate) fn write_pty_input_pair(
         .ok_or_else(|| "Session not found".to_string())?;
     {
         let mut session = entry.lock();
-        session
-            .writer
-            .write_all(text.as_bytes())
+        // Both parts route through write_pty_bytes (chunked + paced on Windows);
+        // it flushes internally after each part.
+        crate::pty::write_pty_bytes(session.writer.as_mut(), text.as_bytes())
             .map_err(|e| format!("Write failed: {e}"))?;
-        session
-            .writer
-            .write_all(key.as_bytes())
+        crate::pty::write_pty_bytes(session.writer.as_mut(), key.as_bytes())
             .map_err(|e| format!("Write failed: {e}"))?;
-        if let Err(e) = session.writer.flush() {
-            tracing::warn!(session_id = %session_id, "PTY flush failed: {e}");
-        }
     }
     drop(entry);
 
@@ -963,7 +956,6 @@ pub(super) async fn ws_stream(
 /// `{"type":"log","lines":[...],"offset":N}`
 ///
 /// Client → server messages are written to the PTY as input.
-
 async fn handle_ws_session(
     socket: WebSocket,
     session_id: String,
@@ -1093,24 +1085,19 @@ async fn handle_ws_session(
             Message::Text(text) => {
                 if let Some(session) = state_clone.sessions.get(&sid) {
                     let mut s = session.lock();
-                    if let Err(e) = s.writer.write_all(text.as_bytes()) {
+                    // Chunk + pace on Windows so a large paste isn't truncated.
+                    if let Err(e) = crate::pty::write_pty_bytes(s.writer.as_mut(), text.as_bytes()) {
                         tracing::error!(session_id = %sid, "PTY write failed: {e}");
                         break;
-                    }
-                    if let Err(e) = s.writer.flush() {
-                        tracing::warn!(session_id = %sid, "PTY flush failed: {e}");
                     }
                 }
             }
             Message::Binary(data) => {
                 if let Some(session) = state_clone.sessions.get(&sid) {
                     let mut s = session.lock();
-                    if let Err(e) = s.writer.write_all(&data) {
+                    if let Err(e) = crate::pty::write_pty_bytes(s.writer.as_mut(), &data) {
                         tracing::error!(session_id = %sid, "PTY write failed: {e}");
                         break;
-                    }
-                    if let Err(e) = s.writer.flush() {
-                        tracing::warn!(session_id = %sid, "PTY flush failed: {e}");
                     }
                 }
             }
@@ -1316,12 +1303,9 @@ async fn handle_ws_log_session(
             Message::Text(text) => {
                 if let Some(session) = state.sessions.get(&session_id) {
                     let mut s = session.lock();
-                    if let Err(e) = s.writer.write_all(text.as_bytes()) {
+                    // Chunk + pace on Windows so a large paste isn't truncated.
+                    if let Err(e) = crate::pty::write_pty_bytes(s.writer.as_mut(), text.as_bytes()) {
                         tracing::error!(session_id = %session_id, "PTY write failed: {e}");
-                        break;
-                    }
-                    if let Err(e) = s.writer.flush() {
-                        tracing::error!("PTY flush failed: {e}");
                         break;
                     }
                 }
@@ -1329,12 +1313,8 @@ async fn handle_ws_log_session(
             Message::Binary(data) => {
                 if let Some(session) = state.sessions.get(&session_id) {
                     let mut s = session.lock();
-                    if let Err(e) = s.writer.write_all(&data) {
+                    if let Err(e) = crate::pty::write_pty_bytes(s.writer.as_mut(), &data) {
                         tracing::error!(session_id = %session_id, "PTY write failed: {e}");
-                        break;
-                    }
-                    if let Err(e) = s.writer.flush() {
-                        tracing::error!("PTY flush failed: {e}");
                         break;
                     }
                 }
@@ -1450,12 +1430,8 @@ async fn handle_ws_grid_session(socket: WebSocket, session_id: String, state: Ar
             Message::Binary(data) => {
                 if let Some(session) = state_clone.sessions.get(&sid) {
                     let mut s = session.lock();
-                    if let Err(e) = s.writer.write_all(&data) {
+                    if let Err(e) = crate::pty::write_pty_bytes(s.writer.as_mut(), &data) {
                         tracing::error!(session_id = %sid, "PTY write failed: {e}");
-                        break;
-                    }
-                    if let Err(e) = s.writer.flush() {
-                        tracing::error!("PTY flush failed: {e}");
                         break;
                     }
                 }

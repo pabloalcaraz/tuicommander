@@ -701,8 +701,18 @@ impl GitReads for GixGitReads {
         };
         // `git worktree list` reports resolved real paths (symlinks followed,
         // e.g. macOS /var -> /private/var). Match that so paths are byte-equal.
+        //
+        // `dunce`, not `std::fs::canonicalize`: on Windows the std version returns
+        // a verbatim `\\?\C:\...` path, which no other producer of this value uses
+        // (the repo path comes from the directory picker as `C:\...`, and the git
+        // CLI prints `C:/...`). Callers compare these strings for equality —
+        // `refreshAllBranchStats` treats `worktreePath !== repoPath` as "the linked
+        // worktree was deleted externally" and closes that branch's terminals — so a
+        // verbatim prefix made every external HEAD move on the main checkout kill
+        // its own PTY sessions (agents included). Linux CI never saw it: verbatim
+        // prefixes are Windows-only, so `shootout_worktrees` stayed green.
         let real = |p: &Path| -> String {
-            std::fs::canonicalize(p)
+            dunce::canonicalize(p)
                 .unwrap_or_else(|_| p.to_path_buf())
                 .to_string_lossy()
                 .into_owned()
@@ -1226,8 +1236,54 @@ mod tests {
         let gix = GixGitReads::new();
         let a = cli.worktree_paths(&repo).unwrap();
         let b = gix.worktree_paths(&repo).unwrap();
-        assert_eq!(a, b, "worktree_paths gix != cli\ncli={a:#?}\ngix={b:#?}");
+        // Separator-agnostic: on Windows the git CLI prints `C:/...` while
+        // `dunce::canonicalize` yields the native `C:\...`. Both name the same
+        // directory, and every consumer compares through a normalizing helper.
+        let norm = |m: &HashMap<String, String>| -> Vec<(String, String)> {
+            let mut v: Vec<(String, String)> = m
+                .iter()
+                .map(|(k, p)| (k.clone(), p.replace('\\', "/")))
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(
+            norm(&a),
+            norm(&b),
+            "worktree_paths gix != cli\ncli={a:#?}\ngix={b:#?}"
+        );
         assert!(a.contains_key("main") && a.contains_key("wt-branch"));
+    }
+
+    /// Regression: `worktree_paths` must never return a Windows verbatim
+    /// (`\\?\`) path. Consumers compare the value for equality against the repo
+    /// path, which comes from the directory picker as a plain `C:\...`. With a
+    /// verbatim prefix the two never matched, so `refreshAllBranchStats`
+    /// classified the main checkout as a linked worktree that had been deleted
+    /// and force-closed its terminals — killing the agent running in them — on
+    /// every external HEAD move (`git checkout -b`, rebase, …).
+    #[test]
+    fn worktree_paths_are_never_verbatim() {
+        let (_guard, repo) = fixture_repo();
+        let wt_dir = tempfile::tempdir().unwrap();
+        let wt = wt_dir.path().join("linked");
+        run_git(
+            &repo,
+            &["worktree", "add", "-b", "wt-branch", wt.to_str().unwrap()],
+        );
+
+        for (backend, paths) in [
+            ("cli", CliGitReads.worktree_paths(&repo).unwrap()),
+            ("gix", GixGitReads::new().worktree_paths(&repo).unwrap()),
+        ] {
+            assert!(!paths.is_empty(), "{backend} returned no worktrees");
+            for (branch, path) in &paths {
+                assert!(
+                    !path.starts_with(r"\\?\"),
+                    "{backend} worktree_paths returned a verbatim path for {branch}: {path}"
+                );
+            }
+        }
     }
 
     /// Init a fresh, empty repo with one committed `a.txt` and return guard+path.

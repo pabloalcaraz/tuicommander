@@ -5294,6 +5294,7 @@ mod tests {
             )),
             connections_lock: tokio::sync::Mutex::new(()),
             screenshot_responses: dashmap::DashMap::new(),
+            #[cfg(unix)]
             standby_sessions: dashmap::DashMap::new(),
             process_snapshot_cache: crate::pty::ProcessSnapshotCache::default(),
             hot_repo_paths: parking_lot::RwLock::new(std::collections::HashSet::new()),
@@ -6687,6 +6688,8 @@ mod tests {
         );
     }
 
+    // Uses `install_completed_agent_submission_probe`, which is `#[cfg(unix)]`.
+    #[cfg(unix)]
     #[test]
     fn mcp_delivery_regression_completed_claude_sse_submits_through_pty() {
         let state = test_state();
@@ -6753,6 +6756,8 @@ mod tests {
         assert_eq!(snapshot.turn_epoch, 1);
     }
 
+    // Uses `install_completed_agent_submission_probe`, which is `#[cfg(unix)]`.
+    #[cfg(unix)]
     #[test]
     fn mcp_delivery_regression_working_claude_keeps_sse_turn_delivery() {
         let state = test_state();

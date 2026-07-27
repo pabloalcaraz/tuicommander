@@ -518,6 +518,80 @@ describe("repositoriesStore", () => {
 			errorSpy.mockRestore();
 		});
 
+		it("strips verbatim (\\\\?\\) prefixes from persisted worktree paths and terminal cwds", async () => {
+			mockInvoke.mockResolvedValueOnce({
+				repos: {
+					"C:\\repo": {
+						path: "C:\\repo",
+						displayName: "test",
+						initials: "TE",
+						expanded: true,
+						collapsed: false,
+						branches: {
+							main: {
+								name: "main",
+								isMain: true,
+								worktreePath: "\\\\?\\C:\\repo",
+								terminals: [],
+								additions: 0,
+								deletions: 0,
+								savedTerminals: [
+									{ name: "t1", cwd: "\\\\?\\C:\\repo", fontSize: 14, agentType: null },
+									{ name: "t2", cwd: null, fontSize: 14, agentType: null },
+								],
+							},
+						},
+						activeBranch: "main",
+					},
+				},
+			});
+
+			await testInScopeAsync(async () => {
+				await store.hydrate();
+				const branch = store.get("C:\\repo")!.branches["main"];
+				expect(branch.worktreePath).toBe("C:\\repo");
+				expect(branch.savedTerminals![0].cwd).toBe("C:\\repo");
+				expect(branch.savedTerminals![1].cwd).toBeNull();
+
+				// Normalized state is written back immediately — the debounced path would
+				// only fire on the next unrelated mutation.
+				const saveCalls = mockInvoke.mock.calls.filter((c: unknown[]) => c[0] === "save_repositories");
+				expect(saveCalls).toHaveLength(1);
+			});
+		});
+
+		it("does not re-persist when no persisted path needed normalizing", async () => {
+			mockInvoke.mockResolvedValueOnce({
+				repos: {
+					"/repo": {
+						path: "/repo",
+						displayName: "test",
+						initials: "TE",
+						expanded: true,
+						collapsed: false,
+						branches: {
+							main: {
+								name: "main",
+								isMain: true,
+								worktreePath: "/repo",
+								terminals: [],
+								additions: 0,
+								deletions: 0,
+								savedTerminals: [{ name: "t1", cwd: "/repo", fontSize: 14, agentType: null }],
+							},
+						},
+						activeBranch: "main",
+					},
+				},
+			});
+
+			await testInScopeAsync(async () => {
+				await store.hydrate();
+				const saveCalls = mockInvoke.mock.calls.filter((c: unknown[]) => c[0] === "save_repositories");
+				expect(saveCalls).toHaveLength(0);
+			});
+		});
+
 		it("migrates from localStorage on first run", async () => {
 			const staleData = {
 				"/repo": {

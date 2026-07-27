@@ -1370,7 +1370,9 @@ describe("useGitOperations", () => {
 			expect(repositoriesStore.get("/repo")?.branches["main"]?.lastCommitTs).toBeNull();
 		});
 
-		it("closes terminals and removes branch when worktree was deleted externally", async () => {
+		/** Set up a repo with a live terminal on a linked worktree that git no longer
+		 *  lists, and make `stat_path` report the directory as gone or still present. */
+		function setupDroppedWorktree(worktreeStillOnDisk: boolean): string {
 			repositoriesStore.add({ path: "/repo", displayName: "Repo" });
 			repositoriesStore.setBranch("/repo", "main", { worktreePath: "/repo" });
 			repositoriesStore.setBranch("/repo", "worktree-agent-abc", { worktreePath: "/repo/.worktrees/agent-abc" });
@@ -1391,6 +1393,21 @@ describe("useGitOperations", () => {
 				diff_stats: { "/repo": { additions: 0, deletions: 0 } },
 				last_commit_ts: {},
 			});
+			mockInvoke.mockImplementation((cmd: string) =>
+				cmd === "stat_path"
+					? Promise.resolve({ exists: worktreeStillOnDisk, is_dir: worktreeStillOnDisk })
+					: Promise.resolve(undefined),
+			);
+			return tid;
+		}
+
+		afterEach(() => {
+			mockInvoke.mockReset();
+			mockInvoke.mockResolvedValue(undefined);
+		});
+
+		it("closes terminals and removes branch when worktree was deleted externally", async () => {
+			const tid = setupDroppedWorktree(false);
 
 			await gitOps.refreshAllBranchStats();
 
@@ -1398,6 +1415,29 @@ describe("useGitOperations", () => {
 			expect(mockCloseTerminal).toHaveBeenCalledWith(tid, true);
 			// Branch should have been removed from the store
 			expect(repositoriesStore.get("/repo")?.branches["worktree-agent-abc"]).toBeUndefined();
+		});
+
+		// Killing a PTY is unrecoverable — a running agent cannot be resumed — so
+		// git dropping a branch from `worktree_paths` is not enough on its own.
+		it("keeps terminals when git dropped the branch but the worktree is still on disk", async () => {
+			const tid = setupDroppedWorktree(true);
+
+			await gitOps.refreshAllBranchStats();
+
+			expect(mockCloseTerminal).not.toHaveBeenCalled();
+			expect(repositoriesStore.get("/repo")?.branches["worktree-agent-abc"]?.terminals).toContain(tid);
+		});
+
+		it("keeps terminals when the existence probe fails — never guesses a delete", async () => {
+			const tid = setupDroppedWorktree(false);
+			mockInvoke.mockImplementation((cmd: string) =>
+				cmd === "stat_path" ? Promise.reject(new Error("transport down")) : Promise.resolve(undefined),
+			);
+
+			await gitOps.refreshAllBranchStats();
+
+			expect(mockCloseTerminal).not.toHaveBeenCalled();
+			expect(repositoriesStore.get("/repo")?.branches["worktree-agent-abc"]?.terminals).toContain(tid);
 		});
 
 		it("does not resurrect a branch deleted by user while refresh was in-flight", async () => {

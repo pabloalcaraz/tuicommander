@@ -1423,6 +1423,9 @@ impl AppState {
         }
     }
 
+    /// Convenience wrapper used only by tests; production callers use
+    /// `begin_agent_wait_with_events` directly.
+    #[cfg(test)]
     pub(crate) fn begin_agent_wait(&self, tuic_session: &str) -> u64 {
         self.begin_agent_wait_with_events(tuic_session).0
     }
@@ -4340,6 +4343,7 @@ mod tests {
             )),
             connections_lock: tokio::sync::Mutex::new(()),
             screenshot_responses: DashMap::new(),
+            #[cfg(unix)]
             standby_sessions: DashMap::new(),
             process_snapshot_cache: crate::pty::ProcessSnapshotCache::default(),
             hot_repo_paths: parking_lot::RwLock::new(std::collections::HashSet::new()),
