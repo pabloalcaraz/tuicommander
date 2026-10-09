@@ -4,6 +4,11 @@
 
 Manages pseudo-terminal sessions for all terminal tabs in the application.
 
+The input-line tracker consumes complete CSI sequences, including private
+parameter prefixes and split SGR mouse reports. Coordinates and terminal replies
+are not user text. CSI parameter storage is bounded independently of PTY input;
+tracking does not alter the bytes delivered to the child process.
+
 ## Windows ConPTY build dependency
 
 Windows desktop builds bundle a pinned Microsoft ConPTY DLL and matching

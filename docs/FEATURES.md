@@ -56,6 +56,7 @@
 - Current zoom shown in status bar
 
 ### 1.5 Copy & Paste
+- Mouse reporting is scoped to the terminal canvas and requires SGR negotiation; Shift bypasses application capture for local selection and scrolling.
 - Copy selection: `Cmd+C`
 - Paste to terminal: `Cmd+V`
 - **Trailing whitespace trimmed** — All copy paths (Cmd+C, Ctrl+C, copy-on-select) strip trailing spaces from terminal rows

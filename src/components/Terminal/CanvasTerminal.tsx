@@ -37,6 +37,7 @@ import { kittySequenceForKey } from "./kittyKeyboard";
 import { filePathRegex, fileUrlRegex } from "./linkProvider";
 import { continuationRowsAfterSuggest, isSuggestBlock } from "./suggestOverlay";
 import { altSequenceFromCode, createCompositionState, keyToSequence } from "./terminalInput";
+import { createMouseReporter } from "./terminalMouse";
 
 // Re-export for external consumers
 export type { CellMetrics, CursorShape, DecodedFrame };
@@ -323,15 +324,6 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 			col: Math.max(0, Math.min(Math.floor(x / m.cellWidth), maxCol)),
 			row: Math.max(0, Math.min(Math.floor(y / m.cellHeight), maxRow)),
 		};
-	}
-
-	function mouseModifiers(e: MouseEvent): number {
-		return (e.shiftKey ? 4 : 0) | (e.altKey ? 8 : 0) | (e.ctrlKey ? 16 : 0);
-	}
-
-	function sgrMouseSequence(button: number, col: number, row: number, press: boolean, e?: MouseEvent): string {
-		const cb = button + (e ? mouseModifiers(e) : 0);
-		return `\x1b[<${cb};${col + 1};${row + 1}${press ? "M" : "m"}`;
 	}
 
 	function viewportRowToAbs(viewportRow: number): number | null {
@@ -2450,6 +2442,13 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 		// --- Mouse selection ---
 		let clickCount = 0;
 		let lastClickTime = 0;
+		const mouseReporter = createMouseReporter({
+			canvas: canvasRef,
+			enabled: () => alive && !hidden,
+			mode: () => currentFrame,
+			position: canvasToGrid,
+			write: writePtyNoScroll,
+		});
 
 		canvasRef.addEventListener("mousedown", (e: MouseEvent) => {
 			keyInputRef.focus({ preventScroll: true });
@@ -2463,11 +2462,10 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 				if (e.button === 2 && detectedLinks.get(pos.row)?.some((sp) => pos.col >= sp.colStart && pos.col < sp.colEnd)) {
 					return;
 				}
-				if (currentFrame.sgrMouse) {
-					writePtyNoScroll(sgrMouseSequence(e.button, pos.col, pos.row, true, e));
+				if (mouseReporter.press(e)) {
+					e.preventDefault();
+					return;
 				}
-				e.preventDefault();
-				return;
 			}
 			if (e.button !== 0) return;
 			const pos = canvasToGrid(e);
@@ -2594,17 +2592,7 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 		};
 
 		const onMouseMove = (e: MouseEvent) => {
-			if (currentFrame && currentFrame.mouseMode > 0 && !e.shiftKey) {
-				if (currentFrame.mouseMode >= 3) {
-					const pos = canvasToGrid(e);
-					writePtyNoScroll(sgrMouseSequence(35, pos.col, pos.row, true, e));
-				} else if (currentFrame.mouseMode >= 2 && e.buttons > 0) {
-					const pos = canvasToGrid(e);
-					const btn = e.buttons & 1 ? 0 : e.buttons & 4 ? 1 : 2;
-					writePtyNoScroll(sgrMouseSequence(32 + btn, pos.col, pos.row, true, e));
-				}
-				return;
-			}
+			if (!selecting && mouseReporter.move(e)) return;
 
 			// Selection drag: coalesce into one rAF/frame with the latest position.
 			if (selecting && selectionStart) {
@@ -2615,7 +2603,7 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 			}
 
 			// Link detection (throttled)
-			if (!selecting) {
+			if (!selecting && e.target === canvasRef && !hidden) {
 				clearTimeout(linkThrottle);
 				linkThrottle = setTimeout(() => {
 					const pos = canvasToGrid(e);
@@ -2625,13 +2613,7 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 		};
 
 		const onMouseUp = (e: MouseEvent) => {
-			if (currentFrame && currentFrame.mouseMode > 0 && !e.shiftKey) {
-				const pos = canvasToGrid(e);
-				if (currentFrame.sgrMouse) {
-					writePtyNoScroll(sgrMouseSequence(e.button, pos.col, pos.row, false, e));
-				}
-				return;
-			}
+			if (!selecting && mouseReporter.release(e)) return;
 			stopSelectionScroll();
 			if (selecting && selectionStart && selectionEnd) {
 				if (selectionStart.row !== selectionEnd.row || selectionStart.col !== selectionEnd.col) {
@@ -2701,12 +2683,7 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 			// (TUIC scrolled its own history instead of forwarding to grok).
 			// Shift+wheel always scrolls the TUIC scrollback, never the app — the
 			// escape hatch matching the click/motion handlers' `!e.shiftKey` bypass.
-			if (currentFrame && currentFrame.mouseMode > 0 && !e.shiftKey) {
-				const pos = canvasToGrid(e as unknown as MouseEvent);
-				const btn = e.deltaY < 0 ? 64 : 65;
-				writePtyNoScroll(sgrMouseSequence(btn, pos.col, pos.row, true, e as unknown as MouseEvent));
-				return;
-			}
+			if (mouseReporter.wheel(e)) return;
 			const dy = e.deltaY;
 			const atBottom = currentFrame && currentFrame.displayOffset === 0 && (scrollPosF == null || scrollPosF <= 0);
 			const atTop =
@@ -2790,6 +2767,7 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 		// would otherwise still be undefined — leaking all four document listeners for
 		// the page lifetime. The success path augments this with transport.unsubscribe().
 		const detachDomListeners = () => {
+			mouseReporter.reset();
 			document.removeEventListener("mousemove", onMouseMove);
 			document.removeEventListener("mouseup", onMouseUp);
 			document.removeEventListener("mousemove", onScrollDragMove);

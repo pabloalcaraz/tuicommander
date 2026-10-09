@@ -2,6 +2,11 @@
 
 ## Terminal Sessions
 
+Mouse reporting is confined to the visible terminal under the pointer. Applications
+that enable SGR mouse reporting receive clicks, drags, motion, and wheel events;
+hold **Shift** to select text or scroll TUICommander's history instead. Hidden tabs
+and other panels never send mouse input to that application.
+
 Each terminal tab runs an independent PTY (pseudo-terminal) session with your shell. Up to 50 concurrent sessions.
 
 ### Creating Terminals

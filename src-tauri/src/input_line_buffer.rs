@@ -246,17 +246,28 @@ impl InputLineBuffer {
 
     fn handle_csi(&mut self, ch: char) -> Option<InputAction> {
         match ch {
-            // Parameter bytes: digits and semicolons
-            '0'..='9' | ';' => {
-                self.csi_params.push(ch as u8);
+            // CSI parameter bytes include private prefixes (<, =, >, ?) and
+            // subparameter separators (:). In particular, '<' is NOT the end
+            // of an SGR mouse report; consume the whole report through M/m.
+            '\x30'..='\x3f' => {
+                if self.csi_params.len() < 64 {
+                    self.csi_params.push(ch as u8);
+                }
                 None
             }
-            // Final byte — execute CSI command
-            _ => {
+            '\x20'..='\x2f' => None,
+            '\x40'..='\x7e' => {
                 self.esc_state = EscState::Normal;
-                self.execute_csi(ch);
+                if !self.csi_params.first().is_some_and(|b| b"<=>?".contains(b)) {
+                    self.execute_csi(ch);
+                }
                 None
             }
+            '\x1b' => {
+                self.esc_state = EscState::Esc;
+                None
+            }
+            _ => None,
         }
     }
 
@@ -437,6 +448,36 @@ impl InputLineBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mouse_reports_do_not_become_user_text_even_when_split() {
+        let mut buf = InputLineBuffer::new();
+        buf.feed("hello");
+        for ch in "\x1b[<35;45;42M\x1b[<0;45;42m".chars() {
+            assert!(buf.feed(&ch.to_string()).is_empty());
+        }
+        assert_eq!(buf.content(), "hello");
+        assert_eq!(
+            feed_and_get_line(&mut buf, " world\r"),
+            Some("hello world".into())
+        );
+    }
+
+    #[test]
+    fn private_csi_responses_do_not_edit_or_pollute_input() {
+        let mut buf = InputLineBuffer::new();
+        buf.feed("text\x1b[?1;2c\x1b[>0;1c\x1b[?1000h");
+        assert_eq!(buf.content(), "text");
+        assert_eq!(buf.cursor_pos(), 4);
+    }
+
+    #[test]
+    fn malformed_unterminated_csi_has_bounded_parameter_storage() {
+        let mut buf = InputLineBuffer::new();
+        buf.feed(&format!("\x1b[<{}Mok", "9;".repeat(10000)));
+        assert!(buf.csi_params.len() <= 64);
+        assert_eq!(buf.content(), "ok");
+    }
 
     fn feed_and_get_line(buf: &mut InputLineBuffer, data: &str) -> Option<String> {
         buf.feed(data).into_iter().find_map(|a| match a {

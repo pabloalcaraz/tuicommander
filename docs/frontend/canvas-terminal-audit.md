@@ -123,6 +123,12 @@ Each frame: 26-byte header + variable row data. The header ends with a `historyB
 
 ### Selection & Clipboard
 
+SGR mouse reporting is canvas-scoped and disabled for hidden terminals. Motion is
+coalesced once per animation frame, deduplicated by cell/modifiers/button, and
+flushed before a matching release. Only a press owned by this canvas may generate
+a release or drag; document listeners do not forward other panes' gestures.
+Terminals without negotiated SGR encoding retain local selection/scroll behavior.
+
 | Feature | Status | Notes |
 |---------|--------|-------|
 | Mouse drag selection | OK | |
