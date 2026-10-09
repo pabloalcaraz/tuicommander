@@ -277,6 +277,15 @@ export const GeneralTab: Component = () => {
 				label={t("general.toggle.copyOnSelect", "Copy on select")}
 				hint={t("general.hint.copyOnSelect", "Automatically copy selected text to clipboard")}
 			/>
+			<SettingToggle
+				checked={settingsStore.state.agentMouseSelection}
+				onChange={(enabled) => settingsStore.setAgentMouseSelection(enabled)}
+				label={t("general.toggle.agentMouseSelection", "Select text in agent terminals")}
+				hint={t(
+					"general.hint.agentMouseSelection",
+					"Drag to select in AI terminals; hold Alt to send clicks and drags to the application",
+				)}
+			/>
 
 			<SettingToggle
 				checked={settingsStore.state.osc52Clipboard}

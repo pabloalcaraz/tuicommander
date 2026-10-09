@@ -7,6 +7,12 @@ that enable SGR mouse reporting receive clicks, drags, motion, and wheel events;
 hold **Shift** to select text or scroll TUICommander's history instead. Hidden tabs
 and other panels never send mouse input to that application.
 
+In detected AI-agent terminals, **Select text in agent terminals** (Settings →
+General → Terminal, enabled by default) makes normal left-drag select text.
+Hold **Alt** to send clicks/drags to the agent instead, or disable the preference
+to use the application's mouse capture. The wheel still scrolls the agent's
+conversation; Shift+wheel scrolls TUICommander's history.
+
 Each terminal tab runs an independent PTY (pseudo-terminal) session with your shell. Up to 50 concurrent sessions.
 
 ### Creating Terminals

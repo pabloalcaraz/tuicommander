@@ -3,6 +3,7 @@ export function createMouseReporter(options: {
 	canvas: HTMLCanvasElement;
 	enabled: () => boolean;
 	mode: () => { mouseMode: number; sgrMouse: boolean } | null;
+	preferSelection?: () => boolean;
 	position: (event: MouseEvent) => { col: number; row: number };
 	write: (data: string) => void;
 	requestFrame?: (callback: FrameRequestCallback) => number;
@@ -51,6 +52,7 @@ export function createMouseReporter(options: {
 	return {
 		press(event: MouseEvent): boolean {
 			if (!reporting() || event.shiftKey || !ownsTarget(event)) return false;
+			if (event.button === 0 && options.preferSelection?.() && !event.altKey) return false;
 			flush();
 			pressed = event.button;
 			lastMotion = null;
@@ -67,6 +69,7 @@ export function createMouseReporter(options: {
 				lastMotion = null;
 				return false;
 			}
+			if (pressed === null && options.preferSelection?.() && !event.altKey) return false;
 			const mode = options.mode()!.mouseMode;
 			if (mode < 3 && pressed === null) return false;
 			if (mode >= 3 || (mode >= 2 && pressed !== null)) {

@@ -1,5 +1,10 @@
 # Settings
 
+**General → Terminal → Select text in agent terminals** is enabled by default.
+Normal left-drag selects text in AI terminals; Alt sends clicks and drags to the
+application. Disable it to restore application-controlled mouse capture. Shift
+remains the universal local-selection override.
+
 Open settings with `Cmd+,`. Settings are organized into tabs.
 
 ## General Tab

@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { createMouseReporter } from "../../components/Terminal/terminalMouse";
 
-function setup(mouseMode = 3, sgrMouse = true) {
+function setup(mouseMode = 3, sgrMouse = true, preferSelection = false) {
 	const canvas = document.createElement("canvas");
 	const other = document.createElement("div");
 	let enabled = true;
@@ -12,7 +12,8 @@ function setup(mouseMode = 3, sgrMouse = true) {
 		canvas,
 		enabled: () => enabled,
 		mode: () => mode,
-		position: (e) => ({ col: e.clientX, row: e.clientY }),
+		preferSelection: () => preferSelection,
+		position: (e) => ({ col: e.clientX ?? 0, row: e.clientY ?? 0 }),
 		write,
 		requestFrame: (callback) => {
 			tick = callback;
@@ -44,6 +45,15 @@ function setup(mouseMode = 3, sgrMouse = true) {
 }
 
 describe("terminal mouse isolation", () => {
+	it("prefers local selection in agents while preserving Alt-drag and wheel", () => {
+		const s = setup(3, true, true);
+		expect(s.reporter.press(s.event())).toBe(false);
+		expect(s.reporter.move(s.event())).toBe(false);
+		expect(s.reporter.press(s.event(s.canvas, { altKey: true }))).toBe(true);
+		expect(s.reporter.release(s.event(s.canvas))).toBe(true);
+		expect(s.reporter.wheel(new WheelEvent("wheel", { deltaY: 1 }))).toBe(true);
+		expect(s.write.mock.calls.map(([data]) => data)).toEqual(["\x1b[<8;45;42M", "\x1b[<0;45;42m", "\x1b[<65;1;1M"]);
+	});
 	it("never forwards document events over another pane or a hidden terminal", () => {
 		const s = setup();
 		expect(s.reporter.move(s.event(s.other))).toBe(false);

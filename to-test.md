@@ -1486,5 +1486,6 @@ worktree build's HTTP API on :9877 or the desktop app._
 - [ ] Rebuild with `make dev` or `pnpm tauri build --bundles nsis` to load the Rust build-script change. Verify pasting a command larger than 4 KB with the bundled console host.
 # Windows terminal input fixes (2026-10-09)
 
+- [x] Fast drag/modifier release behavior and persisted agent selection preference covered by `selectionDrag.test.ts`, `terminalMouse.test.ts`, and `settings.test.ts`.
 - [ ] Rebuild/restart required: Rust input parsing now consumes complete SGR mouse reports. The installed application and a running `make dev` backend do not load Rust edits until rebuilt/restarted.
 - [ ] Visual check: with multiple agent tabs, selecting/moving over another panel must never insert mouse coordinates in a terminal; Shift-drag remains local.

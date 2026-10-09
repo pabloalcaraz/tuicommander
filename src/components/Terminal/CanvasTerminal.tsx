@@ -35,6 +35,7 @@ import { acquireCache, getSharedMetrics, invalidateGlyphCache, releaseCache } fr
 import { createGridRenderer, type GridRenderer } from "./gridRenderer";
 import { kittySequenceForKey } from "./kittyKeyboard";
 import { filePathRegex, fileUrlRegex } from "./linkProvider";
+import { createSelectionDrag } from "./selectionDrag";
 import { continuationRowsAfterSuggest, isSuggestBlock } from "./suggestOverlay";
 import { altSequenceFromCode, createCompositionState, keyToSequence } from "./terminalInput";
 import { createMouseReporter } from "./terminalMouse";
@@ -160,8 +161,6 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 	// collapse the repaint burst into one paint per frame via rAF — mirrors the
 	// scroll/resize coalescing so raw mousemoves don't force a gBCR + full paint each.
 	let selectionDragRect: DOMRect | null = null;
-	let selectionRafId: number | undefined;
-	let lastSelectionEvent: MouseEvent | null = null;
 
 	// Link detection
 	const linkCache = new Map<
@@ -2446,6 +2445,8 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 			canvas: canvasRef,
 			enabled: () => alive && !hidden,
 			mode: () => currentFrame,
+			preferSelection: () =>
+				settingsStore.state.agentMouseSelection && !!terminalsStore.get(props.terminalId)?.agentType,
 			position: canvasToGrid,
 			write: writePtyNoScroll,
 		});
@@ -2560,16 +2561,15 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 			// Cache the canvas rect for the whole drag — its position doesn't move
 			// while selecting (auto-scroll shifts content offset, not the element).
 			selectionDragRect = canvasRef.getBoundingClientRect();
+			selectionDrag.reset();
 			fullRepaintNeeded = true;
 			scheduleRepaint();
 		});
 
 		// Coalesced selection-drag processing: runs at most once per frame with the
 		// latest mouse position (#9b13). Uses the cached drag rect (no per-move gBCR).
-		const flushSelectionDrag = () => {
-			selectionRafId = undefined;
-			const e = lastSelectionEvent;
-			if (!e || !selecting || !selectionStart) return;
+		const applySelectionDrag = (e: MouseEvent) => {
+			if (!selecting || !selectionStart) return;
 			const rect = selectionDragRect ?? canvasRef.getBoundingClientRect();
 			const m = metrics();
 			if (m) {
@@ -2590,16 +2590,14 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 			const mRepaint = metrics();
 			if (currentFrame && mRepaint) paintFrame(currentFrame, mRepaint);
 		};
+		const selectionDrag = createSelectionDrag(applySelectionDrag);
 
 		const onMouseMove = (e: MouseEvent) => {
 			if (!selecting && mouseReporter.move(e)) return;
 
 			// Selection drag: coalesce into one rAF/frame with the latest position.
 			if (selecting && selectionStart) {
-				lastSelectionEvent = e;
-				if (selectionRafId === undefined) {
-					selectionRafId = requestAnimationFrame(flushSelectionDrag);
-				}
+				selectionDrag.move(e);
 			}
 
 			// Link detection (throttled)
@@ -2614,6 +2612,8 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 
 		const onMouseUp = (e: MouseEvent) => {
 			if (!selecting && mouseReporter.release(e)) return;
+			if (!selecting || e.button !== 0) return;
+			selectionDrag.finish(e);
 			stopSelectionScroll();
 			if (selecting && selectionStart && selectionEnd) {
 				if (selectionStart.row !== selectionEnd.row || selectionStart.col !== selectionEnd.col) {
@@ -2628,15 +2628,18 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 			selecting = false;
 			// End the coalesced drag: drop the cached rect + any pending frame.
 			selectionDragRect = null;
-			lastSelectionEvent = null;
-			if (selectionRafId !== undefined) {
-				cancelAnimationFrame(selectionRafId);
-				selectionRafId = undefined;
-			}
+		};
+		const onWindowBlur = () => {
+			mouseReporter.reset();
+			selectionDrag.reset();
+			selecting = false;
+			selectionDragRect = null;
+			stopSelectionScroll();
 		};
 
 		document.addEventListener("mousemove", onMouseMove);
 		document.addEventListener("mouseup", onMouseUp);
+		window.addEventListener("blur", onWindowBlur);
 
 		// Link click — plain click opens, skip if user was selecting text
 		canvasRef.addEventListener("click", () => {
@@ -2768,12 +2771,13 @@ const CanvasTerminal: Component<CanvasTerminalProps> = (props) => {
 		// the page lifetime. The success path augments this with transport.unsubscribe().
 		const detachDomListeners = () => {
 			mouseReporter.reset();
+			selectionDrag.reset();
+			window.removeEventListener("blur", onWindowBlur);
 			document.removeEventListener("mousemove", onMouseMove);
 			document.removeEventListener("mouseup", onMouseUp);
 			document.removeEventListener("mousemove", onScrollDragMove);
 			document.removeEventListener("mouseup", onScrollDragUp);
 			if (scrollRafId) cancelAnimationFrame(scrollRafId);
-			if (selectionRafId !== undefined) cancelAnimationFrame(selectionRafId);
 			resetSmoothScroll();
 			stopSelectionScroll();
 		};

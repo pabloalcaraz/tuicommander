@@ -55,6 +55,7 @@ interface RustAppConfig {
 	intent_tab_title: boolean;
 	suggest_followups: boolean;
 	copy_on_select: boolean;
+	agent_mouse_selection?: boolean;
 	osc52_clipboard: boolean;
 	show_last_prompt: boolean;
 	bell_style: string;
@@ -363,6 +364,7 @@ interface SettingsStoreState {
 	intentTabTitle: boolean;
 	suggestFollowups: boolean;
 	copyOnSelect: boolean;
+	agentMouseSelection: boolean;
 	osc52Clipboard: boolean;
 	showLastPrompt: boolean;
 	bellStyle: "none" | "visual" | "sound" | "both";
@@ -415,6 +417,7 @@ function createSettingsStore() {
 		intentTabTitle: true,
 		suggestFollowups: true,
 		copyOnSelect: true,
+		agentMouseSelection: true,
 		osc52Clipboard: true,
 		showLastPrompt: true,
 		bellStyle: "visual",
@@ -484,6 +487,7 @@ function createSettingsStore() {
 		config.intent_tab_title = state.intentTabTitle;
 		config.suggest_followups = state.suggestFollowups;
 		config.copy_on_select = state.copyOnSelect;
+		config.agent_mouse_selection = state.agentMouseSelection;
 		config.osc52_clipboard = state.osc52Clipboard;
 		config.show_last_prompt = state.showLastPrompt;
 		config.bell_style = state.bellStyle;
@@ -586,6 +590,7 @@ function createSettingsStore() {
 				setState("disabledAgents", config.disabled_agents ?? []);
 				setState("intentTabTitle", config.intent_tab_title ?? true);
 				setState("copyOnSelect", config.copy_on_select ?? true);
+				setState("agentMouseSelection", config.agent_mouse_selection ?? true);
 				setState("osc52Clipboard", config.osc52_clipboard ?? true);
 				setState("showLastPrompt", config.show_last_prompt ?? false);
 				setState("bellStyle", (config.bell_style || "visual") as SettingsStoreState["bellStyle"]);
@@ -784,6 +789,10 @@ function createSettingsStore() {
 			setState("copyOnSelect", enabled);
 			save();
 		},
+		setAgentMouseSelection(enabled: boolean): void {
+			setState("agentMouseSelection", enabled);
+			save();
+		},
 
 		/** Enable/disable honoring OSC 52 clipboard-write sequences from terminal output */
 		setOsc52Clipboard(enabled: boolean): void {
@@ -943,6 +952,7 @@ registerDebugSnapshot("settings", () => {
 		intentTabTitle: s.intentTabTitle,
 		suggestFollowups: s.suggestFollowups,
 		copyOnSelect: s.copyOnSelect,
+		agentMouseSelection: s.agentMouseSelection,
 		autoUpdateEnabled: s.autoUpdateEnabled,
 		preventSleepWhenBusy: s.preventSleepWhenBusy,
 		issueFilter: s.issueFilter,

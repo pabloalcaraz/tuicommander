@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Agent terminals prefer natural text selection (configurable); fast drags preserve their final position, modifier changes do not switch gesture ownership, and loss of focus cancels pending gestures.
 - Terminal mouse events are scoped to their own visible canvas, require negotiated SGR encoding, and coalesce motion by frame and cell. Mouse reports and private CSI replies no longer contaminate captured user input.
 - Windows builds obtain and verify pinned ConPTY dependencies automatically, including the matching OpenConsole executable for development. Generated sidecars are excluded from source control.
 - Fork builds check for signed updates from the fork's release endpoint.

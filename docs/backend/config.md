@@ -1,5 +1,10 @@
 # Configuration
 
+`agent_mouse_selection` defaults to `true` (including configs written before the
+field existed). It controls local left-drag selection in detected AI terminals;
+Alt bypasses the preference, and wheel reporting is unaffected. Both desktop and
+HTTP config transports persist the same field.
+
 **Module:** `src-tauri/src/config.rs`
 
 Manages all application configuration as JSON files in the platform config directory.

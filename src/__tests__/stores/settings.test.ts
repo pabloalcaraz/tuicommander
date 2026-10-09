@@ -47,6 +47,20 @@ describe("settingsStore", () => {
 	}
 
 	describe("pre-hydrate write protection", () => {
+		it("defaults agent text selection on and persists disabling it", async () => {
+			await testInScopeAsync(async () => {
+				await hydrateStore();
+				expect(store.state.agentMouseSelection).toBe(true);
+				store.setAgentMouseSelection(false);
+				vi.advanceTimersByTime(600);
+				await vi.runAllTimersAsync();
+				const calls = saveConfigCalls();
+				expect(calls).toHaveLength(1);
+				expect((calls[0][1] as { config: { agent_mouse_selection: boolean } }).config.agent_mouse_selection).toBe(
+					false,
+				);
+			});
+		});
 		it("does not persist before hydrate", async () => {
 			await testInScopeAsync(async () => {
 				store.setIde("cursor");

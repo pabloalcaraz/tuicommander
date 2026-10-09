@@ -554,6 +554,10 @@ pub(crate) struct AppConfig {
     /// Auto-copy terminal selection to clipboard
     #[serde(default = "default_true")]
     pub(crate) copy_on_select: bool,
+    /// Prefer local left-drag selection in detected agent terminals. Alt-drag
+    /// still reaches the application; wheel reporting remains available.
+    #[serde(default = "default_true")]
+    pub(crate) agent_mouse_selection: bool,
     /// Honor OSC 52 clipboard-write sequences from terminal output. Disable to
     /// ignore clipboard writes emitted by displayed files/logs. Frontend-gated
     /// (the OSC 52 write executes in the renderer); stored here for persistence.
@@ -733,6 +737,7 @@ impl Default for AppConfig {
             intent_tab_title: true,
             suggest_followups: true,
             copy_on_select: true,
+            agent_mouse_selection: true,
             osc52_clipboard: true,
             show_last_prompt: true,
             bell_style: default_bell_style(),
@@ -2304,6 +2309,7 @@ mod tests {
             suggest_followups: false,
             global_hotkey: Some("CommandOrControl+Shift+T".to_string()),
             copy_on_select: true,
+            agent_mouse_selection: true,
             osc52_clipboard: true,
             show_last_prompt: false,
             bell_style: "visual".to_string(),

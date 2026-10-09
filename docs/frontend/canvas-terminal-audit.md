@@ -131,7 +131,7 @@ Terminals without negotiated SGR encoding retain local selection/scroll behavior
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| Mouse drag selection | OK | |
+| Mouse drag selection | OK | Final mouseup position is applied before copying, including drags shorter than one frame. Ownership survives modifier changes; blur/disposal cancels pending work. Agent-local selection is configurable (Alt bypass). |
 | Double-click word select | OK | `terminal_select_start` with `word:true` |
 | Triple-click line select | OK | |
 | Cmd+C copy with selection | OK | `terminal_select_text` IPC |
