@@ -514,6 +514,7 @@ impl OutputParser {
             && !text.contains("servers are down")
             && !text.contains("not able to authenticate")
             && !text.contains("request failed")
+            && !text.contains("workspace routing discovery failed")
         {
             return None;
         }
@@ -739,6 +740,12 @@ fn build_api_error_patterns() -> Vec<ApiErrorPattern> {
             "aider-auth-msg",
             r"The API provider is not able to authenticate you",
             "auth",
+        ),
+        // Codex CLI: startup failure before an interactive composer exists.
+        ae(
+            "codex-workspace-routing",
+            r"(?m)^Error: account/read failed during TUI bootstrap:[^\n]*workspace routing discovery failed[^\n]*",
+            "server",
         ),
         // Codex CLI: stream error with retry exhaustion (non-429 status)
         ae(
@@ -1863,6 +1870,26 @@ pub fn parse_choice_prompt(screen_rows: &[String]) -> Option<ParsedEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codex_workspace_routing_bootstrap_error_is_server_error_and_deduped() {
+        let mut parser = OutputParser::new();
+        let error = "Error: account/read failed during TUI bootstrap: account/read failed: workspace routing discovery failed (code -32603).";
+        let events = parser.parse(error);
+        assert!(events.iter().any(|event| matches!(event, ParsedEvent::ApiError { pattern_name, error_kind, .. } if pattern_name == "codex-workspace-routing" && error_kind == "server")));
+        assert!(
+            !parser
+                .parse(error)
+                .iter()
+                .any(|event| matches!(event, ParsedEvent::ApiError { .. }))
+        );
+        assert!(
+            !OutputParser::new()
+                .parse(&format!("+{error}"))
+                .iter()
+                .any(|event| matches!(event, ParsedEvent::ApiError { .. }))
+        );
+    }
 
     #[test]
     fn test_rate_limit_claude_429() {
@@ -3052,7 +3079,10 @@ Enter to select · ↑/↓ to navigate · Esc to cancel";
         // Tilde must be expanded to an absolute path
         assert!(!path.starts_with("~"), "tilde should be expanded: {path}");
         assert!(path.ends_with("/.claude/plans/graceful-rolling-quasar.md"));
-        assert!(path.starts_with("/"), "path should be absolute: {path}");
+        assert!(
+            std::path::Path::new(&path).is_absolute(),
+            "path should be absolute: {path}"
+        );
     }
 
     #[test]

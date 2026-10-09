@@ -18,6 +18,7 @@ import { writeClipboard } from "../../utils/clipboard";
 import { keyFor } from "../../utils/hotkey";
 import { isPerfDebug } from "../../utils/perfDebug";
 import { ComposePanel } from "../ComposePanel";
+import { canScheduleAgentRetry, isAgentRetryTarget } from "./agentRetry";
 import { getAwaitingInputSound } from "./awaitingInputSound";
 import CanvasTerminal, { type CanvasTerminalRef } from "./CanvasTerminal";
 import { gridDimsForBox, snapLineHeight } from "./canvasTerminalUtils";
@@ -168,6 +169,12 @@ export const Terminal: Component<TerminalProps> = (props) => {
 	const RETRY_DELAYS = [5_000, 15_000, 30_000];
 	let retryCount = 0;
 	let retryTimer: ReturnType<typeof setTimeout> | undefined;
+	let retryInputEpoch = 0;
+	const cancelAgentRetry = () => {
+		retryInputEpoch++;
+		clearTimeout(retryTimer);
+		retryTimer = undefined;
+	};
 	let agentDetectTimer: ReturnType<typeof setTimeout> | undefined;
 	let rafHandle = 0;
 
@@ -345,6 +352,7 @@ export const Terminal: Component<TerminalProps> = (props) => {
 					}
 					break;
 				case "user-input":
+					cancelAgentRetry();
 					planFileNotified = false;
 					// Record the prompt row for the green scrollbar marker. line < 0 (the
 					// keystroke-reconstructed path) is ignored by the store.
@@ -375,7 +383,7 @@ export const Terminal: Component<TerminalProps> = (props) => {
 					appLogger.error("terminal", `${label}: ${kindLabel} (${patternName})`);
 
 					const willAutoRetry =
-						kind === "server" &&
+						canScheduleAgentRetry(kind, patternName) &&
 						agent &&
 						agentConfigsStore.isAutoRetryEnabled(agent) &&
 						!retryTimer &&
@@ -388,16 +396,38 @@ export const Terminal: Component<TerminalProps> = (props) => {
 							"terminal",
 							`[AutoRetry] ${label}: attempt ${attempt}/${RETRY_DELAYS.length} in ${delay / 1000}s`,
 						);
-						retryTimer = setTimeout(() => {
+						const expectedInputEpoch = retryInputEpoch;
+						retryTimer = setTimeout(async () => {
 							retryTimer = undefined;
-							const current = terminalsStore.get(props.id);
-							if (sessionId && current?.shellState !== "busy") {
+							const expected = { sessionId: targetSessionId, agentType: agent, shellState: "idle" };
+							const stillCurrent = () => {
+								const current = terminalsStore.get(props.id);
+								return (
+									!disposed &&
+									retryInputEpoch === expectedInputEpoch &&
+									isAgentRetryTarget(
+										{
+											sessionId: sessionId ?? null,
+											agentType: current?.agentType ?? null,
+											shellState: current?.shellState ?? null,
+										},
+										expected,
+									)
+								);
+							};
+							if (!stillCurrent()) return;
+							try {
+								const [foreground, composer] = await Promise.all([
+									invoke<string | null>("get_session_foreground_process", { sessionId: targetSessionId }),
+									invoke<string>("get_input_buffer_content", { sessionId: targetSessionId }),
+								]);
+								if (!stillCurrent() || foreground !== agent || composer.length > 0) return;
 								appLogger.info("terminal", `[AutoRetry] ${label}: injecting "continue" (attempt ${attempt})`);
 								// Route through sendCommand (never raw text+\r): Ink-based agents in
 								// raw mode drop the Enter when bundled with text, defeating the retry.
-								pty
-									.sendCommand(sessionId, "continue", current?.agentType)
-									.catch((err) => appLogger.error("terminal", "[AutoRetry] Failed to write", { error: String(err) }));
+								await pty.sendCommand(targetSessionId, "continue", agent);
+							} catch (err) {
+								appLogger.error("terminal", "[AutoRetry] Failed to verify or write", { error: String(err) });
 							}
 						}, delay);
 						retryCount++;
@@ -885,6 +915,7 @@ export const Terminal: Component<TerminalProps> = (props) => {
 	createEffect(() => {
 		const curr = terminalsStore.get(props.id)?.agentType ?? null;
 		if (lastAgentType !== null && curr === null && sessionId) {
+			cancelAgentRetry();
 			terminalsStore.setLastPrompt(props.id, null);
 			invoke<boolean>("terminal_exit_alt_screen", { sessionId })
 				.then((wasAlt) => {
@@ -932,10 +963,12 @@ export const Terminal: Component<TerminalProps> = (props) => {
 	const refMethods = {
 		fit: () => canvasTerminalRef()?.refresh(),
 		write: (data: string) => {
+			cancelAgentRetry();
 			if (sessionId)
 				pty.write(sessionId, data).catch((err) => appLogger.error("terminal", "Failed to write to PTY", err));
 		},
 		writeln: (data: string) => {
+			cancelAgentRetry();
 			// PTY injection rule: writeln submits a line, so route through
 			// sendCommand (agent-aware Enter; Ink raw-mode ignores a bare \n and
 			// Windows needs \r\n). `write`/`input` below stay raw on purpose — they
@@ -946,6 +979,7 @@ export const Terminal: Component<TerminalProps> = (props) => {
 					.catch((err) => appLogger.error("terminal", "writeln failed", err));
 		},
 		input: (data: string) => {
+			cancelAgentRetry();
 			if (sessionId) pty.write(sessionId, data).catch((err) => appLogger.error("terminal", "input failed", err));
 		},
 		clear: () => {
@@ -1103,6 +1137,7 @@ export const Terminal: Component<TerminalProps> = (props) => {
 	const handleFileDrop = (e: DragEvent) => {
 		const path = e.dataTransfer?.getData("application/x-tuic-path");
 		if (!path || !sessionId) return;
+		cancelAgentRetry();
 		e.preventDefault();
 		const quoted = `'${path.replace(/'/g, "'\\''")}' `;
 		pty.write(sessionId, quoted);
@@ -1112,6 +1147,14 @@ export const Terminal: Component<TerminalProps> = (props) => {
 	return (
 		<div
 			class={s.wrapper}
+			ref={(wrapper) => {
+				wrapper.addEventListener("keydown", cancelAgentRetry, true);
+				wrapper.addEventListener("paste", cancelAgentRetry, true);
+				onCleanup(() => {
+					wrapper.removeEventListener("keydown", cancelAgentRetry, true);
+					wrapper.removeEventListener("paste", cancelAgentRetry, true);
+				});
+			}}
 			data-terminal-id={props.id}
 			data-focus-target="terminal"
 			onDragOver={handleFileDragOver}
@@ -1219,6 +1262,7 @@ export const Terminal: Component<TerminalProps> = (props) => {
 					canvasTerminalRef()?.focus();
 				}}
 				onSend={async (text) => {
+					cancelAgentRetry();
 					if (sessionId) {
 						try {
 							const term = terminalsStore.get(props.id);

@@ -103,6 +103,14 @@ Detects errors from two tiers:
 
 Frontend plays an error notification sound and logs via `appLogger.error()`.
 
+The exact Codex `account/read failed during TUI bootstrap: ... workspace routing
+discovery failed` line is classified as `codex-workspace-routing` / `server` and
+deduplicated. This does not establish an authentication failure. Bootstrap errors
+never schedule a `continue` retry because no agent composer exists yet. Other
+automatic retries recheck the same session/agent, a live foreground agent and an
+empty input buffer; typing, pasting, submission and confirmed agent exit cancel
+pending retries, including cancellation while the verification calls are in flight.
+
 ### Intent
 
 Agent-declared intent — what the LLM is currently working on:

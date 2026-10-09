@@ -10,7 +10,7 @@
 ## 1. Terminal Management
 
 ### 1.1 PTY Sessions
-- Confirmed agent exit restores interactive terminal modes on either screen and clears stale prompt state, with desktop/HTTP parity.
+- Confirmed agent exit restores interactive terminal modes on either screen and clears stale prompt state, with desktop/HTTP parity. Codex workspace-routing bootstrap failures are identified separately and cannot cause `continue` to be injected into the shell; ordinary retry timers verify their live agent and an empty composer.
 - Input requests are serialized per terminal, with a separate fair writer lock and shared desktop/HTTP/WebSocket tracking. A blocked input write leaves session metadata available, and prompt tracking avoids copying the entire composer for every key.
 - Up to 50 concurrent PTY sessions (configurable in Rust `MAX_SESSIONS`)
 - Each tab runs an independent pseudo-terminal with the user's shell

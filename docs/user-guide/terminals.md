@@ -55,6 +55,16 @@ History/completion can change text inside the agent, so those submissions keep
 the previous known prompt. Expand with the header, select the body normally, or
 use the copy icon. Leaving the agent clears the bar.
 
+### Codex startup errors
+
+If Codex reports `account/read ... workspace routing discovery failed`, it failed
+before opening its prompt. Check the Codex account/service/network and retry launching
+Codex. TUICommander cannot determine the upstream cause from this message alone.
+TUICommander identifies this as a startup/service error and does not type `continue`
+into the shell. The message alone is not evidence that you need to sign out.
+After confirmed agent exit, terminal mouse, focus and keyboard modes are restored
+on the main screen as well as the alternate screen, preserving shell output.
+
 ### Tab Names
 
 - Default naming: "Terminal 1", "Terminal 2", etc.

@@ -8,7 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
-- Agent exit restores terminal interaction modes even after failed startup on the main screen, with HTTP parity.
+- Agent exit restores terminal interaction modes even after failed startup on the main screen, with HTTP parity. Codex workspace-routing bootstrap errors are identified separately, and retry timers cannot send `continue` after agent exit or overwrite a nonempty composer.
 - PTY input preserves request order per terminal, uses a fair writer lock separate from session metadata, and shares desktop/HTTP/WebSocket tracking without blocking async workers. Typing during sustained output gets rendering priority; Windows now supplies native CPU, thread, handle and child-process diagnostics.
 - The last-prompt bar captures agent input rather than long shell commands, supports short and pasted multiline prompts, skips unreliable history/completion text, and offers selectable text and an explicit copy button. Desktop and HTTP input share bookkeeping and prompt events.
 - Agent terminals prefer natural text selection (configurable); fast drags preserve their final position, modifier changes do not switch gesture ownership, and loss of focus cancels pending gestures.
