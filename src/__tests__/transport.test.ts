@@ -98,6 +98,13 @@ describe("transport", () => {
 	});
 
 	describe("mapCommandToHttp()", () => {
+		it("maps agent exit recovery to the same backend used by desktop", () => {
+			expect(mapCommandToHttp("terminal_exit_alt_screen", { sessionId: "s1" })).toEqual({
+				method: "POST",
+				path: "/sessions/s1/terminal/recover",
+			});
+			expect(INTENTIONALLY_UNMAPPED).not.toContain("terminal_exit_alt_screen");
+		});
 		it("maps create_pty to POST /sessions", () => {
 			const result = mapCommandToHttp("create_pty", { config: { rows: 24, cols: 80, shell: null, cwd: "/tmp" } });
 			expect(result.method).toBe("POST");

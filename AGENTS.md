@@ -119,7 +119,7 @@ Use `appLogger` from `src/stores/appLogger.ts` — never `console.log/warn/error
 Runtime diagnostics for debugging performance issues. Code: `src-tauri/src/cpu_watchdog.rs`.
 
 **Always on (zero overhead when idle):**
-- CPU spike detection via `getrusage(RUSAGE_SELF)` — only the TUIC process, not PTY children
+- CPU spike detection via `getrusage(RUSAGE_SELF)` (Unix) or `GetProcessTimes` (Windows) — only the TUIC process, not PTY children
 - Logs `CPU SPIKE` warning when >80% for 10+ consecutive seconds with full snapshot
 - Sleep/wake detection — skips stale ticks after lid close/open
 
@@ -139,6 +139,11 @@ curl 'http://localhost:9876/logs?source=diagnostics'
 When enabled, emits health snapshots every 30s and alerts on FD/thread growth trends. Each snapshot includes: CPU% (TUIC-self only, via `RUSAGE_SELF`), `children_cpu` (aggregate %cpu of PTY children + hottest child — the spike trigger deliberately ignores children, so this is the only place a hot `cargo`/agent surfaces when TUIC itself is calm), thread count, FD count, PTY session count, content index build state, semaphore permits, `grid_frame_in_flight` stuck sessions, event bus subscriber count, `head_emits_suppressed` (repo-watcher `head-changed` emits skipped by the resolved-HEAD-target guard — a high/climbing value signals a filesystem-event storm, issue #82).
 
 **When to enable:** Boss reports sluggishness, CPU spikes, or UI freezes. Enable it, reproduce the issue, then check the logs. The snapshot at the time of the spike tells you what subsystem is overloaded.
+
+Windows diagnostics use native process times, Toolhelp thread/child snapshots,
+and process handle counts (`fds` means handles there). Child CPU is a lifetime
+average and inaccessible samples are marked unavailable. Typing frame throttling
+uses cached `GetSystemTimes` CPU utilization (90% saturation), shared across tabs.
 
 **Known past failure patterns this catches:**
 - IPC flush loop (ack_terminal_frame sending frames in ack path → 240+ IPC/sec)

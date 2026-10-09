@@ -85,7 +85,11 @@ pub(super) async fn write_to_session(
     Path(session_id): Path<String>,
     Json(body): Json<WriteRequest>,
 ) -> impl IntoResponse {
-    if let Err(e) = write_pty_input(&state, &session_id, &body.data) {
+    let result =
+        tokio::task::spawn_blocking(move || write_pty_input(&state, &session_id, &body.data))
+            .await
+            .unwrap_or_else(|e| Err(format!("PTY write task failed: {e}")));
+    if let Err(e) = result {
         if e == "Session not found" {
             return session_not_found();
         }
@@ -103,23 +107,7 @@ pub(crate) fn write_pty_input(
     session_id: &str,
     data: &str,
 ) -> Result<(), String> {
-    let entry = state
-        .sessions
-        .get(session_id)
-        .ok_or_else(|| "Session not found".to_string())?;
-    {
-        let mut session = entry.lock();
-        // Route through write_pty_bytes so a large paste is chunked + paced on
-        // Windows (ConPTY input-buffer overflow) instead of a single write that
-        // truncates. It flushes internally.
-        crate::pty::write_pty_bytes(session.writer.as_mut(), data.as_bytes())
-            .map_err(|e| format!("Write failed: {e}"))?;
-    }
-    drop(entry);
-
-    apply_input_bookkeeping(state, session_id, data);
-
-    Ok(())
+    crate::pty::write_session_input(state, session_id, &[data])
 }
 
 /// Write two input parts (e.g. text + a special-key sequence) to a session's
@@ -135,28 +123,20 @@ pub(crate) fn write_pty_input_pair(
     text: &str,
     key: &str,
 ) -> Result<(), String> {
-    let entry = state
-        .sessions
-        .get(session_id)
-        .ok_or_else(|| "Session not found".to_string())?;
-    {
-        let mut session = entry.lock();
-        // Both parts route through write_pty_bytes (chunked + paced on Windows);
-        // it flushes internally after each part.
-        crate::pty::write_pty_bytes(session.writer.as_mut(), text.as_bytes())
-            .map_err(|e| format!("Write failed: {e}"))?;
-        crate::pty::write_pty_bytes(session.writer.as_mut(), key.as_bytes())
-            .map_err(|e| format!("Write failed: {e}"))?;
-    }
-    drop(entry);
-
-    apply_input_bookkeeping(state, session_id, text);
-    apply_input_bookkeeping(state, session_id, key);
-
-    Ok(())
+    crate::pty::write_session_input(state, session_id, &[text, key])
 }
 
 pub(crate) use crate::pty::apply_input_bookkeeping;
+
+async fn write_ws_input(
+    state: Arc<AppState>,
+    session_id: String,
+    data: Vec<u8>,
+) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || crate::pty::write_session_bytes(&state, &session_id, &data))
+        .await
+        .map_err(|e| format!("PTY write task failed: {e}"))?
+}
 
 pub(super) async fn set_session_name(
     State(state): State<Arc<AppState>>,
@@ -313,9 +293,9 @@ pub(super) async fn close_session(
     if state.sessions.contains_key(&session_id) {
         // Send Ctrl+C then cleanup
         if let Some(entry) = state.sessions.get(&session_id) {
-            let mut session = entry.lock();
-            let _ = session.writer.write_all(&[0x03]);
-            let _ = session.writer.flush();
+            let session = entry.lock();
+            let _ = session.writer.lock().write_all(&[0x03]);
+            let _ = session.writer.lock().flush();
         }
         // Broadcast to SSE/WebSocket consumers BEFORE cleanup: cleanup_session reaps
         // this session's per-session PTY channel, so the closed frame must be emitted
@@ -412,7 +392,7 @@ pub(super) fn spawn_pty_session(
     state.sessions.insert(
         session_id.clone(),
         Mutex::new(PtySession {
-            writer,
+            writer: std::sync::Arc::new(parking_lot::FairMutex::new(writer)),
             master: pair.master,
             _child: child,
             paused: paused.clone(),
@@ -1001,23 +981,23 @@ async fn handle_ws_session(
     while let Some(Ok(msg)) = ws_receiver.next().await {
         match msg {
             Message::Text(text) => {
-                if let Some(session) = state_clone.sessions.get(&sid) {
-                    let mut s = session.lock();
-                    // Chunk + pace on Windows so a large paste isn't truncated.
-                    if let Err(e) = crate::pty::write_pty_bytes(s.writer.as_mut(), text.as_bytes())
-                    {
-                        tracing::error!(session_id = %sid, "PTY write failed: {e}");
-                        break;
-                    }
+                if let Err(e) = write_ws_input(
+                    Arc::clone(&state_clone),
+                    sid.clone(),
+                    text.as_bytes().to_vec(),
+                )
+                .await
+                {
+                    tracing::error!(session_id = %sid, "PTY write failed: {e}");
+                    break;
                 }
             }
             Message::Binary(data) => {
-                if let Some(session) = state_clone.sessions.get(&sid) {
-                    let mut s = session.lock();
-                    if let Err(e) = crate::pty::write_pty_bytes(s.writer.as_mut(), &data) {
-                        tracing::error!(session_id = %sid, "PTY write failed: {e}");
-                        break;
-                    }
+                if let Err(e) =
+                    write_ws_input(Arc::clone(&state_clone), sid.clone(), data.to_vec()).await
+                {
+                    tracing::error!(session_id = %sid, "PTY write failed: {e}");
+                    break;
                 }
             }
             Message::Close(_) => break,
@@ -1220,23 +1200,23 @@ async fn handle_ws_log_session(
     while let Some(Ok(msg)) = ws_receiver.next().await {
         match msg {
             Message::Text(text) => {
-                if let Some(session) = state.sessions.get(&session_id) {
-                    let mut s = session.lock();
-                    // Chunk + pace on Windows so a large paste isn't truncated.
-                    if let Err(e) = crate::pty::write_pty_bytes(s.writer.as_mut(), text.as_bytes())
-                    {
-                        tracing::error!(session_id = %session_id, "PTY write failed: {e}");
-                        break;
-                    }
+                if let Err(e) = write_ws_input(
+                    Arc::clone(&state),
+                    session_id.clone(),
+                    text.as_bytes().to_vec(),
+                )
+                .await
+                {
+                    tracing::error!(session_id = %session_id, "PTY write failed: {e}");
+                    break;
                 }
             }
             Message::Binary(data) => {
-                if let Some(session) = state.sessions.get(&session_id) {
-                    let mut s = session.lock();
-                    if let Err(e) = crate::pty::write_pty_bytes(s.writer.as_mut(), &data) {
-                        tracing::error!(session_id = %session_id, "PTY write failed: {e}");
-                        break;
-                    }
+                if let Err(e) =
+                    write_ws_input(Arc::clone(&state), session_id.clone(), data.to_vec()).await
+                {
+                    tracing::error!(session_id = %session_id, "PTY write failed: {e}");
+                    break;
                 }
             }
             Message::Close(_) => break,
@@ -1348,12 +1328,11 @@ async fn handle_ws_grid_session(socket: WebSocket, session_id: String, state: Ar
                 // No ACK needed — watch channel handles backpressure naturally.
             }
             Message::Binary(data) => {
-                if let Some(session) = state_clone.sessions.get(&sid) {
-                    let mut s = session.lock();
-                    if let Err(e) = crate::pty::write_pty_bytes(s.writer.as_mut(), &data) {
-                        tracing::error!(session_id = %sid, "PTY write failed: {e}");
-                        break;
-                    }
+                if let Err(e) =
+                    write_ws_input(Arc::clone(&state_clone), sid.clone(), data.to_vec()).await
+                {
+                    tracing::error!(session_id = %sid, "PTY write failed: {e}");
+                    break;
                 }
             }
             Message::Close(_) => break,
@@ -1389,6 +1368,16 @@ fn trim_screen_chrome(rows: Vec<String>) -> TrimResult {
 
 // --- Terminal grid HTTP endpoints ---
 // These delegate to the same VtLogBuffer/TerminalGrid logic as the Tauri commands in pty.rs.
+
+pub(super) async fn recover_terminal(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+) -> impl IntoResponse {
+    Json(crate::pty::recover_terminal_after_agent_exit(
+        &state,
+        &session_id,
+    ))
+}
 
 pub(super) async fn terminal_scroll(
     State(state): State<Arc<AppState>>,

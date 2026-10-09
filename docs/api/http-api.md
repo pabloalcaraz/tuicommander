@@ -133,6 +133,7 @@ GET  /sessions/:id/input-buffer                        -> { "content": string }
 GET  /sessions/:id/leaf-pid                            -> { "pid": number|null }
 GET  /sessions/:id/has-foreground                      -> { "process": string|null }
 POST /sessions/:id/visible              { "visible": bool }   -> { "ok": true }
+POST /sessions/:id/terminal/recover                    -> bool (was alternate screen)
 GET  /sessions/:id/terminal/selection-text?startRow=&startCol=&endRow=&endCol=  -> { "text": string }
 GET  /sessions/:id/terminal/logical-line?row=N         -> [logicalStartRow, text]
 GET  /sessions/:id/terminal/hyperlink-span?row=R&col=C -> [startCol, endCol, url] | null
@@ -144,6 +145,12 @@ Read-only PTY/terminal state mirroring the desktop Tauri commands (story 062). T
 command's bare return (e.g. `Option<String>` → `null`). The desktop-only commands
 themselves are absent from the remote binary, so these handlers read `AppState`
 directly.
+
+`terminal/recover` mirrors `terminal_exit_alt_screen`: call only after confirmed
+agent exit. It clears stale agent input/prompt state and restores mouse/focus,
+paste and Kitty keyboard modes even if the main screen was already active. It
+emits a fresh grid frame and never writes reset sequences to PTY stdin. `false`
+means the main screen was already active, rather than that recovery was skipped.
 
 ### Pause/Resume
 

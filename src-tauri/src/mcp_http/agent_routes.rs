@@ -398,7 +398,7 @@ pub(super) async fn spawn_agent_session(
     state.sessions.insert(
         session_id.clone(),
         Mutex::new(PtySession {
-            writer,
+            writer: std::sync::Arc::new(parking_lot::FairMutex::new(writer)),
             master: pair.master,
             _child: child,
             paused: paused.clone(),

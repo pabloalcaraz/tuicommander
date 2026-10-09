@@ -19,6 +19,38 @@ vi.mock("../transport", () => ({
 // Import after mocks are set up
 const { invoke, listen, _inflight_TEST_ONLY } = await import("../invoke");
 
+describe("PTY write ordering", () => {
+	beforeEach(() => mockTauriInvoke.mockReset());
+	it("keeps keyboard, paste and Enter in order while another session remains responsive", async () => {
+		let release!: () => void;
+		mockTauriInvoke
+			.mockImplementationOnce(
+				() =>
+					new Promise<void>((resolve) => {
+						release = resolve;
+					}),
+			)
+			.mockResolvedValue(undefined);
+		const first = invoke("write_pty", { sessionId: "ordered", data: "a" });
+		const second = invoke("write_pty", { sessionId: "ordered", data: "pasted text" });
+		const enter = invoke("write_pty", { sessionId: "ordered", data: "\r" });
+		await invoke("write_pty", { sessionId: "independent", data: "b" });
+		expect(mockTauriInvoke.mock.calls.map((call) => call[1].data)).toEqual(["a", "b"]);
+		release();
+		await Promise.all([first, second, enter]);
+		expect(mockTauriInvoke.mock.calls.map((call) => call[1].data)).toEqual(["a", "b", "pasted text", "\r"]);
+	});
+
+	it("reports failed writes without retrying or wedging the session queue", async () => {
+		mockTauriInvoke.mockRejectedValueOnce(new Error("write failed")).mockResolvedValue(undefined);
+		const first = invoke("write_pty", { sessionId: "recover", data: "a" });
+		const second = invoke("write_pty", { sessionId: "recover", data: "b" });
+		await expect(first).rejects.toThrow("write failed");
+		await second;
+		expect(mockTauriInvoke).toHaveBeenCalledTimes(2);
+	});
+});
+
 describe("invoke in-flight dedup", () => {
 	beforeEach(() => {
 		mockTauriInvoke.mockReset();

@@ -3817,13 +3817,17 @@ impl ChunkProcessor {
                                 "PtyWrite contains DEC private mode sequences! response={:?}",
                                 response.as_bytes().iter().take(200).collect::<Vec<_>>());
                         }
-                        if let Some(sess) = state.sessions.get(session_id)
-                            && let Some(mut s) = sess.try_lock()
+                        let writer = state
+                            .sessions
+                            .get(session_id)
+                            .and_then(|sess| sess.try_lock().map(|s| Arc::clone(&s.writer)));
+                        if let Some(writer) = writer
+                            && let Some(mut writer) = writer.try_lock()
                         {
-                            if let Err(e) = s.writer.write_all(response.as_bytes()) {
+                            if let Err(e) = writer.write_all(response.as_bytes()) {
                                 tracing::warn!(source = "terminal", session_id = %session_id, "PtyWrite response failed: {e}");
                             }
-                            if let Err(e) = s.writer.flush() {
+                            if let Err(e) = writer.flush() {
                                 tracing::warn!(source = "terminal", session_id = %session_id, "PtyWrite flush failed: {e}");
                             }
                         }
@@ -4509,17 +4513,21 @@ fn process_kitty_actions(kitty_actions: &[KittyAction], session_id: &str, state:
                 // try_lock: MUST NOT block the reader thread — blocking here
                 // while write_pty holds the lock causes a circular deadlock
                 // (reader blocked → kernel buffer fills → write_pty blocks on write).
-                if let Some(sess) = state.sessions.get(session_id) {
-                    if let Some(mut s) = sess.try_lock() {
-                        if let Err(e) = s.writer.write_all(response.as_bytes()) {
+                let writer = state
+                    .sessions
+                    .get(session_id)
+                    .and_then(|sess| sess.try_lock().map(|s| Arc::clone(&s.writer)));
+                if let Some(writer) = writer {
+                    if let Some(mut writer) = writer.try_lock() {
+                        if let Err(e) = writer.write_all(response.as_bytes()) {
                             tracing::warn!(source = "terminal", session_id = %session_id, "kitty query write failed: {e}");
                         }
-                        if let Err(e) = s.writer.flush() {
+                        if let Err(e) = writer.flush() {
                             tracing::warn!(source = "terminal", session_id = %session_id, "kitty query flush failed: {e}");
                         }
                     } else {
                         tracing::warn!(source = "terminal", session_id = %session_id,
-                            "kitty query response dropped — session lock contended; agent input handling may degrade");
+                            "kitty query response dropped — writer lock contended; agent input handling may degrade");
                     }
                 }
             }
@@ -4950,8 +4958,8 @@ const INJECT_ENTER_GAP: std::time::Duration = std::time::Duration::from_millis(5
 /// `injection_payload` framing that Ink/raw-mode agents require, and — critically —
 /// a REAL time gap between the payload and the Enter (see `INJECT_ENTER_GAP`): a
 /// concatenated or merely back-to-back Enter is missed, and unbracketed multiline
-/// text never submits. The session lock is released across the gap so a concurrent
-/// writer to the same session is never blocked by the delay. Best-effort: a dead
+/// text never submits. Session metadata stays unlocked across the gap; the input
+/// writer lock keeps the text/Enter transaction atomic. Best-effort: a dead
 /// PTY is logged and ignored (the inbox still holds the message).
 /// Write prompt text and a submitting Enter to an agent PTY using the exact
 /// framing and timing required by raw-mode TUIs. The caller owns bookkeeping:
@@ -4962,21 +4970,25 @@ pub(crate) fn write_agent_command_to_pty(
     session_id: &str,
     text: &str,
 ) -> Result<(), String> {
+    let writer_handle = {
+        let entry = state
+            .sessions
+            .get(session_id)
+            .ok_or_else(|| "Session not found".to_string())?;
+        Arc::clone(&entry.lock().writer)
+    };
+    let mut writer = writer_handle.lock();
     {
         let entry = state
             .sessions
             .get(session_id)
             .ok_or_else(|| "Session not found".to_string())?;
-        let mut session = entry.lock();
-        session
-            .writer
+        drop(entry);
+        writer
             .write_all(injection_payload(text).as_bytes())
             .map_err(|e| format!("Write failed: {e}"))?;
-        session
-            .writer
-            .flush()
-            .map_err(|e| format!("Flush failed: {e}"))?;
-    } // lock released before the gap
+        writer.flush().map_err(|e| format!("Flush failed: {e}"))?;
+    } // Session metadata is unlocked; the input transaction remains atomic.
 
     // DEFERRED (2026-07-17) — this blocks the calling thread (sometimes a tokio
     // worker: session-state accumulator / agent-send dispatch) for INJECT_ENTER_GAP.
@@ -4990,15 +5002,11 @@ pub(crate) fn write_agent_command_to_pty(
             .sessions
             .get(session_id)
             .ok_or_else(|| "Session vanished before Enter injection".to_string())?;
-        let mut session = entry.lock();
-        session
-            .writer
+        drop(entry);
+        writer
             .write_all(b"\r")
             .map_err(|e| format!("Write failed: {e}"))?;
-        session
-            .writer
-            .flush()
-            .map_err(|e| format!("Flush failed: {e}"))?;
+        writer.flush().map_err(|e| format!("Flush failed: {e}"))?;
     }
 
     Ok(())
@@ -5039,14 +5047,21 @@ fn write_all_with_progress(
 
 fn write_claimed_agent_command(state: &AppState, session_id: &str, text: &str) -> InjectionOutcome {
     let payload = injection_payload(text);
+    let writer_handle = {
+        let Some(entry) = state.sessions.get(session_id) else {
+            return InjectionOutcome::NotStarted("Session not found".to_string());
+        };
+        Arc::clone(&entry.lock().writer)
+    };
+    let mut writer = writer_handle.lock();
     {
         let entry = match state.sessions.get(session_id) {
             Some(entry) => entry,
             None => return InjectionOutcome::NotStarted("Session not found".to_string()),
         };
-        let mut session = entry.lock();
+        drop(entry);
         if let Err((written, error)) =
-            write_all_with_progress(session.writer.as_mut(), payload.as_bytes(), 0)
+            write_all_with_progress(writer.as_mut(), payload.as_bytes(), 0)
         {
             return if written == 0 {
                 InjectionOutcome::NotStarted(error)
@@ -5054,7 +5069,7 @@ fn write_claimed_agent_command(state: &AppState, session_id: &str, text: &str) -
                 InjectionOutcome::Uncertain(error)
             };
         }
-        if let Err(error) = session.writer.flush() {
+        if let Err(error) = writer.flush() {
             return InjectionOutcome::Uncertain(format!("Flush failed: {error}"));
         }
     }
@@ -5070,13 +5085,11 @@ fn write_claimed_agent_command(state: &AppState, session_id: &str, text: &str) -
                 );
             }
         };
-        let mut session = entry.lock();
-        if let Err((_, error)) =
-            write_all_with_progress(session.writer.as_mut(), b"\r", payload.len())
-        {
+        drop(entry);
+        if let Err((_, error)) = write_all_with_progress(writer.as_mut(), b"\r", payload.len()) {
             return InjectionOutcome::Uncertain(error);
         }
-        if let Err(error) = session.writer.flush() {
+        if let Err(error) = writer.flush() {
             return InjectionOutcome::Uncertain(format!("Flush failed: {error}"));
         }
     }
@@ -5524,7 +5537,8 @@ fn inject_clear_before_cursor_up(data: &str) -> String {
 /// cpu_watchdog covers via getrusage). >= 1.0 means the run queue is as long as
 /// there are cores: things are queueing and the WebView main thread gets starved.
 /// Used to gate the typing frame-throttle so it only kicks in under real load.
-/// Returns 0.0 where unavailable (Windows) — throttle stays off, behaviour unchanged.
+/// Windows uses native processor utilization normalized to its 90% saturation
+/// threshold, cached across all sessions. Other unsupported platforms return 0.
 #[cfg(unix)]
 fn system_load_per_core() -> f64 {
     let mut avg = [0f64; 3];
@@ -5537,7 +5551,12 @@ fn system_load_per_core() -> f64 {
     avg[0] / ncpu
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn system_load_per_core() -> f64 {
+    crate::windows_metrics::system_load_ratio()
+}
+
+#[cfg(not(any(unix, windows)))]
 fn system_load_per_core() -> f64 {
     0.0
 }
@@ -5714,7 +5733,7 @@ pub(crate) fn spawn_reader_thread(
             }
             // Typing-under-load throttle: only when saturated AND the user typed
             // recently. now_epoch_ms() is computed only on the saturated path.
-            let input_recent = system_saturated && {
+            let input_recent = (system_saturated || dirty_run >= 6) && {
                 let now_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
@@ -6105,7 +6124,7 @@ pub(crate) async fn create_pty(
     state.sessions.insert(
         session_id.clone(),
         Mutex::new(PtySession {
-            writer,
+            writer: std::sync::Arc::new(parking_lot::FairMutex::new(writer)),
             master: pair.master,
             _child: child,
             paused: paused.clone(),
@@ -6214,7 +6233,7 @@ pub(crate) async fn spawn_session_for_agent(
     state.sessions.insert(
         session_id.clone(),
         Mutex::new(PtySession {
-            writer,
+            writer: std::sync::Arc::new(parking_lot::FairMutex::new(writer)),
             master: pair.master,
             _child: child,
             paused: paused.clone(),
@@ -6380,7 +6399,7 @@ pub(crate) async fn create_pty_with_worktree(
     state.sessions.insert(
         session_id.clone(),
         Mutex::new(PtySession {
-            writer,
+            writer: std::sync::Arc::new(parking_lot::FairMutex::new(writer)),
             master,
             _child: child,
             paused: paused.clone(),
@@ -6513,32 +6532,62 @@ pub(crate) fn write_pty_bytes(writer: &mut dyn Write, data: &[u8]) -> std::io::R
 /// `write_pty_input_pair`: stamps last-input time and feeds the
 /// InputLineBuffer FSM to track slash_mode accurately. Runs once per input
 /// part, after the PTY lock for that part's write has already been released.
-pub(crate) fn apply_input_bookkeeping(state: &Arc<AppState>, session_id: &str, data: &str) {
-    // Stamp last-input time (same as desktop write_pty) so the grid ticker
-    // throttles frames for remote/PWA typing under CPU saturation too.
-    crate::pty::stamp_input_ms(state, session_id);
-    crate::state::resolve_choice_prompt_input(state, session_id, data);
+struct InputBookkeeping {
+    actions: Vec<crate::input_line_buffer::InputAction>,
+    buffer_empty: bool,
+    buffer_starts_slash: bool,
+}
 
-    // Feed input through InputLineBuffer FSM to track slash_mode accurately.
-    // The old substring heuristic false-positived on pastes starting with '/'.
-    // Copy the FSM result and composer content, then release BOTH the inner
-    // mutex and DashMap entry guard before any transition/delivery callback.
-    // `flush_pending_injections` re-reads input_buffers; retaining the entry
-    // guard across that call self-deadlocks its DashMap shard.
+fn record_input(state: &Arc<AppState>, session_id: &str, data: &str) -> InputBookkeeping {
     let agent_context = state
         .session_states
         .get(session_id)
         .and_then(|s| s.agent_type.clone());
-    let (actions, prompts, buffer_content) = {
+    let (actions, prompts, buffer_empty, buffer_starts_slash) = {
         let input_entry = state
             .input_buffers
             .entry(session_id.to_string())
             .or_insert_with(|| parking_lot::Mutex::new(InputLineBuffer::new()));
         let mut buf = input_entry.lock();
         let (actions, prompts) = buf.feed_for_agent(data, agent_context.as_deref());
-        let buffer_content = buf.content();
-        (actions, prompts, buffer_content)
+        (actions, prompts, buf.is_empty(), buf.starts_with_slash())
     };
+    // Publish while still inside the input transaction so concurrent transports
+    // cannot let an older submission overwrite a newer prompt.
+    if let Some(prompt) = prompts.last() {
+        state
+            .last_prompts
+            .insert(session_id.to_string(), prompt.clone());
+    }
+    InputBookkeeping {
+        actions,
+        buffer_empty,
+        buffer_starts_slash,
+    }
+}
+
+pub(crate) fn apply_input_bookkeeping(state: &Arc<AppState>, session_id: &str, data: &str) {
+    stamp_input_ms(state, session_id);
+    finish_input_bookkeeping(
+        state,
+        session_id,
+        data,
+        record_input(state, session_id, data),
+    );
+}
+
+fn finish_input_bookkeeping(
+    state: &Arc<AppState>,
+    session_id: &str,
+    data: &str,
+    record: InputBookkeeping,
+) {
+    crate::state::resolve_choice_prompt_input(state, session_id, data);
+    let InputBookkeeping {
+        actions,
+        buffer_empty,
+        buffer_starts_slash,
+    } = record;
     let interrupted = actions
         .iter()
         .any(|a| matches!(a, crate::input_line_buffer::InputAction::Interrupt));
@@ -6558,9 +6607,6 @@ pub(crate) fn apply_input_bookkeeping(state: &Arc<AppState>, session_id: &str, d
         }
     } else if nonempty_line_submitted {
         crate::pty::note_submitted_input(state, session_id);
-    }
-    if let Some(prompt) = prompts.into_iter().last() {
-        state.last_prompts.insert(session_id.to_string(), prompt);
     }
     for action in &actions {
         if let crate::input_line_buffer::InputAction::Line(content) = action
@@ -6596,7 +6642,7 @@ pub(crate) fn apply_input_bookkeeping(state: &Arc<AppState>, session_id: &str, d
     // unreliable. Use multiple signals:
     let in_slash = if line_submitted {
         false
-    } else if buffer_content.starts_with('/') {
+    } else if buffer_starts_slash {
         true
     } else if data == "/" {
         // Fresh slash keystroke from PWA/MCP — always enters slash mode
@@ -6618,72 +6664,99 @@ pub(crate) fn apply_input_bookkeeping(state: &Arc<AppState>, session_id: &str, d
         .entry(session_id.to_string())
         .or_insert_with(|| std::sync::atomic::AtomicBool::new(false))
         .store(in_slash, std::sync::atomic::Ordering::Relaxed);
-    if buffer_content.is_empty() {
+    if buffer_empty {
         crate::pty::flush_pending_injections(state, session_id);
     }
 }
 
-/// Write data to a PTY session
+/// Shared desktop/HTTP input transaction. Clone the I/O handle under the short
+/// metadata lock, then write and record input under one fair per-session lock.
+/// Lifecycle callbacks MUST run afterwards: they may themselves inject input.
+pub(crate) fn write_session_input(
+    state: &Arc<AppState>,
+    session_id: &str,
+    parts: &[&str],
+) -> Result<(), String> {
+    let writer = {
+        let entry = state
+            .sessions
+            .get(session_id)
+            .ok_or_else(|| "Session not found".to_string())?;
+        Arc::clone(&entry.lock().writer)
+    };
+    stamp_input_ms(state, session_id);
+    let mut records = Vec::with_capacity(parts.len());
+    let started = std::time::Instant::now();
+    let result = {
+        let mut writer = writer.lock();
+        let lock_ms = started.elapsed().as_millis();
+        let result = (|| {
+            for data in parts {
+                write_pty_bytes(writer.as_mut(), data.as_bytes())
+                    .map_err(|e| format!("Failed to write to PTY: {e}"))?;
+                records.push((*data, record_input(state, session_id, data)));
+            }
+            Ok(())
+        })();
+        let total_ms = started.elapsed().as_millis();
+        if total_ms > 100 {
+            tracing::warn!(
+                session_id,
+                lock_ms,
+                total_ms,
+                "write_pty SLOW — writer lock or write blocked"
+            );
+        }
+        result
+    };
+    for (data, record) in records {
+        finish_input_bookkeeping(state, session_id, data, record);
+    }
+    result
+}
+
+/// Write data to a PTY session without blocking a Tokio runtime worker.
+pub(crate) fn write_session_bytes(
+    state: &Arc<AppState>,
+    session_id: &str,
+    data: &[u8],
+) -> Result<(), String> {
+    if let Ok(text) = std::str::from_utf8(data) {
+        return write_session_input(state, session_id, &[text]);
+    }
+    let writer = {
+        let entry = state
+            .sessions
+            .get(session_id)
+            .ok_or_else(|| "Session not found".to_string())?;
+        Arc::clone(&entry.lock().writer)
+    };
+    stamp_input_ms(state, session_id);
+    write_pty_bytes(writer.lock().as_mut(), data)
+        .map_err(|e| format!("Failed to write to PTY: {e}"))
+}
+
+/// Write data to a PTY session without blocking a Tokio runtime worker.
 #[cfg(feature = "desktop")]
 #[tauri::command]
 pub(crate) async fn write_pty(
-    app: AppHandle,
     state: State<'_, Arc<AppState>>,
     session_id: String,
     data: String,
 ) -> Result<(), String> {
     let state = Arc::clone(&state);
-    let _ = app;
     tokio::task::spawn_blocking(move || {
-    // Keystroke delivery to the PTY: run on the high QoS band so the write (and
-    // thus the echo round-trip) isn't starved by a saturating build. Idempotent
-    // per call; bumps whichever blocking-pool thread serves this keystroke.
-    raise_thread_for_interactive_io();
-    // Restore cursor if hidden — Ink-based agents send DECTCEM hide for
-    // spinners but may not send CNORM when returning to the prompt.
-    // Best-effort try_lock: this is cosmetic (touches the local grid, not the PTY)
-    // and MUST NOT block input delivery. Under an output flood the ticker
-    // (serialize_dirty_rows) and reader thrash this same vt lock; a blocking lock
-    // here would starve input. If contended, skip — the next frame restores the
-    // cursor anyway.
-    if let Some(vt) = state.vt_log_buffers.get(&session_id)
-        && let Some(mut vt) = vt.try_lock()
-        && !vt.is_cursor_visible()
-    {
-        vt.process(b"\x1b[?25h");
-    }
-
-    if let Some(entry) = state.sessions.get(&session_id) {
-        tracing::trace!(session_id = %session_id, data_len = data.len(), "write_pty");
-        if data.contains("\x1b[?1049") || data.contains("\x1b[?1047") || data.contains("\x1b[?47l") || data.contains("\x1b[?25h") {
-            tracing::error!(source = "terminal", session_id = %session_id,
-                "write_pty received DEC private mode sequences! data({} bytes)={:?}",
-                data.len(), data.as_bytes().iter().take(200).collect::<Vec<_>>());
-        }
-        let t0 = std::time::Instant::now();
+        raise_thread_for_interactive_io();
+        if let Some(vt) = state.vt_log_buffers.get(&session_id)
+            && let Some(mut vt) = vt.try_lock()
+            && !vt.is_cursor_visible()
         {
-            let mut session = entry.lock();
-            let lock_ms = t0.elapsed().as_millis();
-            write_pty_bytes(session.writer.as_mut(), data.as_bytes())
-                .map_err(|e| format!("Failed to write to PTY: {e}"))?;
-            let total_ms = t0.elapsed().as_millis();
-            if total_ms > 100 {
-                tracing::warn!(session_id = %session_id, lock_ms = %lock_ms, total_ms = %total_ms,
-                    data_len = %data.len(), "write_pty SLOW — lock or write blocked");
-            }
+            vt.process(b"\x1b[?25h");
         }
-
-        // Release the session DashMap guard before any callback can read sessions.
-        drop(entry);
-        apply_input_bookkeeping(&state, &session_id, &data);
-
-        Ok(())
-    } else {
-        Err("Session not found".to_string())
-    }
+        write_session_input(&state, &session_id, &[&data])
     })
     .await
-    .map_err(|e| format!("Task join error: {e}"))?
+    .map_err(|e| e.to_string())?
 }
 
 /// Return the current content of the input line buffer for a PTY session.
@@ -7269,8 +7342,8 @@ pub(crate) fn close_pty_core(
     let mut session = session_mutex.into_inner();
 
     // Send Ctrl-C (0x03) to give the process a chance to clean up
-    let _ = session.writer.write_all(&[0x03]);
-    let _ = session.writer.flush();
+    let _ = session.writer.lock().write_all(&[0x03]);
+    let _ = session.writer.lock().flush();
 
     // Wait up to 100ms for process to exit gracefully
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
@@ -8246,38 +8319,42 @@ pub(crate) fn unsubscribe_terminal_grid(state: State<'_, Arc<AppState>>, session
     state.pending_scroll.remove(&session_id);
 }
 
-/// Exit alternate screen via the terminal grid (display side only, never touches PTY stdin).
-/// Only injects the exit sequences when the grid is actually in alternate-screen mode,
-/// preventing escape leaks into the shell when the agent already cleaned up normally.
+/// Recover after a confirmed agent exit, including failed bootstrap on the main
+/// screen. Only changes terminal OUTPUT state; never writes controls to stdin.
+pub(crate) fn recover_terminal_after_agent_exit(state: &Arc<AppState>, session_id: &str) -> bool {
+    state.last_prompts.remove(session_id);
+    state.input_buffers.remove(session_id);
+    state.slash_mode.remove(session_id);
+    state.kitty_states.remove(session_id);
+    if let Some(mut session) = state.session_states.get_mut(session_id) {
+        session.agent_type = None;
+        session.hook_instrumented = false;
+    }
+    let frame = state.vt_log_buffers.get(session_id).map(|vt| {
+        let mut vt = vt.lock();
+        let was_alt = vt.is_alternate_screen();
+        if was_alt { vt.process(b"\x1b[?1049l\x1b[?1047l\x1b[?47l"); }
+        vt.process(b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1016l\x1b[?2004l\x1b[?2026l\x1b[?1l\x1b[<999u\x1b[=0u\x1b[?25h\x1b[0m");
+        vt.grid_force_full_damage();
+        (was_alt, vt.serialize_dirty_rows())
+    });
+    if let Some((was_alt, frame)) = frame {
+        send_grid_frame(state, session_id, frame);
+        was_alt
+    } else {
+        false
+    }
+}
+
+/// Legacy command name; false means the main screen was already active, NOT
+/// that mode recovery was skipped.
 #[cfg(feature = "desktop")]
 #[tauri::command]
 pub(crate) fn terminal_exit_alt_screen(
     state: State<'_, Arc<AppState>>,
     session_id: String,
 ) -> bool {
-    // Frontend calls only after confirmed agent exit, never a transient process sample.
-    state.last_prompts.remove(&session_id);
-    state.input_buffers.remove(&session_id);
-    if let Some(mut session) = state.session_states.get_mut(&session_id) {
-        session.agent_type = None;
-        session.hook_instrumented = false;
-    }
-    if let Some(vt) = state.vt_log_buffers.get(&session_id) {
-        let (was_alt, frame) = {
-            let mut vt = vt.lock();
-            if !vt.is_alternate_screen() {
-                return false;
-            }
-            vt.process(b"\x1b[?1049l\x1b[?1047l\x1b[?47l\x1b[?25h\x1b[0m");
-            (true, vt.serialize_dirty_rows())
-        };
-        if was_alt {
-            send_grid_frame(&state, &session_id, frame);
-        }
-        was_alt
-    } else {
-        false
-    }
+    recover_terminal_after_agent_exit(&state, &session_id)
 }
 
 // --- Scroll commands ---
@@ -8549,6 +8626,152 @@ pub(crate) async fn set_session_visible(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blocked_input_keeps_session_metadata_available_and_pairs_atomic() {
+        use std::sync::mpsc;
+        struct GateWriter {
+            started: Option<mpsc::Sender<()>>,
+            release: mpsc::Receiver<()>,
+            bytes: Arc<Mutex<Vec<u8>>>,
+        }
+        impl Write for GateWriter {
+            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                if let Some(started) = self.started.take() {
+                    started.send(()).unwrap();
+                    self.release
+                        .recv_timeout(std::time::Duration::from_secs(3))
+                        .map_err(std::io::Error::other)?;
+                }
+                self.bytes.lock().extend_from_slice(data);
+                Ok(data.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let state = Arc::new(crate::state::tests_support::make_test_app_state());
+        let pair = portable_pty::native_pty_system()
+            .openpty(portable_pty::PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        let mut command =
+            portable_pty::CommandBuilder::new(if cfg!(windows) { "cmd.exe" } else { "/bin/sh" });
+        #[cfg(windows)]
+        command.args(["/D", "/Q"]);
+        let child = pair.slave.spawn_command(command).unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        state.sessions.insert(
+            "writer-test".to_string(),
+            Mutex::new(PtySession {
+                writer: Arc::new(parking_lot::FairMutex::new(Box::new(GateWriter {
+                    started: Some(started_tx),
+                    release: release_rx,
+                    bytes: Arc::clone(&bytes),
+                }))),
+                master: pair.master,
+                _child: child,
+                paused: Arc::new(AtomicBool::new(false)),
+                worktree: None,
+                cwd: None,
+                display_name: None,
+                shell: "test".to_string(),
+            }),
+        );
+        let first_state = Arc::clone(&state);
+        let first = std::thread::spawn(move || {
+            write_session_input(&first_state, "writer-test", &["text", "\r"])
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .unwrap();
+        let metadata_available = state
+            .sessions
+            .get("writer-test")
+            .unwrap()
+            .try_lock()
+            .is_some();
+        let second_state = Arc::clone(&state);
+        let second =
+            std::thread::spawn(move || write_session_input(&second_state, "writer-test", &["z"]));
+        release_tx.send(()).unwrap();
+        let first_result = first.join().unwrap();
+        let second_result = second.join().unwrap();
+        let _ = state
+            .sessions
+            .get("writer-test")
+            .unwrap()
+            .lock()
+            ._child
+            .kill();
+        first_result.unwrap();
+        second_result.unwrap();
+        assert!(
+            metadata_available,
+            "PTY input must not hold the session metadata mutex"
+        );
+        assert_eq!(
+            bytes.lock().as_slice(),
+            b"text\rz",
+            "paired input cannot interleave"
+        );
+        assert_eq!(
+            state
+                .input_buffers
+                .get("writer-test")
+                .unwrap()
+                .lock()
+                .content(),
+            "z"
+        );
+    }
+
+    #[test]
+    fn agent_exit_recovers_mouse_and_keyboard_modes_on_both_screens() {
+        for alternate in [false, true] {
+            let state = Arc::new(crate::state::tests_support::make_test_app_state());
+            let sid = "recovery-test";
+            let mut vt = crate::state::VtLogBuffer::new(24, 80, 1000);
+            vt.process(b"saved shell output\r\n");
+            if alternate {
+                vt.process(b"\x1b[?1049h");
+            }
+            vt.process(b"\x1b[?1003h\x1b[?1006h\x1b[?1004h\x1b[?2004h\x1b[>3u\x1b[?25l");
+            state.vt_log_buffers.insert(sid.to_string(), Mutex::new(vt));
+            state
+                .last_prompts
+                .insert(sid.to_string(), "stale prompt".to_string());
+            state.session_states.insert(
+                sid.to_string(),
+                crate::state::SessionState {
+                    agent_type: Some("codex".to_string()),
+                    ..Default::default()
+                },
+            );
+            assert_eq!(recover_terminal_after_agent_exit(&state, sid), alternate);
+            assert!(!state.last_prompts.contains_key(sid));
+            assert!(state.session_states.get(sid).unwrap().agent_type.is_none());
+            let vt = state.vt_log_buffers.get(sid).unwrap();
+            let mut vt = vt.lock();
+            vt.grid_force_full_damage();
+            let frame = vt.serialize_dirty_rows();
+            assert_eq!(frame[16], 0, "Kitty flags reset");
+            assert_eq!(frame[17] & 0xf8, 0, "mouse, focus, paste flags reset");
+            assert!(vt.is_cursor_visible());
+            assert!(
+                vt.screen_rows()
+                    .iter()
+                    .any(|row| row.contains("saved shell output")),
+                "shell output must survive recovery"
+            );
+        }
+    }
 
     #[test]
     fn sanitize_cwd_strips_verbatim_drive_prefix() {
@@ -15650,7 +15873,7 @@ mod tests {
         state.sessions.insert(
             sid.to_string(),
             Mutex::new(PtySession {
-                writer,
+                writer: std::sync::Arc::new(parking_lot::FairMutex::new(writer)),
                 master,
                 _child: child,
                 paused: Arc::new(AtomicBool::new(false)),
@@ -16545,7 +16768,7 @@ mod tests {
         state.sessions.insert(
             sid.to_string(),
             Mutex::new(PtySession {
-                writer,
+                writer: std::sync::Arc::new(parking_lot::FairMutex::new(writer)),
                 master,
                 _child: child,
                 paused: Arc::new(AtomicBool::new(false)),
@@ -16725,7 +16948,7 @@ mod tests {
         state.sessions.insert(
             sid.to_string(),
             Mutex::new(PtySession {
-                writer,
+                writer: std::sync::Arc::new(parking_lot::FairMutex::new(writer)),
                 master,
                 _child: child,
                 paused: Arc::new(AtomicBool::new(false)),

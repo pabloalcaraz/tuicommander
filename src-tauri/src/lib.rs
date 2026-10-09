@@ -103,6 +103,8 @@ mod tuic_cli;
 pub(crate) mod tunnels;
 #[cfg(feature = "desktop")]
 mod updater;
+#[cfg(windows)]
+mod windows_metrics;
 pub(crate) mod worktree;
 
 use std::path::{Path, PathBuf};

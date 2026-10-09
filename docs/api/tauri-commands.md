@@ -21,6 +21,7 @@ All commands are invoked from the frontend via `invoke(command, args)`. In brows
 | `update_session_cwd` | `session_id, cwd` | `()` | Update session working directory (from OSC 7) |
 | `get_session_foreground_process` | `session_id` | `JSON` | Get foreground process info |
 | `get_kitty_flags` | `session_id` | `u32` | Get Kitty keyboard protocol flags for session |
+| `terminal_exit_alt_screen` | `session_id` | `bool` | After confirmed agent exit, restore interactive modes and clear stale prompt state; returns whether the alternate screen was active. HTTP: `POST /sessions/:id/terminal/recover`. Never writes reset bytes to PTY stdin |
 | `get_last_prompt` | `session_id` | `Option<String>` | Last reliably reconstructed agent prompt (short/multiline included; shell and slash commands excluded) |
 | `get_shell_state` | `session_id` | `Option<String>` | Get current shell state ("busy", "idle", or null) |
 | `has_foreground_process` | `session_id: String` | `bool` | Checks if a non-shell foreground process is running |

@@ -2,6 +2,10 @@
 
 **Module:** `src-tauri/src/mcp_http/mod.rs`
 
+PTY input over HTTP and all three WebSocket modes uses the same writer transaction
+and input bookkeeping as desktop IPC. Blocking ConPTY I/O runs in `spawn_blocking`;
+it does not hold the session metadata mutex or block the async request runtime.
+
 Optional HTTP/WebSocket server that exposes all Tauri commands as REST endpoints. Enables browser-mode operation and MCP (Model Context Protocol) integration for external AI tools.
 
 ## Activation

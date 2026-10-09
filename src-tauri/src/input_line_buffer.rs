@@ -108,6 +108,13 @@ impl InputLineBuffer {
         self.chars.iter().collect()
     }
 
+    pub(crate) fn is_empty(&self) -> bool {
+        self.chars.is_empty()
+    }
+    pub(crate) fn starts_with_slash(&self) -> bool {
+        self.chars.first() == Some(&'/')
+    }
+
     /// Get current cursor position.
     #[cfg(test)]
     pub(crate) fn cursor_pos(&self) -> usize {

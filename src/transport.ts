@@ -246,6 +246,9 @@ const COMMAND_TABLE: Record<string, CommandTableEntry> = {
 			transform: (data) => (data as { prompt: string | null }).prompt ?? null,
 		}),
 	},
+	terminal_exit_alt_screen: {
+		map: (args) => ({ method: "POST", path: `/sessions/${args.sessionId}/terminal/recover` }),
+	},
 	get_input_buffer_content: {
 		map: (args) => ({
 			method: "GET",
@@ -1861,7 +1864,6 @@ export const INTENTIONALLY_UNMAPPED: ReadonlySet<string> = new Set<string>([
 	"subscribe_terminal_grid",
 	"unsubscribe_terminal_grid",
 	"ack_terminal_frame",
-	"terminal_exit_alt_screen",
 	"read_vt_log",
 	"terminal_get_block_rows",
 	// Desktop-only terminal/session diagnostics or local visual state with no

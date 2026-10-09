@@ -81,7 +81,34 @@ const DEDUP_COMMANDS = new Set([
 	"get_claude_usage_api",
 ]);
 
+// One request per session prevents async IPC/HTTP completion order from changing
+// keystroke order. Independent terminals remain concurrent; failures never retry
+// an uncertain write or block the next request.
+const _ptyWriteTails = new Map<string, Promise<void>>();
+
 export function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+	if (cmd === "write_pty" && typeof args?.sessionId === "string") {
+		const sessionId = args.sessionId;
+		const capturedArgs = { ...args };
+		const previous = _ptyWriteTails.get(sessionId);
+		const result = previous
+			? previous.then(() => invokeTransport<T>(cmd, capturedArgs))
+			: invokeTransport<T>(cmd, capturedArgs);
+		const tail = result
+			.then(
+				() => {},
+				() => {},
+			)
+			.finally(() => {
+				if (_ptyWriteTails.get(sessionId) === tail) _ptyWriteTails.delete(sessionId);
+			});
+		_ptyWriteTails.set(sessionId, tail);
+		return result;
+	}
+	return invokeTransport<T>(cmd, args);
+}
+
+function invokeTransport<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
 	if (isTauri()) {
 		if (DEDUP_COMMANDS.has(cmd)) {
 			const key = args !== undefined ? `${cmd}:${JSON.stringify(args)}` : cmd;

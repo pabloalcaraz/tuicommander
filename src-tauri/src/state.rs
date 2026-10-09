@@ -845,7 +845,9 @@ pub struct WorktreeInfo {
 
 /// Represents a PTY session with optional worktree
 pub struct PtySession {
-    pub writer: Box<dyn Write + Send>,
+    // Input I/O has its own fair lock. A blocked ConPTY write must not hold the
+    // session metadata mutex needed by polling, resize, and process inspection.
+    pub writer: Arc<parking_lot::FairMutex<Box<dyn Write + Send>>>,
     pub master: Box<dyn portable_pty::MasterPty + Send>,
     pub(crate) _child: Box<dyn portable_pty::Child + Send + Sync>,
     pub(crate) paused: Arc<AtomicBool>,

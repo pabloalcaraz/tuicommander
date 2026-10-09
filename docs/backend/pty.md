@@ -17,6 +17,21 @@ submits while Shift+Enter inserts a newline and key-release events do not submit
 Short prompts are eligible. Confirmed agent exit clears prompt/context state.
 Both transports emit `UserInput` and apply the same silence/error reset policy.
 
+`recover_terminal_after_agent_exit` restores interactive mouse/focus, paste and
+Kitty modes after confirmed exit, even when bootstrap failed on the main screen.
+Alternate-screen exits are conditional; shell output and history remain intact.
+Only output-grid state is changed. Desktop `terminal_exit_alt_screen` and HTTP
+`POST /sessions/:id/terminal/recover` share the helper and return `was_alt`.
+
+Input writes use a fair per-session writer lock separate from session metadata.
+Desktop, HTTP, and all WebSocket input modes share the same transaction helper;
+HTTP/WS run blocking ConPTY writes off the Tokio runtime. Paired text/Enter writes
+and framed agent injections hold the writer lock across both parts. Input tracking
+runs in write order under that lock; lifecycle callbacks run afterwards so pending
+injections cannot self-deadlock. Slash/empty checks do not copy the whole composer
+on each keystroke. The frontend also serializes `write_pty` per session, retaining
+each input and its error without retries; other terminals remain concurrent.
+
 ## Windows ConPTY build dependency
 
 Windows desktop builds bundle a pinned Microsoft ConPTY DLL and matching
@@ -117,6 +132,11 @@ spawn_reader_thread(reader, paused, session_id, app, state)
 4. Updates metrics (decrement `active_sessions`)
 
 ### Frame Emission Pipeline
+
+Sustained output is limited to roughly 30 fps; recent typing under sustained output
+or CPU saturation takes priority at roughly 20 fps. Input is stamped before waiting
+for the writer. Windows saturation uses native `GetSystemTimes` utilization at 90%,
+sampled once per second across all sessions; Unix uses load average per core.
 
 Frame emission is decoupled from PTY reading via a per-session **frame ticker** thread (same approach as iTerm2's Metal display-link renderer):
 

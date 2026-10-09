@@ -2760,7 +2760,7 @@ fn handle_agent_with_parent_cwd(
             state.sessions.insert(
                 session_id.clone(),
                 Mutex::new(PtySession {
-                    writer,
+                    writer: std::sync::Arc::new(parking_lot::FairMutex::new(writer)),
                     master: pair.master,
                     _child: child,
                     paused: paused.clone(),
@@ -5490,7 +5490,7 @@ mod tests {
         state.sessions.insert(
             session_id.to_string(),
             parking_lot::Mutex::new(PtySession {
-                writer,
+                writer: std::sync::Arc::new(parking_lot::FairMutex::new(writer)),
                 master: pair.master,
                 _child: child,
                 paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -6534,7 +6534,7 @@ mod tests {
         state.sessions.insert(
             session_id.to_string(),
             Mutex::new(PtySession {
-                writer,
+                writer: std::sync::Arc::new(parking_lot::FairMutex::new(writer)),
                 master: pair.master,
                 _child: child,
                 paused: Arc::new(AtomicBool::new(false)),
@@ -8255,7 +8255,7 @@ mod tests {
         state.sessions.insert(
             tuic.clone(),
             parking_lot::Mutex::new(PtySession {
-                writer,
+                writer: std::sync::Arc::new(parking_lot::FairMutex::new(writer)),
                 master: pair.master,
                 _child: child,
                 paused: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),

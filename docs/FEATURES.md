@@ -10,6 +10,8 @@
 ## 1. Terminal Management
 
 ### 1.1 PTY Sessions
+- Confirmed agent exit restores interactive terminal modes on either screen and clears stale prompt state, with desktop/HTTP parity.
+- Input requests are serialized per terminal, with a separate fair writer lock and shared desktop/HTTP/WebSocket tracking. A blocked input write leaves session metadata available, and prompt tracking avoids copying the entire composer for every key.
 - Up to 50 concurrent PTY sessions (configurable in Rust `MAX_SESSIONS`)
 - Each tab runs an independent pseudo-terminal with the user's shell
 - Terminals are never unmounted — hidden tabs stay alive with full scroll history
@@ -1807,7 +1809,7 @@ TUICommander aggregates upstream MCP servers and exposes them through its own `/
 - Use to diagnose which agent/terminal is driving high CPU or memory
 
 ### 20.11 Runtime Diagnostics (CPU watchdog + diagnostic mode)
-- **Always-on CPU watchdog** (zero overhead when idle): polls `getrusage(RUSAGE_SELF)` every 5s and logs a full snapshot when TUIC's own CPU stays above 80% for 10+ consecutive seconds. PTY children (cargo, rustc, …) are separate OS processes and don't count toward the measurement
+- **Always-on CPU watchdog**: polls `getrusage(RUSAGE_SELF)` on Unix and `GetProcessTimes` on Windows every 5s and logs a full snapshot when TUIC's own CPU stays above 80% for 10+ consecutive seconds. PTY children (cargo, rustc, …) are separate OS processes and don't count toward the measurement. Windows uses native thread/handle counters and child process probes; its typing throttle uses cached system CPU utilization.
 - **Sleep/wake aware**: inter-tick gaps over 30s are treated as the machine having been asleep (lid closed) and skipped, so stale tokio-timer ticks after wake don't trigger false spikes or idle cascades
 - **Diagnostic mode** (toggleable at runtime, off by default): emits a health snapshot every 30s and alerts on FD/thread growth trends. Each snapshot includes: `cpu_pct` (TUIC self only, via `RUSAGE_SELF`), `children_cpu` (aggregate %cpu of all PTY child process trees + the hottest individual child — note the CPU watchdog spike trigger intentionally ignores children, so a hot `cargo`/agent only surfaces here), thread count, FD count, PTY session count, content-index build state, semaphore permits, stuck `grid_frame_in_flight` sessions, event-bus subscriber count, and `head_emits_suppressed` (repo-watcher `head-changed` emits skipped by the resolved-HEAD-target guard — a climbing value signals a filesystem-event storm)
 - Control via HTTP: `POST /diagnostics {"enabled":true}` to toggle, `GET /diagnostics` for status, `GET /logs?source=diagnostics` to read the snapshots

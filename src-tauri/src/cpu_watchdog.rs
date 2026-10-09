@@ -65,9 +65,7 @@ pub(crate) fn diagnostic_mode() -> bool {
 // CPU measurement via getrusage(RUSAGE_SELF)
 // ---------------------------------------------------------------------------
 
-// Never constructed on non-Unix (getrusage is POSIX-only) — the watchdog
-// disables itself there. Suppress the resulting dead-code lint on Windows.
-#[cfg_attr(not(unix), allow(dead_code))]
+// Unix uses rusage; Windows uses native GetProcessTimes.
 struct CpuSample {
     user_us: i64,
     sys_us: i64,
@@ -89,15 +87,22 @@ impl CpuSample {
         })
     }
 
-    /// `getrusage(RUSAGE_SELF)` is POSIX-only; there's no equivalent self-usage
-    /// probe wired up on non-Unix, so CPU sampling is unavailable and the
-    /// watchdog disables itself (callers treat `None` as "watchdog unavailable").
-    #[cfg(not(unix))]
+    /// Native Windows self-usage excludes PTY children.
+    #[cfg(windows)]
+    fn now() -> Option<Self> {
+        let (user_us, sys_us) = crate::windows_metrics::self_cpu_us()?;
+        Some(Self {
+            user_us,
+            sys_us,
+            wall: Instant::now(),
+        })
+    }
+
+    #[cfg(not(any(unix, windows)))]
     fn now() -> Option<Self> {
         None
     }
 
-    #[cfg_attr(not(unix), allow(dead_code))]
     fn cpu_pct_since(&self, prev: &CpuSample) -> f64 {
         let cpu_delta_us = (self.user_us - prev.user_us) + (self.sys_us - prev.sys_us);
         let wall_us = self.wall.duration_since(prev.wall).as_micros() as f64;
@@ -121,7 +126,11 @@ fn count_open_fds() -> usize {
     {
         std::fs::read_dir("/proc/self/fd").map_or(0, |d| d.count())
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(windows)]
+    {
+        crate::windows_metrics::handle_count()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     {
         0
     }
@@ -147,12 +156,17 @@ fn thread_count() -> usize {
         let pid = std::process::id();
         std::fs::read_dir(format!("/proc/{pid}/task")).map_or(0, |d| d.count())
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(windows)]
+    {
+        crate::windows_metrics::thread_count()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     {
         0
     }
 }
 
+#[cfg(not(windows))]
 fn child_process_summary() -> String {
     let pid = std::process::id();
     // macOS `ps` doesn't support --ppid; use -o + awk to filter
@@ -182,6 +196,7 @@ fn child_process_summary() -> String {
 /// load). So this is the only place child CPU surfaces during a diagnostic
 /// session that ISN'T already a TUIC-process spike. `%cpu` from `ps` is the
 /// process-lifetime average, not instantaneous — good enough for visibility.
+#[cfg(not(windows))]
 fn child_cpu_summary() -> String {
     let pid = std::process::id();
     let output = std::process::Command::new("sh")
@@ -218,6 +233,44 @@ fn child_cpu_summary() -> String {
 // ---------------------------------------------------------------------------
 // Snapshot: emitted on CPU spike or periodic diagnostic
 // ---------------------------------------------------------------------------
+
+#[cfg(windows)]
+fn child_process_summary() -> String {
+    let children = crate::windows_metrics::children();
+    if children.is_empty() {
+        return "(no children or snapshot unavailable)".to_string();
+    }
+    children
+        .into_iter()
+        .map(|(pid, name, cpu)| {
+            let cpu = cpu.map_or_else(|| "unavailable".to_string(), |pct| format!("{pct:.1}%"));
+            format!("{pid} {name} {cpu}")
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+#[cfg(windows)]
+fn child_cpu_summary() -> String {
+    let children = crate::windows_metrics::children();
+    let mut total = 0.0;
+    let mut top = (String::new(), 0.0);
+    let mut unavailable = 0;
+    for (_, name, cpu) in children {
+        if let Some(cpu) = cpu {
+            total += cpu;
+            if cpu > top.1 {
+                top = (name, cpu);
+            }
+        } else {
+            unavailable += 1;
+        }
+    }
+    format!(
+        "children_cpu={total:.1}% (top: {} {:.1}%, unavailable={unavailable})",
+        top.0, top.1
+    )
+}
 
 struct HealthSnapshot {
     cpu_pct: f64,
@@ -327,7 +380,7 @@ fn run(state: Arc<AppState>) {
         None => {
             tracing::warn!(
                 source = "diagnostics",
-                "getrusage failed — watchdog disabled"
+                "Native process CPU sampling failed — watchdog disabled"
             );
             return;
         }

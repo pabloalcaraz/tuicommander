@@ -540,6 +540,10 @@ fn shared_routes() -> Router<Arc<AppState>> {
             get(session::list_sessions).post(session::create_session),
         )
         .route("/sessions/{id}/write", post(session::write_to_session))
+        .route(
+            "/sessions/{id}/terminal/recover",
+            post(session::recover_terminal),
+        )
         .route("/sessions/{id}/name", put(session::set_session_name))
         .route("/sessions/{id}/resize", post(session::resize_session))
         .route("/sessions/{id}/output", get(session::get_output))
