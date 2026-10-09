@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use tauri::{AppHandle, Emitter, State};
 use uuid::Uuid;
 
-use crate::input_line_buffer::{InputAction, InputLineBuffer};
+use crate::input_line_buffer::InputLineBuffer;
 use crate::output_parser::{OutputParser, ParsedEvent};
 use crate::state::{
     AppState, ChangedRow, EscapeAwareBuffer, KittyAction, KittyKeyboardState,
@@ -6509,6 +6509,120 @@ pub(crate) fn write_pty_bytes(writer: &mut dyn Write, data: &[u8]) -> std::io::R
     writer.flush()
 }
 
+/// Post-write bookkeeping shared by `write_pty_input` and
+/// `write_pty_input_pair`: stamps last-input time and feeds the
+/// InputLineBuffer FSM to track slash_mode accurately. Runs once per input
+/// part, after the PTY lock for that part's write has already been released.
+pub(crate) fn apply_input_bookkeeping(state: &Arc<AppState>, session_id: &str, data: &str) {
+    // Stamp last-input time (same as desktop write_pty) so the grid ticker
+    // throttles frames for remote/PWA typing under CPU saturation too.
+    crate::pty::stamp_input_ms(state, session_id);
+    crate::state::resolve_choice_prompt_input(state, session_id, data);
+
+    // Feed input through InputLineBuffer FSM to track slash_mode accurately.
+    // The old substring heuristic false-positived on pastes starting with '/'.
+    // Copy the FSM result and composer content, then release BOTH the inner
+    // mutex and DashMap entry guard before any transition/delivery callback.
+    // `flush_pending_injections` re-reads input_buffers; retaining the entry
+    // guard across that call self-deadlocks its DashMap shard.
+    let agent_context = state
+        .session_states
+        .get(session_id)
+        .and_then(|s| s.agent_type.clone());
+    let (actions, prompts, buffer_content) = {
+        let input_entry = state
+            .input_buffers
+            .entry(session_id.to_string())
+            .or_insert_with(|| parking_lot::Mutex::new(InputLineBuffer::new()));
+        let mut buf = input_entry.lock();
+        let (actions, prompts) = buf.feed_for_agent(data, agent_context.as_deref());
+        let buffer_content = buf.content();
+        (actions, prompts, buffer_content)
+    };
+    let interrupted = actions
+        .iter()
+        .any(|a| matches!(a, crate::input_line_buffer::InputAction::Interrupt));
+    let line_submitted = actions.iter().any(|a| {
+        matches!(
+            a,
+            crate::input_line_buffer::InputAction::Line(_)
+                | crate::input_line_buffer::InputAction::Interrupt
+        )
+    });
+    let nonempty_line_submitted = actions.iter().any(|a| {
+        matches!(a, crate::input_line_buffer::InputAction::Line(content) if !content.is_empty())
+    });
+    if interrupted || data == "\x1b" {
+        if let Some(sl) = state.silence_states.get(session_id) {
+            sl.lock().note_interrupt_requested();
+        }
+    } else if nonempty_line_submitted {
+        crate::pty::note_submitted_input(state, session_id);
+    }
+    if let Some(prompt) = prompts.into_iter().last() {
+        state.last_prompts.insert(session_id.to_string(), prompt);
+    }
+    for action in &actions {
+        if let crate::input_line_buffer::InputAction::Line(content) = action
+            && !content.is_empty()
+        {
+            let parsed = crate::output_parser::ParsedEvent::UserInput {
+                content: content.clone(),
+                line: -1,
+            };
+            if let Ok(json) = serde_json::to_value(&parsed) {
+                state.emit_pty_event(crate::state::AppEvent::PtyParsed {
+                    session_id: session_id.to_string(),
+                    parsed: json,
+                });
+            }
+            #[cfg(feature = "desktop")]
+            if let Some(app) = state.app_handle.read().as_ref() {
+                use tauri::Emitter as _;
+                let _ = app.emit(&format!("pty-parsed-{session_id}"), &parsed);
+            }
+            if let Some(ss) = state.silence_states.get(session_id) {
+                ss.lock().suppress_user_input();
+            }
+        }
+    }
+    if line_submitted && let Some(ss) = state.silence_states.get(session_id) {
+        let mut ss = ss.lock();
+        ss.reset_tool_error_memory();
+        ss.reset_suggest_memory();
+    }
+    // Determine slash mode. The InputLineBuffer may accumulate junk from
+    // terminal responses (e.g. DA reply "1;2c"), so buf.content() alone is
+    // unreliable. Use multiple signals:
+    let in_slash = if line_submitted {
+        false
+    } else if buffer_content.starts_with('/') {
+        true
+    } else if data == "/" {
+        // Fresh slash keystroke from PWA/MCP — always enters slash mode
+        true
+    } else {
+        // Maintain current slash_mode for subsequent chars (delta sync sends
+        // one char at a time after the initial "/"), unless dismissed
+        let is_bare_esc = data == "\x1b" || (data.contains('\x1b') && !data.contains("\x1b["));
+        let dismissed = is_bare_esc || data.contains('\x03');
+        !dismissed
+            && state
+                .slash_mode
+                .get(session_id)
+                .is_some_and(|v| v.load(std::sync::atomic::Ordering::Relaxed))
+    };
+    tracing::trace!(in_slash, input_len = data.len(), "write_pty slash_mode");
+    state
+        .slash_mode
+        .entry(session_id.to_string())
+        .or_insert_with(|| std::sync::atomic::AtomicBool::new(false))
+        .store(in_slash, std::sync::atomic::Ordering::Relaxed);
+    if buffer_content.is_empty() {
+        crate::pty::flush_pending_injections(state, session_id);
+    }
+}
+
 /// Write data to a PTY session
 #[cfg(feature = "desktop")]
 #[tauri::command]
@@ -6519,7 +6633,7 @@ pub(crate) async fn write_pty(
     data: String,
 ) -> Result<(), String> {
     let state = Arc::clone(&state);
-    let app = app.clone();
+    let _ = app;
     tokio::task::spawn_blocking(move || {
     // Keystroke delivery to the PTY: run on the high QoS band so the write (and
     // thus the echo round-trip) isn't starved by a saturating build. Idempotent
@@ -6559,111 +6673,9 @@ pub(crate) async fn write_pty(
             }
         }
 
-        // Stamp last-input time so the grid ticker can throttle frame sends while
-        // the user types under CPU saturation (keeps the WebView thread free for
-        // keystroke dispatch + echo).
-        stamp_input_ms(&state, &session_id);
-        crate::state::resolve_choice_prompt_input(&state, &session_id, &data);
-
-        // Feed input through the line buffer to reconstruct user-typed lines
-        // Release both the inner mutex and DashMap entry guard before callbacks
-        // below. In particular, flush_pending_injections -> should_inject_now
-        // reads input_buffers again; retaining input_entry there self-deadlocks
-        // this shard and can park the entire IPC Tokio runtime under load.
-        let (actions, buffer_content) = {
-            let input_entry = state
-                .input_buffers
-                .entry(session_id.clone())
-                .or_insert_with(|| parking_lot::Mutex::new(InputLineBuffer::new()));
-            let mut buf = input_entry.lock();
-            let actions = buf.feed(&data);
-            let buffer_content = buf.content();
-            (actions, buffer_content)
-        };
-        let mut line_submitted = false;
-        for action in actions {
-            match action {
-                InputAction::Line(content) => {
-                    line_submitted = true;
-                    if !content.is_empty() {
-                        note_submitted_input(&state, &session_id);
-                        // Store as last relevant prompt if >= 10 words
-                        let word_count = content.split_whitespace().count();
-                        if word_count >= 10 {
-                            state.last_prompts.insert(session_id.clone(), content.clone());
-                        }
-                        // Keystroke-reconstructed: no grid context, so no prompt
-                        // row (line = -1). The scrollbar marker uses the OSC 7770
-                        // state=busy path's absolute line instead.
-                        let parsed = ParsedEvent::UserInput { content, line: -1 };
-                        // Broadcast to SSE/WebSocket consumers
-                        if let Ok(json) = serde_json::to_value(&parsed) {
-                            state.emit_pty_event(crate::state::AppEvent::PtyParsed {
-                                session_id: session_id.clone(),
-                                parsed: json,
-                            });
-                        }
-                        // Tauri IPC for desktop backward compat
-                        let _ = app.emit(
-                            &format!("pty-parsed-{session_id}"),
-                            &parsed,
-                        );
-
-                        // Suppress silence-based question detection for user-typed lines.
-                        // The PTY will echo this input back — without suppression, a line
-                        // ending with `?` would be mistaken for an agent question prompt.
-                        if let Some(ss) = state.silence_states.get(&session_id) {
-                            ss.lock().suppress_user_input();
-                        }
-                    }
-                }
-                InputAction::Interrupt => {
-                    line_submitted = true;
-                    if let Some(ss) = state.silence_states.get(&session_id) {
-                        ss.lock().note_interrupt_requested();
-                    }
-                }
-            }
-        }
-        // Codex advertises Escape as its normal interrupt key. A bare Escape is
-        // only intent evidence; it never flips idle until the agent redraws an
-        // interrupted/ready prompt. CSI-prefixed navigation keys are excluded.
-        if data == "\x1b"
-            && let Some(ss) = state.silence_states.get(&session_id)
-        {
-            ss.lock().note_interrupt_requested();
-        }
-
-        // On any line submit (Enter or Ctrl+C) reset the tool-error dedup
-        // memory: the user is explicitly engaging again, so a recurrence of
-        // the same failure in a later turn must be allowed to notify.
-        // Mirrors `OutputParser`'s reset of `last_api_error_match` on UserInput.
-        if line_submitted
-            && let Some(ss) = state.silence_states.get(&session_id)
-        {
-            let mut sl = ss.lock();
-            sl.reset_tool_error_memory();
-            sl.reset_suggest_memory();
-        }
-
-        // Track slash command mode: true when the input buffer starts with /
-        // Fallback: when ESC is sent before "/" (TerminalKeybar's handleSlash),
-        // the InputLineBuffer consumes "/" as an unknown escape-sequence suffix
-        // and never inserts it. Detect bare "/" writes that the buffer missed.
-        let in_slash = if line_submitted {
-            false
-        } else {
-            buffer_content.starts_with('/') || (buffer_content.is_empty() && data == "/")
-        };
-        state
-            .slash_mode
-            .entry(session_id.clone())
-            .or_insert_with(|| std::sync::atomic::AtomicBool::new(false))
-            .store(in_slash, std::sync::atomic::Ordering::Relaxed);
-
-        if buffer_content.is_empty() {
-            flush_pending_injections(&state, &session_id);
-        }
+        // Release the session DashMap guard before any callback can read sessions.
+        drop(entry);
+        apply_input_bookkeeping(&state, &session_id, &data);
 
         Ok(())
     } else {
@@ -8243,6 +8255,13 @@ pub(crate) fn terminal_exit_alt_screen(
     state: State<'_, Arc<AppState>>,
     session_id: String,
 ) -> bool {
+    // Frontend calls only after confirmed agent exit, never a transient process sample.
+    state.last_prompts.remove(&session_id);
+    state.input_buffers.remove(&session_id);
+    if let Some(mut session) = state.session_states.get_mut(&session_id) {
+        session.agent_type = None;
+        session.hook_instrumented = false;
+    }
     if let Some(vt) = state.vt_log_buffers.get(&session_id) {
         let (was_alt, frame) = {
             let mut vt = vt.lock();
@@ -15431,9 +15450,16 @@ mod tests {
 
     #[test]
     fn write_pty_bytes_small_input_takes_single_write() {
-        let mut w = RecordingWriter { writes: Vec::new(), data: Vec::new() };
+        let mut w = RecordingWriter {
+            writes: Vec::new(),
+            data: Vec::new(),
+        };
         write_pty_bytes(&mut w, b"ls -la\r").expect("write");
-        assert_eq!(w.writes, vec![7], "a keystroke-sized write must not be chunked");
+        assert_eq!(
+            w.writes,
+            vec![7],
+            "a keystroke-sized write must not be chunked"
+        );
         assert_eq!(w.data, b"ls -la\r", "the bytes must be delivered unchanged");
     }
 
@@ -15446,7 +15472,10 @@ mod tests {
         let payload: Vec<u8> = (0..PTY_PASTE_CHUNK_THRESHOLD * 3 + 7)
             .map(|i| (i % 251) as u8)
             .collect();
-        let mut w = RecordingWriter { writes: Vec::new(), data: Vec::new() };
+        let mut w = RecordingWriter {
+            writes: Vec::new(),
+            data: Vec::new(),
+        };
         write_pty_bytes(&mut w, &payload).expect("write");
         assert!(
             w.writes.len() > 1,

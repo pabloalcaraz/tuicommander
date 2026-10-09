@@ -47,6 +47,14 @@ Terminals are **never unmounted** from the DOM. When you switch branches or tabs
 
 ## Tab Management
 
+### Last Prompt
+
+The optional **Prompt** bar shows the last captured AI prompt, including short
+and multiline input. Shell commands and agent slash commands are excluded.
+History/completion can change text inside the agent, so those submissions keep
+the previous known prompt. Expand with the header, select the body normally, or
+use the copy icon. Leaving the agent clears the bar.
+
 ### Tab Names
 
 - Default naming: "Terminal 1", "Terminal 2", etc.

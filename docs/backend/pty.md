@@ -9,6 +9,14 @@ parameter prefixes and split SGR mouse reports. Coordinates and terminal replies
 are not user text. CSI parameter storage is bounded independently of PTY input;
 tracking does not alter the bytes delivered to the child process.
 
+Desktop and HTTP writes share `apply_input_bookkeeping`. `feed_for_agent` records
+prompts only in an agent context, resets tracking when that context changes, and
+excludes slash commands and lines changed through history, completion, or yank.
+Bracketed paste retains line breaks until an explicit submission; Kitty Enter
+submits while Shift+Enter inserts a newline and key-release events do not submit.
+Short prompts are eligible. Confirmed agent exit clears prompt/context state.
+Both transports emit `UserInput` and apply the same silence/error reset policy.
+
 ## Windows ConPTY build dependency
 
 Windows desktop builds bundle a pinned Microsoft ConPTY DLL and matching

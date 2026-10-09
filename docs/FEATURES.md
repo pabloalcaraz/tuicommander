@@ -422,7 +422,7 @@ Tabbed side panel with four tabs: Changes, Log, Stashes, Branches. Replaces the 
 - Sub-rows (up to one shown per terminal, in priority order):
   - `currentTask` (gear icon) — current agent task from status-line parsing (e.g. "Reading files"). Suppressed for Claude Code (spinner verbs are decorative)
   - `agentIntent` (crosshair icon) — LLM-declared intent via `intent:` token
-  - `lastPrompt` (speech bubble icon) — last user prompt (>= 10 words). Shown only when no `agentIntent` is present
+  - `lastPrompt` (speech bubble icon) — last reliably captured agent prompt, including short and multiline input; shell/slash commands and unknown history/completion edits are excluded. Shown only when no `agentIntent` is present. The terminal prompt bar supports body selection and an explicit copy button.
 - Status color codes: green=working, yellow=waiting, red=rate-limited, gray=idle
 - Ready input composers remain gray/idle when an agent leaves a long-lived background terminal running
 - Rate limit indicators with countdown timers

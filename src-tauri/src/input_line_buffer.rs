@@ -18,6 +18,10 @@ pub(crate) struct InputLineBuffer {
     esc_state: EscState,
     /// Accumulator for CSI parameter bytes (digits and semicolons).
     csi_params: Vec<u8>,
+    bracketed_paste: bool,
+    reliable: bool,
+    agent_context: Option<String>,
+    submitted_prompts: Vec<String>,
 }
 
 /// Escape sequence parser state.
@@ -49,6 +53,10 @@ impl InputLineBuffer {
             cursor: 0,
             esc_state: EscState::Normal,
             csi_params: Vec::new(),
+            bracketed_paste: false,
+            reliable: true,
+            agent_context: None,
+            submitted_prompts: Vec::new(),
         }
     }
 
@@ -62,6 +70,37 @@ impl InputLineBuffer {
             }
         }
         actions
+    }
+
+    /// Prompt capture is conservative: shell input and edits whose resulting
+    /// text is owned by the application (history/completion) are never prompts.
+    pub(crate) fn feed_for_agent(
+        &mut self,
+        data: &str,
+        agent: Option<&str>,
+    ) -> (Vec<InputAction>, Vec<String>) {
+        if self.agent_context.as_deref() != agent {
+            *self = Self::new();
+            self.agent_context = agent.map(str::to_owned);
+        }
+        let actions = self.feed(data);
+        (actions, std::mem::take(&mut self.submitted_prompts))
+    }
+
+    fn submit(&mut self) -> InputAction {
+        let line = self.content();
+        let prompt = line.trim();
+        if self.reliable
+            && self.agent_context.is_some()
+            && !prompt.is_empty()
+            && !prompt.starts_with('/')
+        {
+            self.submitted_prompts.push(line.clone());
+        }
+        self.chars.clear();
+        self.cursor = 0;
+        self.reliable = true;
+        InputAction::Line(line)
     }
 
     /// Get the current buffer content.
@@ -85,6 +124,14 @@ impl InputLineBuffer {
     }
 
     fn handle_normal(&mut self, ch: char) -> Option<InputAction> {
+        if self.bracketed_paste && ch != '\x1b' {
+            // A paste's line breaks are data; only Enter AFTER its closing
+            // delimiter submits the complete multi-line prompt.
+            self.chars
+                .insert(self.cursor, if ch == '\r' { '\n' } else { ch });
+            self.cursor += 1;
+            return None;
+        }
         match ch {
             // ESC — start escape sequence
             '\x1b' => {
@@ -92,12 +139,7 @@ impl InputLineBuffer {
                 None
             }
             // Enter (CR or LF) — submit line
-            '\r' | '\n' => {
-                let line: String = self.chars.iter().collect();
-                self.chars.clear();
-                self.cursor = 0;
-                Some(InputAction::Line(line))
-            }
+            '\r' | '\n' => Some(self.submit()),
             // Backspace (DEL) or Ctrl+H — delete char before cursor
             '\x7f' | '\x08' => {
                 if self.cursor > 0 {
@@ -122,6 +164,7 @@ impl InputLineBuffer {
             '\x03' => {
                 self.chars.clear();
                 self.cursor = 0;
+                self.reliable = true;
                 Some(InputAction::Interrupt)
             }
             // Ctrl+D — delete char at cursor (or ignored if empty)
@@ -177,9 +220,15 @@ impl InputLineBuffer {
                 None
             }
             // Ctrl+Y — yank (we can't track kill ring, so ignore)
-            '\x19' => None,
+            '\x19' => {
+                self.reliable = false;
+                None
+            }
             // Tab, Ctrl+N, Ctrl+P, Ctrl+R, Ctrl+S, etc. — ignore (shell-level ops)
-            '\x09' | '\x0e' | '\x10' | '\x12' | '\x13' => None,
+            '\x09' | '\x0e' | '\x10' | '\x12' | '\x13' => {
+                self.reliable = false;
+                None
+            }
             // Other control chars we don't handle
             c if c < '\x20' => None,
             // Regular printable character — insert at cursor
@@ -259,7 +308,7 @@ impl InputLineBuffer {
             '\x40'..='\x7e' => {
                 self.esc_state = EscState::Normal;
                 if !self.csi_params.first().is_some_and(|b| b"<=>?".contains(b)) {
-                    self.execute_csi(ch);
+                    return self.execute_csi(ch);
                 }
                 None
             }
@@ -289,13 +338,13 @@ impl InputLineBuffer {
                 // End
                 self.cursor = self.chars.len();
             }
-            // Up/Down (A/B) — history navigation, ignore
+            'A' | 'B' => self.reliable = false,
             _ => {}
         }
         None
     }
 
-    fn execute_csi(&mut self, final_byte: char) {
+    fn execute_csi(&mut self, final_byte: char) -> Option<InputAction> {
         let params = self.parse_csi_params();
 
         match final_byte {
@@ -304,6 +353,7 @@ impl InputLineBuffer {
                 // Up/Down — history navigation. We can't track this, so ignore.
                 // The shell will replace the entire line content; our buffer
                 // will be wrong until the user types again or submits.
+                self.reliable = false;
             }
             'C' => {
                 // Right arrow. Check for modifier (Ctrl+Right = word forward).
@@ -343,6 +393,8 @@ impl InputLineBuffer {
             '~' => {
                 let key = params.first().copied().unwrap_or(0);
                 match key {
+                    200 => self.bracketed_paste = true,
+                    201 => self.bracketed_paste = false,
                     1 => self.cursor = 0, // Home (VT220)
                     3 if self.cursor < self.chars.len() => {
                         self.chars.remove(self.cursor);
@@ -354,8 +406,18 @@ impl InputLineBuffer {
             // Kitty CSI u sequences: ESC [ <codepoint> ; <modifier> u
             'u' => {
                 let codepoint = params.first().copied().unwrap_or(0);
-                let _modifier = params.get(1).copied().unwrap_or(1);
+                let modifier = params.get(1).copied().unwrap_or(1);
+                // Kitty release events (modifier:event=3) must not submit twice.
+                if self
+                    .csi_params
+                    .split(|b| *b == b';')
+                    .nth(1)
+                    .is_some_and(|p| p.split(|b| *b == b':').nth(1) == Some(b"3".as_slice()))
+                {
+                    return None;
+                }
                 match codepoint {
+                    13 if modifier == 1 && !self.bracketed_paste => return Some(self.submit()),
                     // Enter (13) with modifier = Shift+Enter → literal newline
                     13 => {
                         self.chars.insert(self.cursor, '\n');
@@ -369,12 +431,13 @@ impl InputLineBuffer {
                     // Escape (27) — ignore
                     27 => {}
                     // Tab (9) — ignore
-                    9 => {}
+                    9 => self.reliable = false,
                     _ => {}
                 }
             }
             _ => {} // Unknown CSI final byte — ignore
         }
+        None
     }
 
     /// Parse CSI parameter bytes into a list of numeric values.
@@ -385,7 +448,7 @@ impl InputLineBuffer {
         }
         let s: String = self.csi_params.iter().map(|&b| b as char).collect();
         s.split(';')
-            .filter_map(|part| part.parse::<u32>().ok())
+            .filter_map(|part| part.split(':').next()?.parse::<u32>().ok())
             .collect()
     }
 
@@ -448,6 +511,77 @@ impl InputLineBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prompt_capture_excludes_shell_and_unknown_edits() {
+        let mut buf = InputLineBuffer::new();
+        assert!(
+            buf.feed_for_agent(
+                "a long shell command with more than ten words belongs to the shell\r",
+                None
+            )
+            .1
+            .is_empty()
+        );
+        assert_eq!(
+            buf.feed_for_agent("Revisa el código\r", Some("codex")).1,
+            vec!["Revisa el código"]
+        );
+        assert!(
+            buf.feed_for_agent("partial\x1b[Achanged\r", Some("codex"))
+                .1
+                .is_empty()
+        );
+        assert!(buf.feed_for_agent("he\tllo\r", Some("codex")).1.is_empty());
+        assert!(buf.feed_for_agent("/clear\r", Some("codex")).1.is_empty());
+        assert_eq!(
+            buf.feed_for_agent("nuevo\r", Some("codex")).1,
+            vec!["nuevo"]
+        );
+    }
+
+    #[test]
+    fn prompt_context_changes_discard_stale_shell_text() {
+        let mut buf = InputLineBuffer::new();
+        buf.feed_for_agent("shell text", None);
+        assert_eq!(
+            buf.feed_for_agent("claude prompt\r", Some("claude")).1,
+            vec!["claude prompt"]
+        );
+        buf.feed_for_agent("unfinished agent text", Some("claude"));
+        assert!(buf.feed_for_agent("shell command\r", None).1.is_empty());
+        assert_eq!(buf.content(), "");
+    }
+
+    #[test]
+    fn bracketed_paste_waits_for_enter_and_preserves_multiline_prompt() {
+        let mut buf = InputLineBuffer::new();
+        assert!(
+            buf.feed_for_agent("\x1b[200~línea uno\nlínea dos", Some("claude"))
+                .0
+                .is_empty()
+        );
+        assert!(buf.feed_for_agent("\x1b[201~", Some("claude")).1.is_empty());
+        assert_eq!(
+            buf.feed_for_agent("\r", Some("claude")).1,
+            vec!["línea uno\nlínea dos"]
+        );
+    }
+
+    #[test]
+    fn kitty_enter_submits_once_and_shift_enter_inserts_newline() {
+        let mut buf = InputLineBuffer::new();
+        buf.feed_for_agent("uno\x1b[13;2u", Some("codex"));
+        assert_eq!(
+            buf.feed_for_agent("dos\x1b[13;1:1u", Some("codex")).1,
+            vec!["uno\ndos"]
+        );
+        assert!(
+            buf.feed_for_agent("\x1b[13;1:3u", Some("codex"))
+                .0
+                .is_empty()
+        );
+    }
 
     #[test]
     fn mouse_reports_do_not_become_user_text_even_when_split() {

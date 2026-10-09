@@ -357,7 +357,7 @@ export const Terminal: Component<TerminalProps> = (props) => {
 					terminalsStore.clearAwaitingInput(props.id);
 					invoke<string | null>("get_last_prompt", { sessionId: targetSessionId })
 						.then((prompt) => {
-							if (prompt !== null) terminalsStore.setLastPrompt(props.id, prompt);
+							if (!disposed && sessionId === targetSessionId) terminalsStore.setLastPrompt(props.id, prompt);
 						})
 						.catch((err) => {
 							appLogger.debug("terminal", "get_last_prompt failed", { sessionId: targetSessionId, error: String(err) });
@@ -885,6 +885,7 @@ export const Terminal: Component<TerminalProps> = (props) => {
 	createEffect(() => {
 		const curr = terminalsStore.get(props.id)?.agentType ?? null;
 		if (lastAgentType !== null && curr === null && sessionId) {
+			terminalsStore.setLastPrompt(props.id, null);
 			invoke<boolean>("terminal_exit_alt_screen", { sessionId })
 				.then((wasAlt) => {
 					if (wasAlt) {

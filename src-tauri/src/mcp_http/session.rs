@@ -156,89 +156,7 @@ pub(crate) fn write_pty_input_pair(
     Ok(())
 }
 
-/// Post-write bookkeeping shared by `write_pty_input` and
-/// `write_pty_input_pair`: stamps last-input time and feeds the
-/// InputLineBuffer FSM to track slash_mode accurately. Runs once per input
-/// part, after the PTY lock for that part's write has already been released.
-pub(crate) fn apply_input_bookkeeping(state: &Arc<AppState>, session_id: &str, data: &str) {
-    // Stamp last-input time (same as desktop write_pty) so the grid ticker
-    // throttles frames for remote/PWA typing under CPU saturation too.
-    crate::pty::stamp_input_ms(state, session_id);
-    crate::state::resolve_choice_prompt_input(state, session_id, data);
-
-    // Feed input through InputLineBuffer FSM to track slash_mode accurately.
-    // The old substring heuristic false-positived on pastes starting with '/'.
-    // Copy the FSM result and composer content, then release BOTH the inner
-    // mutex and DashMap entry guard before any transition/delivery callback.
-    // `flush_pending_injections` re-reads input_buffers; retaining the entry
-    // guard across that call self-deadlocks its DashMap shard.
-    let (actions, buffer_content) = {
-        let input_entry = state
-            .input_buffers
-            .entry(session_id.to_string())
-            .or_insert_with(|| {
-                parking_lot::Mutex::new(crate::input_line_buffer::InputLineBuffer::new())
-            });
-        let mut buf = input_entry.lock();
-        let actions = buf.feed(data);
-        let buffer_content = buf.content();
-        (actions, buffer_content)
-    };
-    let interrupted = actions
-        .iter()
-        .any(|a| matches!(a, crate::input_line_buffer::InputAction::Interrupt));
-    let line_submitted = actions.iter().any(|a| {
-        matches!(
-            a,
-            crate::input_line_buffer::InputAction::Line(_)
-                | crate::input_line_buffer::InputAction::Interrupt
-        )
-    });
-    let nonempty_line_submitted = actions.iter().any(|a| {
-        matches!(a, crate::input_line_buffer::InputAction::Line(content) if !content.is_empty())
-    });
-    if interrupted || data == "\x1b" {
-        if let Some(sl) = state.silence_states.get(session_id) {
-            sl.lock().note_interrupt_requested();
-        }
-    } else if nonempty_line_submitted {
-        crate::pty::note_submitted_input(state, session_id);
-    }
-    // Determine slash mode. The InputLineBuffer may accumulate junk from
-    // terminal responses (e.g. DA reply "1;2c"), so buf.content() alone is
-    // unreliable. Use multiple signals:
-    let in_slash = if line_submitted {
-        false
-    } else if buffer_content.starts_with('/') {
-        true
-    } else if data == "/" {
-        // Fresh slash keystroke from PWA/MCP — always enters slash mode
-        true
-    } else {
-        // Maintain current slash_mode for subsequent chars (delta sync sends
-        // one char at a time after the initial "/"), unless dismissed
-        let is_bare_esc = data == "\x1b" || (data.contains('\x1b') && !data.contains("\x1b["));
-        let dismissed = is_bare_esc || data.contains('\x03');
-        !dismissed
-            && state
-                .slash_mode
-                .get(session_id)
-                .is_some_and(|v| v.load(std::sync::atomic::Ordering::Relaxed))
-    };
-    tracing::trace!(
-        "write_pty slash_mode: in_slash={in_slash} buf='{}' data='{}'",
-        buffer_content,
-        data
-    );
-    state
-        .slash_mode
-        .entry(session_id.to_string())
-        .or_insert_with(|| std::sync::atomic::AtomicBool::new(false))
-        .store(in_slash, std::sync::atomic::Ordering::Relaxed);
-    if buffer_content.is_empty() {
-        crate::pty::flush_pending_injections(state, session_id);
-    }
-}
+pub(crate) use crate::pty::apply_input_bookkeeping;
 
 pub(super) async fn set_session_name(
     State(state): State<Arc<AppState>>,
@@ -1086,7 +1004,8 @@ async fn handle_ws_session(
                 if let Some(session) = state_clone.sessions.get(&sid) {
                     let mut s = session.lock();
                     // Chunk + pace on Windows so a large paste isn't truncated.
-                    if let Err(e) = crate::pty::write_pty_bytes(s.writer.as_mut(), text.as_bytes()) {
+                    if let Err(e) = crate::pty::write_pty_bytes(s.writer.as_mut(), text.as_bytes())
+                    {
                         tracing::error!(session_id = %sid, "PTY write failed: {e}");
                         break;
                     }
@@ -1304,7 +1223,8 @@ async fn handle_ws_log_session(
                 if let Some(session) = state.sessions.get(&session_id) {
                     let mut s = session.lock();
                     // Chunk + pace on Windows so a large paste isn't truncated.
-                    if let Err(e) = crate::pty::write_pty_bytes(s.writer.as_mut(), text.as_bytes()) {
+                    if let Err(e) = crate::pty::write_pty_bytes(s.writer.as_mut(), text.as_bytes())
+                    {
                         tracing::error!(session_id = %session_id, "PTY write failed: {e}");
                         break;
                     }
@@ -1720,6 +1640,40 @@ pub(super) async fn terminal_request_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn input_bookkeeping_captures_only_agent_prompts_and_emits_to_remote_clients() {
+        let state = super::super::tests::test_state();
+        let sid = "prompt-capture";
+        apply_input_bookkeeping(
+            &state,
+            sid,
+            "a shell command long enough to have at least ten words in it\r",
+        );
+        assert!(!state.last_prompts.contains_key(sid));
+        state.session_states.insert(
+            sid.to_string(),
+            crate::state::SessionState {
+                agent_type: Some("claude".to_string()),
+                ..Default::default()
+            },
+        );
+        let mut events = state.subscribe_pty_events(sid);
+        apply_input_bookkeeping(&state, sid, "Corrige el bug\r");
+        assert_eq!(
+            state.last_prompts.get(sid).unwrap().as_str(),
+            "Corrige el bug"
+        );
+        assert!(matches!(
+            events.try_recv(),
+            Ok(crate::state::AppEvent::PtyParsed { .. })
+        ));
+        apply_input_bookkeeping(&state, sid, "partial\x1b[A\r");
+        assert_eq!(
+            state.last_prompts.get(sid).unwrap().as_str(),
+            "Corrige el bug"
+        );
+    }
 
     #[test]
     fn mcp_regression_input_bookkeeping_releases_guard_before_pending_delivery() {
