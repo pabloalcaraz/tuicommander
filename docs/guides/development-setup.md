@@ -166,6 +166,15 @@ cargo install tauri-cli --version "^2"
 
 ### Full Windows Build Command
 
+Windows builds automatically prepare Microsoft ConPTY before compiling sidecars;
+development prepares it before starting Vite. The pinned
+[Microsoft.Windows.Console.ConPTY 1.24.260710001](https://www.nuget.org/packages/Microsoft.Windows.Console.ConPTY/1.24.260710001)
+package and its x64, x86 or ARM64 binaries are verified with SHA-256. The first
+preparation needs access to `api.nuget.org`; subsequent runs reuse verified local
+files. Use `pnpm prepare:conpty` before calling Cargo directly (including clippy).
+The binaries in `src-tauri/binaries/` are generated or downloaded build inputs and
+must never be committed. `pnpm build:sidecar` regenerates the TUIC CLI and bridge.
+
 Always set `LIBCLANG_PATH` before building:
 
 ```powershell

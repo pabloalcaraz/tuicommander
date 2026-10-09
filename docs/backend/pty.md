@@ -4,6 +4,18 @@
 
 Manages pseudo-terminal sessions for all terminal tabs in the application.
 
+## Windows ConPTY build dependency
+
+Windows desktop builds bundle a pinned Microsoft ConPTY DLL and matching
+OpenConsole executable from NuGet, rather than relying on the in-box Windows
+console host. `prepare-conpty.mjs` runs before development and sidecar builds;
+`windows/prepare-conpty.ps1` verifies the package and both extracted binaries with
+SHA-256 and repairs missing or modified cache files. Preparation is a no-op on
+macOS and Linux. `tauri.windows.conf.json` confines these bundle inputs to Windows.
+`build.rs` copies both files beside the development executable; the Windows
+installer bundles them beside the installed executable. These inputs are ignored
+by Git and are recreated locally or in CI.
+
 ## Session Lifecycle
 
 ```

@@ -3,7 +3,8 @@ import solid from "vite-plugin-solid";
 import path from "node:path";
 
 export default defineConfig({
-  plugins: [solid()],
+  // HMR's virtual file:///@solid-refresh URL is invalid in Windows workers.
+  plugins: [solid({ hot: false })],
   define: {
     __APP_VERSION__: JSON.stringify("0.3.0"),
   },

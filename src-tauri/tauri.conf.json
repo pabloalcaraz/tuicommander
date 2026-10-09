@@ -4,7 +4,7 @@
   "version": "1.6.3",
   "identifier": "com.tuic.commander",
   "build": {
-    "beforeDevCommand": "pnpm dev",
+    "beforeDevCommand": "node src-tauri/prepare-conpty.mjs && pnpm dev",
     "devUrl": "http://127.0.0.1:1421",
     "beforeBuildCommand": "pnpm build && pnpm build:sidecar",
     "frontendDist": "../dist"
@@ -92,9 +92,9 @@
       }
     },
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEU1MEM3NkIyREQzNDMwMDMKUldRRE1EVGRzbllNNWMxR2xrSFpzblI5clZHd1hCZEV0TGg4WlFaNVp2QjY2bWlUQ1R6Mkt3cWcK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDdGOTEyMkY1RDE4MjZCMTcKUldRWGE0TFI5U0tSZjVtc1ErMXBvbFoyS0NKZmxRQ04yNnhYTUNpSm53Qi9nZ3RkbC9HaGZoVW4K",
       "endpoints": [
-        "https://github.com/sstraus/tuicommander/releases/latest/download/latest.json"
+        "https://github.com/pabloalcaraz/tuicommander/releases/latest/download/latest.json"
       ],
       "windows": {
         "installMode": "passive"

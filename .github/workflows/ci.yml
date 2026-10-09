@@ -77,6 +77,9 @@ jobs:
       - name: Tests
         run: pnpm exec vitest run --reporter=verbose
 
+      - name: Build dependency tests
+        run: node --test src-tauri/windows/prepare-conpty.node-test.mjs
+
   # Always runs: clippy + tests on Linux (fastest, catches most issues)
   rust:
     name: Rust (Linux-x64)
@@ -266,6 +269,11 @@ jobs:
       - name: Create dist stub for include_dir
         shell: bash
         run: mkdir -p dist && echo '<html></html>' > dist/index.html
+
+      - name: Prepare Windows ConPTY
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: ./src-tauri/windows/prepare-conpty.ps1
 
       - name: Create sidecar stub for Tauri build.rs
         shell: bash

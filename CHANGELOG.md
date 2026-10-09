@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Windows builds obtain and verify pinned ConPTY dependencies automatically, including the matching OpenConsole executable for development. Generated sidecars are excluded from source control.
+- Fork builds check for signed updates from the fork's release endpoint.
+- Windows frontend tests disable development HMR to avoid invalid virtual module URLs.
+
 ## [1.6.3] - 2026-07-22
 
 ### Changed

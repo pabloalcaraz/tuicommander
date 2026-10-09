@@ -1480,3 +1480,7 @@ worktree build's HTTP API on :9877 or the desktop app._
 
 - [ ] [VISUAL] Commenting a word that repeats many times in the doc (e.g. "reason" ×18) highlights the ACTUAL selected occurrence, not the first one. _(root cause: `findSourceMatch` used first-occurrence `indexOf`; fixed with DOM occurrence-ordinal → Nth source occurrence. Logic verified in `tweakComments.test.ts` incl. real-file offsets; visual anchor position needs an eye.)_
 - [ ] [VISUAL] Selecting text overlapping an existing highlight hides the "Add comment" button; keyboard-selecting over one and saving shows "That text already has a comment" instead of silently nesting/vanishing. _(logic verified: overlap-rejection + OverlappingCommentError; DOM pre-filter `rangeIntersectsHighlight` needs a visual check.)_
+
+## Windows ConPTY packaging
+
+- [ ] Rebuild with `make dev` or `pnpm tauri build --bundles nsis` to load the Rust build-script change. Verify pasting a command larger than 4 KB with the bundled console host.

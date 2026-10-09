@@ -6,6 +6,9 @@ import { execSync } from "child_process";
 import { copyFileSync, writeFileSync, statSync, existsSync } from "fs";
 import { join, dirname, isAbsolute } from "path";
 import { fileURLToPath } from "url";
+import { prepareConpty } from "./prepare-conpty.mjs";
+
+prepareConpty();
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const root = join(__dirname, "..");

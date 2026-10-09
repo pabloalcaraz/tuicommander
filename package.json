@@ -12,6 +12,7 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "build:sidecar": "node src-tauri/build-sidecar.mjs",
+    "prepare:conpty": "node src-tauri/prepare-conpty.mjs",
     "test": "vitest",
     "test:coverage": "vitest run --coverage"
   },
